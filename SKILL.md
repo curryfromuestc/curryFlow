@@ -1,127 +1,189 @@
 ---
 name: curryflows
 description: >-
-  herdr 注入器:起长跑 worker(默认 codex,可点名换 kimi k3,另备只读位 argv),注入契约、
-  后台 wait 事件唤醒、稀疏心跳巡检、驭偏、合并门禁、回收;本 session 的角色(派工/评审/裁决/全包)
-  由用户开场注入,skill 不预设流程。触发于:"起 curryflows"、"派个 codex 长跑任务"、"监督 codex 别跑飞"。
-user-invocable: true
-argument-hint: "[本 session 的角色 + 要推进的活]"
-type: skill
-tags: [herdr, codex, kimi, injector, loop]
-requires: ["herdr (>=0.8)", codex CLI, kimi CLI, "git (>=2.5, worktree)"]
+  用 herdr 编排用户指定的 worker CLI：为长跑任务创建独立分支、worktree 和 workspace，
+  启动并识别 agent，发送任务说明，等待与巡检执行状态，组织只读复核，验证后合并到本地 main，
+  并回收运行资源。适用于“起 curryflows”“派 worker 长跑任务”“监督 worker”“组织并行实现或评审”等请求。
 ---
-
 # curryflows
-
-herdr 注入器:只提供机制、不预设流程,本 session 的角色由用户开场说明;没有看板文件、没有
-辅助脚本,**herdr 就是看板**。对用户叙述一律中文;`/curryflows status` = herdr agent list + 各线程一句话近况。
-
-## 第 0 步:拿授权
-
-worker argv 若含 `--dangerously-bypass-approvals-and-sandbox`,**必须先向用户要授权**再起第一个线程:
-skill 自带的危险标志一律被 Claude Code 分类器判为 agent 自选而拒绝(实测)。说明理由(沙箱会挡掉
-worker 要用的 docker/外部工具),拿到答复再起;不授权就用 `--full-auto`。
-
-## 铁律
-
-- 本 session 不亲手改产物代码,一切改动经 worker;每 worker 独立分支 + worktree,全程不碰 main。
-- **worker 在途期间不往本地 main 提交**——文档 commit 排队等合并窗口;真撞上了用 rebase 不用 merge。
-- 合并只进**本地** main,**推送远端永远归人类**。
-- 契约必带 BUDGET(硬上限)与 BLOCKED_STOP(无路可走即停下报告)。
-- 只读位永不带写权限进被审对象;要跑代码的复验位在 detached-HEAD 副本里跑。
-- 用户自己的 workspace 永不触碰,只操作自己创建的 `cfx` 前缀 workspace。
-- **状态一律外置**:契约落文件、事实落仓库文档、进度落 git。本 session 上下文会被压缩(实测 7 小时
-  6 次),脑子里记的线程清单与踩过的坑必丢;herdr 的 label 只够当状态灯,不够当记忆。
-
-## 开并行线程前:共享可写状态 pre-flight
-
-worktree 只隔离文件树。先列出 worker 之间共享的可写状态:浮动 license(并发数)、工具的固定输出
-路径(下一次 run 静默覆盖上一次的报告)、共享构建缓存、需重建的跨 worktree 生成物。**列不出来就
-先串行跑一段,边跑边测。**
-
-## herdr 操作手册(0.8;`herdr <子命令> --help` 是唯一权威,输出默认 JSON)
-
-**起线程**(一条命令 = 分支 + worktree + 带名 workspace;返回的 `.result.root_pane.pane_id` 就是 agent 要用的窗格):
+用 herdr 管理 worker；不预设本 session 的职责。按用户指定承担派工、评审、裁决或完整流程。
+对用户使用中文。`/curryflows status` 输出 `herdr agent list`、`herdr pane list` 和各线程一句话近况。
+## 运行边界
+- 先执行 `test "${HERDR_ENV:-}" = 1`；失败时说明当前不在 Herdr pane 内并停止。
+- 用 `herdr <命令> --help` 确认当前 CLI 语法，并从 JSON 响应读取 ID。
+- worker 由用户指定；未指定时先询问，启动前执行 `command -v <worker>`。
+- 启动本 session 的第一个可写 worker 前，说明可写参数会自动批准或绕过 worker 的权限检查；
+  Codex 的对应参数还会关闭其沙箱。取得用户明确授权后再启动；未获授权时不启动可写 worker。
+- 本 session 不直接修改任务产物。每个可写 worker 使用独立 `cfx/*` 分支和 worktree。
+- worker 运行期间不修改本地 `main`。只将验证通过的结果合并到本地 `main`；不推送远端。
+- 只操作本 session 创建的 `cfx` 前缀 workspace、tab、pane、worktree 和分支。
+- 只读评审不得写入被审对象；需要运行代码时使用 detached-HEAD worktree，并在评审前后核对仓库状态。
+- 将任务说明写入 worktree 外的临时文件，将事实写入仓库文档，将进度写入 git 和 Herdr label。
+## 并行前检查
+列出 worker 之间共享的可写状态，包括：
+- 浮动 license 和并发额度；
+- 固定输出路径；
+- 共享构建缓存；
+- worktree 中缺失、需要重建的生成物。
+无法确认并行安全时先串行执行。
+## Worker 能力
+| worker | Herdr 控制面 | 完成检测 |
+|---|---|---|
+| Herdr 可识别的 agent | `agent prompt/read/wait/send-keys` | `agent wait`，心跳兜底 |
+| Herdr 未识别的交互式 CLI | `pane send-text/read/send-keys` | 心跳读取 pane |
+可写 worker 必须带对应的全权限参数：
+| worker | 可写参数 |
+|---|---|
+| `codex` / `tcodex` | `--dangerously-bypass-approvals-and-sandbox` |
+| `claude` / `tclaude` | `--dangerously-skip-permissions` |
+| `kimi` | `--yolo` |
+| `codebuddy` | `--dangerously-skip-permissions` |
+包装器只要呈现 Herdr 可识别的上游 UI，也可使用 agent 控制面。以 `herdr agent explain <pane>` 的结果
+为准，不按可执行文件名猜测。
+取得可写授权后、启动第一个正式线程前，用临时 pane 携带同一可写参数启动 worker，并通过 `pane read`
+确认登录状态；检查完关闭临时 pane。
+## 创建可写线程
 ```bash
-herdr worktree create --workspace "$HERDR_WORKSPACE_ID" --branch cfx/<任务名> --base main \
-  --label "cfx <任务名>" --no-focus
-# --base main 必带,否则从当前 HEAD 切;想让线程挂到项目 workspace 而非本 session 名下,才用 --cwd <项目>
-herdr agent start cfx-<小写任务名> --kind codex --pane <root_pane> --timeout 120000 \
-  -- --dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort=max
-# agent 名:小写开头,只含 a-z0-9-_,≤32 字符,大写直接报 invalid_agent_name;workspace label 不受此限
-# --kind 已决定可执行文件,`--` 后只跟追加参数,别再写一遍 codex;kimi worker:--kind kimi -- --yolo -m kimi-code/k3
+herdr worktree create \
+  --workspace "$HERDR_WORKSPACE_ID" \
+  --branch cfx/<任务名> \
+  --base main \
+  --label "cfx <任务名>" \
+  --no-focus
 ```
-
-**起只读位 / 多位编组**(评审、审计类角色;一位一 tab):
+从响应的 `.result.root_pane.pane_id` 读取 `<pane>`，然后启动 worker：
 ```bash
-git -C <项目> worktree add --detach <副本路径> <目标commit>      # 复验位跑代码用的隔离副本
-herdr worktree open --workspace "$HERDR_WORKSPACE_ID" --path <副本路径> --label "cfx-rv <任务名>" --no-focus
-herdr tab create --workspace <wid> --label "rv-<视角>" --no-focus   # 同样返回 root_pane
-herdr agent start rv-<小写名> --kind codex --pane <root_pane> -- -s read-only -c model_reasoning_effort=medium
-# 只读 argv:codex -s read-only / kimi --plan / claude --permission-mode plan
-# 防篡改核验:起位前后各比对 { git status --porcelain; git diff HEAD; git rev-parse HEAD; } | sha256sum
+herdr pane run <pane> codex \
+  --dangerously-bypass-approvals-and-sandbox <附加参数...>
+herdr pane run <pane> tcodex \
+  --dangerously-bypass-approvals-and-sandbox <附加参数...>
+herdr pane run <pane> claude \
+  --dangerously-skip-permissions <附加参数...>
+herdr pane run <pane> tclaude \
+  --dangerously-skip-permissions <附加参数...>
+herdr pane run <pane> kimi \
+  --yolo <附加参数...>
+herdr pane run <pane> codebuddy \
+  --dangerously-skip-permissions <附加参数...>
 ```
-
-**注入任务**:长提示词(契约、任务书、评审维度书)一律先落 md 文件,composer 只进一行"读文件"短
-指令;直贴长文已实测翻车(截断丢护栏段、CJK 残留草稿 ctrl+u 清不掉)。契约文件**写在 worktree 外**
-(如 `/tmp/cfx-<名>.md`),worker 就无从把它 commit 进产物——`.git/info/exclude` 在 linked worktree 里
-解析到主仓公共目录,写进 `.git/worktrees/<名>/info/` 是空转(实测)。
+只执行与用户指定 worker 对应的一条命令。`tcodex` 和 `tclaude` 直接接收并转发这些参数。
+在 60 秒内轮询识别状态：
 ```bash
-herdr agent prompt cfx-<名> "完整契约见 /tmp/cfx-<名>.md:先通读它,再严格按其执行" --wait --timeout 60000
-# 一条顶旧版 send + send-keys enter + wait 三步;正文是位置参数,不要写 --text
-# 返回 agent_prompt_stalled 就原样重发一次:agent start 之后的首个 prompt 必 stall(实测)
+deadline=$((SECONDS + 60))
+while ! herdr agent explain <pane> >/dev/null 2>&1; do
+  (( SECONDS >= deadline )) && break
+  sleep 2
+done
 ```
-
-契约四段 + 两格(codex 用 `/goal` 前缀持久化,kimi 去前缀直发):
-```
-OUTCOME      要什么,必须写出可核对的物证。「验证 X 可用」只会收到"能打开,可用";写「用 X 定位到
-             一处真实失配,且只用文本查询」才逼得出证据。连续量(覆盖率/面积/耗时/精度)必须钉死
-             三元组:测哪个对象 / 什么口径 / 跟谁比——只写"达标"必然收到一个满足契约但量错对象的结果。
-VERIFICATION 自查命令
-生成物依赖   本段要用到的 gitignore 生成物,及产生它的那条命令。新 worktree 里它们不存在,漏写
-             worker 就卡住或绕路(实测同一成因犯三次);复核者的复跑脚本照这格写。
-BUDGET       硬上限
-BLOCKED_STOP 无路可走即停下报告
-```
-/goal 跨回合自驱推进,适合大任务;小任务普通消息即可。给在途 codex 追加指令发**普通消息**、绝不带
-`/goal` 前缀(弹 "Replace goal?" 顶掉原契约,esc 可退)。
-
-**完成唤醒**:挂后台 Bash 任务(run_in_background),退出即 task-notification 唤醒:
+识别成功时：
 ```bash
-herdr agent wait cfx-<名> --timeout 3600000   # 不带 --until 即匹配 idle|done|blocked 三个终态
-# 认 agent 名也认 pane_id;done 是"完工但 tab 没在 UI 里被看过"的 idle,与 idle 同一状态,一条全覆盖
+herdr agent read <pane> --source visible
+herdr agent rename <pane> cfx-<小写任务名>
 ```
-唤醒是信号不是证据:醒来先 `herdr agent read` 确认(不认识的菜单会让状态回落 idle);超时同样唤醒,
-当卡死信号处理;pane 已回收时 wait 立即报错退出。`pane wait-output --match` 慎用:worker 复述契约即
-把字面量带上屏误触发,只当确认证据、不当唤醒源。
-
-**巡检 / 驭 / 标状态 / 回收**:
+agent 名必须匹配 `[a-z][a-z0-9_-]{0,31}`。未识别时读取 pane：若显示登录界面，先完成登录；
+若 worker 已正常运行，保留 pane ID，后续使用 pane 控制面。
+每个新 worktree 都可能出现目录信任或登录提示。发送任务前必须读取可见区域：
+1. `agent read <pane> --source visible`，未识别时用 `pane read`；
+2. 仅在明确看到需要确认的安全提示时发送对应按键；
+3. 再次读取，确认已进入 worker 主界面；
+4. 发送任务后再次读取，确认任务已被接收。
+不要仅依据 `idle`、`done` 或命令成功返回判断界面是否就绪。
+## 创建只读评审位
+需要执行验证时先创建隔离副本：
 ```bash
-herdr agent list                                      # 全线程状态
-herdr agent read cfx-<名> --source recent-unwrapped --lines 50   # kimi 此源返回空,改 --source visible
-herdr agent send-keys cfx-<名> esc                    # 软停:进程存活、上下文完整;纠偏 = 软停后照「注入任务」再发
-herdr workspace rename <wid> "cfx <任务名> · ❓等你"    # label 就是看板,状态变了就改名
+git -C <项目> worktree add --detach <副本路径> <目标commit>
+herdr worktree open \
+  --workspace "$HERDR_WORKSPACE_ID" \
+  --path <副本路径> \
+  --label "cfx-rv <任务名>" \
+  --no-focus
+```
+在评审 workspace 中按视角创建 tab：
+```bash
+herdr tab create --workspace <wid> --label "rv-<视角>" --no-focus
+herdr pane run <root_pane> <worker> <只读参数...>
+```
+只读评审位仅使用对应的只读参数，不叠加可写参数：
+- Codex：`-s read-only`
+- Claude Code：`--permission-mode plan`
+- Kimi：`--plan`
+- CodeBuddy：`--permission-mode plan`
+启动前后分别执行并比对：
+```bash
+{ git status --porcelain; git diff HEAD; git rev-parse HEAD; } | sha256sum
+```
+## 编写并发送任务说明
+长任务说明写入 worktree 外的 Markdown 文件，例如 `/tmp/cfx-<名>.md`。内容包括：
+```text
+OUTCOME
+  明确产物和可核对证据。连续指标写清对象、口径和对照基线。
+VERIFICATION
+  worker 必须执行的自查命令。
+GENERATED_INPUTS
+  所需的 gitignored 生成物及其生成命令。
+BUDGET
+  时间、轮次或资源硬上限。
+BLOCKED_STOP
+  无法继续时停止，并报告阻塞点、已尝试方法和所需输入。
+```
+Herdr 已识别 worker 时：
+```bash
+herdr agent prompt cfx-<名> \
+  "完整任务说明见 /tmp/cfx-<名>.md；先通读，再严格执行。" \
+  --wait \
+  --timeout 60000
+herdr agent read cfx-<名> --source visible
+```
+未识别 worker 时：
+```bash
+herdr pane send-text <pane> \
+  "完整任务说明见 /tmp/cfx-<名>.md；先通读，再严格执行。"
+herdr pane send-keys <pane> enter
+herdr pane read <pane> --source visible
+```
+Codex 的大型、多回合任务可在初始说明前使用 `/goal`。追加指令使用普通消息，避免替换当前 goal。
+其他 worker 使用普通消息。
+## 等待与巡检
+Herdr 已识别 worker：
+```bash
+herdr agent wait cfx-<名> --timeout 3600000
+```
+将长时间等待作为后台 shell 任务运行。等待结束后读取 agent 输出；超时视为巡检信号，不视为失败结论。
+Herdr 未识别 worker 时，在心跳中读取：
+```bash
+herdr pane read <pane> --source visible --lines 50
+```
+每次心跳执行：
+```bash
+herdr agent list
+herdr pane list
+```
+对运行中的线程逐个读取近况。只保留一句状态结论：
+- 继续执行：不干预；
+- 偏离任务：发送 `esc` 软停，再发送纠偏说明；
+- 已完成：进入独立验证；
+- 需要用户裁决：更新 workspace label，并发送通知；
+- 长时间无进展：读取上下文，判断阻塞、纠偏或停止。
+```bash
+herdr agent send-keys cfx-<名> esc
+herdr pane send-keys <pane> esc
+herdr workspace rename <wid> "cfx <任务名> · ❓等你"
 herdr notification show "需要你裁决" --body "<一句话>" --sound request
-herdr worktree remove --workspace <wid> --force       # 回收线程;分支自删 git branch -D cfx/<任务名>
-herdr workspace close <wid>                           # 回收编组;副本另收 git worktree remove <副本路径>
 ```
-
-## 合并门禁:唯一真正拦住问题的地方
-
-实测 43 次巡检 tick 抓到 0 个质量问题,质量问题 100% 在这一节被抓。**别加密巡检,要加厚门禁。**
-
-1. **协调器独立复跑,不读 worker 的自称。** worker 自查拦得住"自称完成",拦不住量错对象。
-2. **机器验布尔量,人验连续量。** 覆盖率/面积/时序余量/精度这类,机器只看到"有个数字"。实测一次
-   人工抽查捅破了"覆盖率 dashboard 把测试平台自身代码算进分母,两套平台数学上不可比"——worker
-   100% 满足契约,同时量错对象。裁不动的连续量交人。
-3. 有界读 diff → 跑验证 → 绿了才 rebase + 合本地 main → 回填基线文档。
-
-## tick:事件驱动为主,稀疏心跳兜底
-
-主等待路径是 `herdr agent wait` 后台任务;`/loop` 心跳放到 20-30 分钟,**只兜"worker 卡死不动"的底**
-——实测 43 次 tick 的全部战果是 2 次卡死唤醒,却吃掉 79% 的成本。每个 tick 必须 `herdr agent list`
-全量扫一遍,不能只看唤醒源,working 线程逐个 read 近况;**逐 tick 的日志观察不进主上下文**,读完
-就丢、只留一行结论。取向:跑偏 → 驭;干完 → 按开场注入的角色处置(移交下游、上报、或过门禁合并
-后回收);裁不动 / 对外不可逆 → rename + notification,其余线程照推。**收尾硬规则:先摘要,后约钟**
-——先用中文输出一行如实摘要(no-op 也要说,不绿洗),ScheduleWakeup 必须是本 turn 最后一个动作,
-顺序反了 tick 会静默收工(已观测多次)。
+有未识别 worker 时，应按其预期运行时长设置足够频繁的心跳。使用 `/loop` 时，每轮先输出中文状态摘要，
+再安排下一次唤醒。
+## 验证与合并
+1. 独立读取有界 diff，不以 worker 的完成声明代替验证。
+2. 独立执行任务说明中的验证命令。
+3. 检查连续指标的对象、口径和基线；无法客观裁定时交由用户。
+4. 验证通过后，将 worker 分支 rebase 到最新本地 `main`。
+5. 合并到本地 `main`，必要时更新基线文档。
+6. 不推送远端。
+## 回收
+```bash
+herdr worktree remove --workspace <wid> --force
+git branch -D cfx/<任务名>
+herdr workspace close <wid>
+git worktree remove <副本路径>
+```
+回收前确认产物、验证记录和需要保留的结论均已落盘。

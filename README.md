@@ -1,35 +1,35 @@
 # curryflows
 
-[herdr](https://herdr.dev) + codex/kimi + Claude Code `/loop` 的 herdr 注入器:把长跑
-worker 起在 herdr workspace 里,注入契约、事件唤醒、心跳巡检、驭偏、回收——只提供机制,
-不预设流程。
+curryflows 使用 [herdr](https://herdr.dev) 编排用户指定的交互式 worker CLI。它负责创建隔离
+worktree、启动任务、等待与巡检、组织只读复核、验证、合并到本地 `main`，以及回收资源。
 
-## 它怎么工作
+## 功能
 
-- 每个用本 skill 的 Claude Code session,角色由你开场注入:派构建者、派评审位、裁决
-  合并,或小任务全包。典型用法是拆两个 session——一个专职派工 + 裁决,另一个专职
-  `/loop` 盯完工 + 起评审位,互不挤占上下文。
-- 起线程:每线程独立 git 分支 + worktree + herdr workspace,worker 长跑(默认 codex,
-  `model_reasoning_effort=max`;可点名换 kimi k3,契约不走 /goal、以普通消息注入)。
-- 只读位:评审、审计类角色用只读 argv(codex `-s read-only` / kimi `--plan` / claude
-  `--permission-mode plan`),要跑代码的复验位在 detached-HEAD 副本里跑。
-- 完成靠 `herdr agent wait` 事件唤醒(阻塞 wait 挂后台任务,退出即唤醒);`/loop` 心跳
-  放稀到 20-30 分钟,只兜 worker 卡死不动的底——拦问题靠合并门禁,不靠加密巡检。
-- 合并门禁:协调器独立复跑不读 worker 自称,机器验布尔量、人验连续量,绿了才 rebase
-  合本地 main。推送远端永远归人类。
-- 需要人类裁决时:workspace 改名标记 + herdr 弹通知;其余线程照推,不等人。
+- 每个可写 worker 使用独立 `cfx/*` 分支、git worktree 和 Herdr workspace。
+- 获得用户明确授权后，以各 worker 的全权限模式启动可写线程。
+- 支持 Herdr 可识别的 agent，也支持通过 pane 控制未识别的交互式 CLI。
+- 长任务说明存放在 worktree 外，通过短消息发送文件路径。
+- Herdr 可识别的 worker 使用 `agent wait` 检测完成；其他 worker 通过心跳读取 pane。
+- 评审位使用只读参数；需要执行代码时使用 detached-HEAD worktree。
+- 协调器独立检查 diff 和验证结果，通过后才合并到本地 `main`。
+- 需要用户处理时更新 workspace label 并发送 Herdr 通知。
+- 不推送远端。
 
-窗口排布:session 创建的一切 workspace(构建线程、评审编组同款)挂它自己名下、排在
-其正后方:
+可写 worker 参数：
 
-```
-herdr workspaces
-  w1  curryGPU            [claude ● idle]     ← 派工 session
-  w2    cfx rtl-smem      [codex ▶ working]
-  w3    cfx compiler      [codex ▶ working]
-  w4  curryGPU_rv         [claude ● idle]     ← 评审 session
-  w5    cfx-rv rtl-smem   [rv-* 一位一 tab,只读]
-```
+| worker | 参数 |
+|---|---|
+| `codex` / `tcodex` | `--dangerously-bypass-approvals-and-sandbox` |
+| `claude` / `tclaude` | `--dangerously-skip-permissions` |
+| `kimi` | `--yolo` |
+| `codebuddy` | `--dangerously-skip-permissions` |
+
+## 依赖
+
+- Herdr 0.8 或更高版本
+- 至少一个 worker CLI
+- Git 2.5 或更高版本
+- Claude Code
 
 ## 安装
 
@@ -37,18 +37,12 @@ herdr workspaces
 git clone <repo-url> ~/.claude/skills/curryflows
 ```
 
-依赖:[herdr](https://herdr.dev) ≥0.8、codex CLI、kimi CLI、git ≥2.5(worktree)、Claude Code。
-0.8 重排了 CLI(`agent send`/顶层 `wait` 已废,改 `agent prompt`/`agent wait`),配方按 0.8 写。
-
 ## 用法
 
 ```text
-/curryflows 你是派工位:把 parser 迁移拆线程发出去,完工改 label 标待评审
-/curryflows 你是评审位:/loop 盯 cfx 线程,谁完工就起只读位评审,findings 落文件通知我
+/curryflows 你是派工位：把 parser 迁移拆成并行线程，完成后标记为待评审
+/curryflows 你是评审位：巡检 cfx 线程，完成后启动只读评审并汇报 findings
+/curryflows 完整推进这个任务：派工、验证、合并到本地 main，但不要推送
 ```
 
-## 设计取向
-
-没有看板文件、没有辅助脚本、没有预设流程——机制在 skill,角色由你注入,状态活在 herdr,
-唯一的持久物是 git 分支上的产物。前提是状态全部外置(契约落文件、事实落仓库文档、进度落
-git)——协调器上下文会被压缩,记在脑子里的一定丢。全部约定见 [SKILL.md](SKILL.md),127 行读完。
+具体操作见 [SKILL.md](SKILL.md)。
