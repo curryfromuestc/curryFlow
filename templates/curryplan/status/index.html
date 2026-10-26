@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>__PROJECT__ 状态</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<meta name="theme-color" content="#2747B0">
+<link rel="stylesheet" href="/kit.css">
+<link rel="stylesheet" href="/ui.css">
+<style>
+.v { font: 600 12px var(--mono); padding: 1px 7px; border-radius: 999px; background: var(--sunk); color: var(--ink-2); white-space: nowrap; }
+.v.PASS, .v.done { background: color-mix(in srgb, var(--c3) 18%, transparent); color: var(--c3); }
+.v.FAIL, .v.failed { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+.v.RUNNING, .v.running, .v.msg { background: var(--accent-soft); color: var(--accent); }
+.mono { font: 12.5px var(--mono); }
+.dim { color: var(--ink-3); }
+.rep { font-size: 12.5px; color: var(--ink-2); max-width: 36em; white-space: pre-wrap; }
+.stale { color: var(--warn); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <a class="back" href="/">← 全部</a>
+  <div class="top"><h1>__PROJECT__ 状态</h1><span class="sub" id="sub">读取中…</span><span class="dl" id="at"></span></div>
+</header>
+<p class="oneline" id="line"></p>
+
+<section class="sec"><h2>任务 <small>refs/tasks/*</small></h2>
+  <div class="card wide scroll"><table class="t" id="tasks"></table></div></section>
+<section class="sec"><h2>验收 <small>候选 × 阶段，refs/ci/*</small></h2>
+  <div class="card wide scroll"><table class="t" id="cands"></table></div></section>
+<section class="sec"><h2>执行端 <small>心跳和槽位</small></h2>
+  <div class="card wide scroll"><table class="t" id="execs"></table></div></section>
+<section class="sec"><h2>磁盘 <small>executor 每天一份</small></h2>
+  <div class="card wide scroll"><table class="t" id="usage"></table></div></section>
+</div>
+<script>
+(function () {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const ago = (t) => { if (!t) return "-"; const s = (Date.now() - Date.parse(t)) / 1000; return s < 90 ? Math.round(s) + " 秒前" : s < 5400 ? Math.round(s / 60) + " 分前" : s < 172800 ? Math.round(s / 3600) + " 小时前" : Math.round(s / 86400) + " 天前"; };
+  const old = (t, sec) => t && (Date.now() - Date.parse(t)) / 1000 > sec;
+  const gb = (b) => b == null ? "-" : (b / 2 ** 30).toFixed(b < 2 ** 30 ? 2 : 1) + " GB";
+  const v = (s) => `<span class="v ${esc(String(s).split(" ")[0])}">${esc(String(s).split(" ")[0])}</span>`;
+  const row = (cells) => "<tr>" + cells.map((c) => `<td>${c}</td>`).join("") + "</tr>";
+  const head = (cols) => "<tr>" + cols.map((c) => `<th>${c}</th>`).join("") + "</tr>";
+  function render(s) {
+    const l = s.lease;
+    $("sub").textContent = `中枢 ${s.hub} · main ${(s.main.sha || "-").slice(0, 10)} ${s.main.subject || ""}`;
+    $("at").textContent = "数据 " + ago(s.at);
+    $("line").innerHTML = l ? `协调器 <b>${esc(l.holder)}</b>（${esc(l.host)}），心跳 <span class="${old(l.beat, 60) ? "stale" : ""}">${ago(l.beat)}</span>` : "没有协调器在跑";
+    const open = s.tasks.filter((t) => t.state !== "closed");
+    $("tasks").innerHTML = head(["任务", "状态", "轮", "机器 / 容器", "agent", "wip", "最后汇报"]) +
+      (open.concat(s.tasks.filter((t) => t.state === "closed").slice(-5))).map((t) => row([
+        `<b>${esc(t.id)}</b>`, v(t.state), t.round, `${esc(t.machine || "-")} <span class="dim mono">${esc(t.box || "")}${t.box_removed ? "（已删）" : ""}</span>`,
+        esc((t.agent || "") + (t.model ? " " + t.model : "")), `<span class="mono">${esc((t.wip || "-").slice(0, 10))}</span>`,
+        `<div class="rep">${esc((t.report || "").split("\n")[0])}</div>`])).join("");
+    $("cands").innerHTML = head(["候选", "提交", "阶段", "结论"]) + s.candidates.slice().reverse().slice(0, 30).map((c) => row([
+      `<b>${esc(c.cid)}</b>${c.open ? "" : ' <span class="dim">已出队</span>'}`, `<span class="mono">${esc((c.cand || "").slice(0, 10))}</span>`,
+      Object.entries(c.stages).map(([k, x]) => `${esc(k)} ${v(x.verdict)} <span class="dim mono">${esc(x.machine ? x.machine + "/" + x.slot : "")}${x.seconds ? " " + x.seconds + "s" : ""}</span>`).join("<br>"),
+      c.verdict ? v(c.verdict) : ""])).join("");
+    $("execs").innerHTML = head(["机器", "心跳", "后端", "槽位", "忙", "agent 容器"]) + Object.values(s.executors).map((e) => row([
+      `<b>${esc(e.machine)}</b>${e.shared ? ' <span class="dim">共享机</span>' : ""}`, `<span class="${old(e.at, 300) ? "stale" : ""}">${ago(e.at)}</span>`, esc(e.backend),
+      esc(Object.entries(e.slots || {}).map(([k, c]) => k).join(" ")), esc((e.busy || []).join(" ") || "无"), `${(e.boxes || []).length} / ${e.seats || 0}`])).join("");
+    $("usage").innerHTML = head(["机器", "报告", "共享缓存", "结果产物", "容器", "构建 .build", "盘剩余"]) + Object.values(s.usage).map((u) => row([
+      `<b>${esc(u.machine)}</b>`, ago(u.at), `${gb(u.cache.bytes)} / ${u.cache.budget_gb} GB · ${u.cache.entries} 项`,
+      `${gb(u.artifacts.bytes)} · 基线 ${u.artifacts.pinned} · 留 ${u.artifacts.keep_days} 天`,
+      (u.containers || []).map((c) => `${esc(c.name)} ${gb(c.used)}${c.quota ? " / " + esc(c.quota) : ""}`).join("<br>") || "-",
+      gb(u.build), `${gb(u.fs_free)} / ${gb(u.fs_total)}`])).join("");
+  }
+  function load() {
+    fetch("status.json", { cache: "no-store" }).then((r) => r.json()).then(render)
+      .catch(() => { $("sub").textContent = "读不到 status.json（中枢不通，或定时任务没跑）"; });
+  }
+  load(); setInterval(load, 30000);
+})();
+</script>
+<script src="/kit.js"></script>
+<script src="/ui.js"></script>
+</body>
+</html>

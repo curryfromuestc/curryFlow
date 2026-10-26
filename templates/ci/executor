@@ -1,0 +1,687 @@
+#!/usr/bin/env python3
+"""每台机器上的常驻进程：只往外连中枢，协调器从不登录执行机。
+
+  ci/executor probe                     看本机拓扑（L3 域、NUMA、内存、GPU、磁盘、容器后端、各节点负载），给出槽位建议
+  ci/executor install --machine NAME    按 ci/machines 建槽位容器、缓存目录，检查中枢和 agentbox
+  ci/executor start --machine NAME      在 herdr 里起 run（人可以 attach 看）；已在跑就不动
+  ci/executor stop                      停掉本 clone 起的 executor（只杀 pid 文件里的进程）
+  ci/executor run --machine NAME        前台循环：领任务开 agent 容器、领验收作业跑槽位、心跳、每天出占用报告
+
+任务：看 refs/tasks/*，推 refs/claims/task-<id> 认领（已存在就被拒，等于锁），用 agentctl 开一个 incus 容器，
+容器里从中枢 clone，在容器的 herdr 里无头跑 codex exec --json / claude -p --output-format stream-json；
+agent 推 wip/<id>，最后一条消息作为汇报写回任务 ref；协调器追加的消息用 resume 在同一个容器里续；任务关了删容器。
+验收：看 refs/ci/queue/*，推 refs/claims/ci-<job> 认领，在固定核的槽位里跑候选自己的 ci/accept --stage，
+结论和关键报告推 refs/ci/result/<job>；大文件留本机 .build/executor/artifacts，7 天后删，基线（--pin）留到有新基线。
+"""
+import argparse
+import hashlib
+import json
+import os
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+sys.dont_write_bytecode = True  # 派生物只准在 .build/ 下，ci/__pycache__ 也不行
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cflib import (BUILD, ROOT, GitError, Hub, commit, cpus, git, load_machines, now, show,  # noqa: E402
+                   show_json, task_view, under)
+
+POLL = 10
+EXE = BUILD / "executor"
+HERDR = shutil.which("herdr") or os.path.expanduser("~/.local/bin/herdr")
+
+
+def log(msg):
+    line = f"{time.strftime('%m-%d %H:%M:%S')} {msg}"
+    print(line, flush=True)
+    with open(EXE / "log", "a") as f:
+        f.write(line + "\n")
+
+
+def sh(cmd, check=True, input=None, **kw):
+    r = subprocess.run(cmd, input=input, capture_output=True, text=input is None or isinstance(input, str), **kw)
+    if check and r.returncode:
+        err = r.stderr if isinstance(r.stderr, str) else r.stderr.decode(errors="replace")
+        raise RuntimeError(f"{shlex.join(map(str, cmd))[:200]}: {err.strip()[-500:]}")
+    return r
+
+
+def js(o):
+    return json.dumps(o, ensure_ascii=False, indent=1) + "\n"
+
+
+# ---------------------------------------------------------------- incus
+
+def incus(*args, check=True, input=None):
+    return sh(["incus", *args], check=check, input=input)
+
+
+def box_sh(box, script, check=True, user=True):
+    pre = ["--user", "1000", "--group", "1000", "--env", "HOME=/home/agent", "--cwd", "/home/agent"] if user else []
+    return incus("exec", box, *pre, "--", "bash", "-lc", script, check=check)
+
+
+def box_push(box, data, path, mode="600"):
+    incus("file", "push", "-", f"{box}{path}", "--mode", mode, "--uid", "1000", "--gid", "1000", input=data)
+
+
+def exists(name):
+    return incus("info", name, check=False).returncode == 0
+
+
+class Executor:
+    def __init__(self, name):
+        self.cfg = load_machines()
+        self.name = name
+        self.m = self.cfg["machines"][name]
+        self.proj = self.cfg["project"]
+        self.hub = Hub(self.cfg)
+        self.incus = self.m["backend"] == "incus"
+        self.jobs = {}       # job -> {proc, slot, t0, ...}
+        self.views = {}      # sha -> parsed json (refs are immutable by sha)
+        self.last_beat = 0
+        self.cache_dir = os.path.expanduser(self.m["cache"]["dir"])
+        if self.m.get("hub_proxy"):
+            os.environ["CURRYFLOW_HUB_PROXY"] = self.m["hub_proxy"]
+
+    # ------------------------------------------------------------ helpers
+    def view(self, sha, path):
+        k = (sha, path)
+        if k not in self.views:
+            self.views[k] = show_json(sha, path, {})
+        return self.views[k]
+
+    def task(self, sha):
+        if (sha, "task") not in self.views:
+            self.views[(sha, "task")] = task_view(sha)
+        return self.views[(sha, "task")]
+
+    def box_name(self, tid):
+        return f"cf-{self.proj}-{tid}"
+
+    def slot_name(self, slot):
+        return f"cf-{self.proj}-{slot}"
+
+    def update_task(self, tid, msg, **fields):
+        reports = fields.pop("_report", None)
+
+        def fn(old):
+            st = show_json(old, "state.json", {})
+            st.update(fields, updated=now())
+            files = {"state.json": js(st)}
+            if reports is not None:
+                files[f"reports/{st['round']:03d}.md"] = reports
+            return files
+        self.hub.update(f"refs/tasks/{tid}", fn, f"task {tid}: {msg}")
+
+    # ------------------------------------------------------------ main loop
+    def run(self):
+        EXE.mkdir(parents=True, exist_ok=True)
+        (EXE / "pid").write_text(f"{os.getpid()}\n")
+        signal.signal(signal.SIGTERM, self.term)
+        log(f"executor {self.name} 起来了（{self.m['backend']}，槽位 {', '.join(self.m['slots'])}，"
+            f"agent 席位 {len(self.m.get('agents', {}).get('seats', []))}）")
+        while True:
+            try:
+                self.tick()
+            except (GitError, RuntimeError) as e:
+                log(f"这一轮出错：{e}")
+            time.sleep(POLL)
+
+    def term(self, *_):
+        for job, j in self.jobs.items():
+            j["proc"].terminate()
+            log(f"停下：作业 {job} 中断，重启后重跑")
+        sys.exit(0)
+
+    def tick(self):
+        rs = self.hub.sync()
+        claims = under(rs, "refs/claims/")
+        if self.m.get("agents", {}).get("seats"):
+            self.tasks(rs, claims)
+        self.ci(rs, claims)
+        self.beat(rs)
+        self.daily()
+
+    # ------------------------------------------------------------ tasks
+    def my_boxes(self, rs, claims):
+        out = {}
+        for tid, sha in under(rs, "refs/tasks/").items():
+            c = claims.get(f"task-{tid}")
+            t = self.task(sha)
+            if c and self.view(c, "claim.json").get("machine") == self.name and not t.get("box_removed"):
+                out[tid] = t
+        return out
+
+    def tasks(self, rs, claims):
+        mine = self.my_boxes(rs, claims)
+        seats = self.m["agents"]["seats"]
+        used = {t.get("seat") for t in mine.values()}
+        for tid, sha in sorted(under(rs, "refs/tasks/").items()):
+            t = self.task(sha)
+            if f"task-{tid}" in claims or t.get("state") != "open" or t.get("machine") not in ("", None, self.name):
+                continue
+            free = [i for i in range(len(seats)) if i not in used]
+            if not free:
+                break
+            if self.hub.create(f"refs/claims/task-{tid}", {"claim.json": js({"machine": self.name, "at": now()})},
+                               f"claim task {tid} on {self.name}"):
+                log(f"领到任务 {tid}")
+                used.add(free[0])
+                mine[tid] = dict(t, seat=free[0], _new=True)
+        for tid, t in mine.items():
+            if t.get("state") == "open" and "seat" not in t:
+                t["seat"] = next(i for i in range(len(seats)) if i not in used)
+                used.add(t["seat"])
+            try:
+                self.drive(tid, t)
+            except (RuntimeError, GitError) as e:
+                log(f"任务 {tid} 出错：{e}")
+                if t.get("state") not in ("closed", "failed"):
+                    self.update_task(tid, "failed", state="failed", _report=f"executor 出错：{e}\n")
+
+    def drive(self, tid, t):
+        st = t.get("state")
+        if st == "open":
+            self.start_task(tid, t, t.get("seat", 0))
+        elif st == "running":
+            self.check_round(tid, t)
+        elif st == "msg":
+            self.start_round(tid, t, t["pending"])
+        elif st == "closed" and t.get("box"):
+            box = t["box"]
+            if exists(box):
+                sh([self.m["agents"].get("agentctl", "agentctl"), "rm", box], check=False)
+            if exists(box):
+                raise RuntimeError(f"{box} 删不掉")
+            log(f"任务 {tid} 关了，容器 {box} 连同构建已删")
+            self.update_task(tid, "box removed", box_removed=True)
+
+    def start_task(self, tid, t, seat):
+        a = self.m["agents"]
+        box = self.box_name(tid)
+        if exists(box):
+            sh([a.get("agentctl", "agentctl"), "rm", box], check=False)
+        log(f"任务 {tid}：开容器 {box}（cpu {a['seats'][seat]}，内存 {a['mem']}，盘 {a['disk']}）")
+        with open(EXE / f"box-{tid}.log", "w") as f:
+            r = subprocess.run([a.get("agentctl", "agentctl"), "new", box, "--cpu", str(a["seats"][seat]),
+                                "--mem", a["mem"], "--disk", a["disk"], "--token", str(a.get("token", 1))],
+                               stdout=f, stderr=subprocess.STDOUT)
+        if r.returncode:
+            raise RuntimeError(f"agentctl new 失败，见 {EXE / f'box-{tid}.log'}")
+        incus("config", "device", "add", box, "cache", "disk", f"source={self.cache_dir}", "path=/cache",
+              "readonly=true", check=False)
+        hosts = " ".join(sorted({u.split("@")[1].split(":")[0] for u in self.cfg["hubs"]}))
+        proxy = self.m.get("hub_proxy")
+        conf = f"Host {hosts}\n  User ci\n  StrictHostKeyChecking accept-new\n" + (
+            f"  ProxyCommand nc -X connect -x {proxy} %h %p\n" if proxy else "")
+        box_sh(box, "mkdir -p ~/.cf ~/.ssh")
+        box_sh(box, f"cat >> ~/.ssh/config <<'EOF'\n{conf}EOF\nchmod 600 ~/.ssh/config")
+        url = self.hub.url or self.cfg["hubs"][0]
+        d = f"/home/agent/{self.proj}"
+        box_sh(box, f"git clone -q {shlex.quote(url)} {d} && cd {d} && git checkout -q -b wip/{tid} {t['base']}")
+        box_push(box, self.prompt(tid, t), "/home/agent/.cf/TASK.md")
+        self.update_task(tid, "box up", state="running", round=0, machine=self.name, box=box, seat=seat,
+                         agent=t.get("agent", "codex"))
+        self.start_round(tid, dict(t, box=box), 1)
+
+    def prompt(self, tid, t):
+        return f"""# 任务 {tid}
+
+{t['goal'].strip()}
+
+## 验收条件
+{t.get('accept') or '见上文'}
+
+## 预算
+{t.get('budget') or '小任务：一两个小时以内'}
+
+## 规矩
+- 你在一个独立的容器里，仓库在 /home/agent/{self.proj}，分支 wip/{tid}，从 main 的 {t['base'][:10]} 开出；项目规则见仓库里的 AGENTS.md。
+- 只写代码；不跑整套验收（不要跑不带参数的 ci/accept），最多 3 次短的诊断运行（单个用例或单个快阶段）。整套验收由协调器排队跑。
+- 派生文件只放在 .build/ 下。不要把本文件提交进仓库。
+- 做完：提交，然后 `git push origin HEAD:refs/heads/wip/{tid}`。没 push 上就是没做完。
+- 只汇报一次，在最后：你的最后一条消息就是汇报——改了什么、怎么验证的、哪里没做或拿不准。中途不要停下来问。
+- 同一个问题 2–3 轮没有进展就停：push 已有的东西，在汇报里写清卡在哪、试过什么、你猜原因是什么。
+"""
+
+    def start_round(self, tid, t, n):
+        box = t["box"]
+        d = f"/home/agent/{self.proj}"
+        if n == 1:
+            ask = "读 ~/.cf/TASK.md，按它把任务做完。"
+        else:
+            msg = show(t["sha"], f"msgs/{n:03d}.md", "")
+            box_push(box, msg + f"\n\n（做完照旧提交并 push 到 wip/{tid}；最后一条消息是汇报。）\n",
+                     f"/home/agent/.cf/msg-{n:03d}.md")
+            ask = f"协调器的新消息在 ~/.cf/msg-{n:03d}.md，读它并照做。"
+        model, effort, sid = t.get("model"), t.get("effort"), t.get("session")
+        if t.get("agent", "codex") == "claude":
+            cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions"]
+            cmd += ["--model", model] if model else []
+            cmd += ["--resume", sid] if n > 1 else []
+            cmd += [ask]
+        else:
+            opts = ["--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
+                    "-o", f"/home/agent/.cf/last-{n:03d}.md"]
+            opts += ["-m", model] if model else []
+            opts += ["-c", f"model_reasoning_effort={effort}"] if effort else []
+            cmd = ["codex", "exec", *(["resume", *opts, sid] if n > 1 else opts), ask]
+        script = (f"#!/bin/bash\ncd {d}\n{shlex.join(cmd)} | tee ~/.cf/events-{n:03d}.jsonl\n"
+                  f"echo ${{PIPESTATUS[0]}} > ~/.cf/exit-{n:03d}\n")
+        box_push(box, script, f"/home/agent/.cf/round-{n:03d}.sh", "755")
+        pane = t.get("pane")
+        if not pane or box_sh(box, f"herdr pane run {pane} 'bash ~/.cf/round-{n:03d}.sh'", check=False).returncode:
+            ws = json.loads(box_sh(box, f"herdr workspace create --cwd {d} --label {tid} --no-focus").stdout)
+            pane = ws["result"]["root_pane"]["pane_id"]
+            box_sh(box, f"herdr pane run {pane} 'bash ~/.cf/round-{n:03d}.sh'")
+        log(f"任务 {tid}：第 {n} 轮开跑（{t.get('agent', 'codex')}，容器 {box} 的 herdr 窗格 {pane}）")
+        self.update_task(tid, f"round {n}", state="running", round=n, pane=pane)
+
+    def check_round(self, tid, t):
+        n, box = t["round"], t["box"]
+        r = box_sh(box, f"cat ~/.cf/exit-{n:03d} 2>/dev/null", check=False)
+        if not r.stdout.strip():
+            return
+        rc = int(r.stdout.strip())
+        events = box_sh(box, f"cat ~/.cf/events-{n:03d}.jsonl", check=False).stdout.splitlines()
+        sid, last, tokens = t.get("session"), "", dict(t.get("tokens") or {})
+        for line in events:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if e.get("type") == "thread.started":
+                sid = e["thread_id"]
+            if e.get("session_id"):
+                sid = e["session_id"]
+            u = e.get("usage") if e.get("type") in ("turn.completed", "result") else None
+            for k, v in (u or {}).items():
+                if isinstance(v, int):
+                    tokens[k] = tokens.get(k, 0) + v
+            if e.get("type") == "result":
+                last = e.get("result") or ""
+        if t.get("agent", "codex") == "codex":
+            last = box_sh(box, f"cat ~/.cf/last-{n:03d}.md", check=False).stdout
+        wip = self.hub.ls(f"refs/heads/wip/{tid}").get(f"refs/heads/wip/{tid}")
+        state = "done" if rc == 0 else "failed"
+        note = "" if wip else f"\n\n（executor：中枢上没有 wip/{tid}，agent 没 push）\n"
+        log(f"任务 {tid} 第 {n} 轮结束：{state}，wip {(wip or '无')[:10]}")
+        self.update_task(tid, state, state=state, session=sid, wip=wip, tokens=tokens, exit=rc,
+                         _report=(last.strip() or f"（agent 没留下最后一条消息，退出码 {rc}）") + note)
+
+    # ------------------------------------------------------------ CI
+    def busy(self):
+        return {j["slot"] for j in self.jobs.values()}
+
+    def free_slot(self, cls):
+        """A free slot of class CLS whose cpus no busy slot uses; build slots may oversubscribe."""
+        sl = self.m["slots"]
+        taken = set().union(set(), *[cpus(sl[s]["cpus"]) for s in self.busy() if sl[s]["class"] != "build"])
+        for s, v in sl.items():
+            if v["class"] == cls and s not in self.busy() and (cls == "build" or not cpus(v["cpus"]) & taken):
+                return s
+        return None
+
+    def ci(self, rs, claims):
+        for job, sha in sorted(under(rs, "refs/ci/queue/").items()):
+            if f"refs/ci/result/{job}" in rs or job in self.jobs:
+                continue
+            spec = self.view(sha, "job.json")
+            c = claims.get(f"ci-{job}")
+            if c is None:
+                slot = self.free_slot(spec["class"])
+                if not slot:
+                    continue
+                claim = {"machine": self.name, "slot": slot, "cpus": self.m["slots"][slot]["cpus"], "at": now()}
+                if not self.hub.create(f"refs/claims/ci-{job}", {"claim.json": js(claim)}, f"claim {job}"):
+                    continue
+            else:
+                claim = self.view(c, "claim.json")
+                if claim.get("machine") != self.name or claim["slot"] in self.busy():
+                    continue
+                log(f"作业 {job} 是本机领的但没在跑（executor 重启过），重跑")
+                slot = claim["slot"]
+            try:
+                self.start_job(job, spec, slot)
+            except (RuntimeError, GitError) as e:
+                log(f"作业 {job} 起不来：{e}")
+                self.push_result(job, spec, slot, 1, 0, f"FAIL {spec['stage']} executor 起不来：{e}", {})
+        for job, j in list(self.jobs.items()):
+            if j["proc"].poll() is not None:
+                self.finish_job(job, j)
+
+    def stage_spec(self, cand, stage):
+        src = show(cand, "ci/accept")
+        r = sh([sys.executable, "-", "--list", "--json"], input=src)
+        return next(s for s in json.loads(r.stdout) if s["name"] == stage)
+
+    def start_job(self, job, spec, slot):
+        cand, stage, s = spec["cand"], spec["stage"], self.m["slots"][slot]
+        git("cat-file", "-e", cand)
+        env = self.ensure_caches(cand, self.stage_spec(cand, stage).get("cache", {}), s["cpus"])
+        env["CF_SLOT"] = slot
+        if "gpu" in s:
+            env["CUDA_VISIBLE_DEVICES"] = str(s["gpu"])
+        art = EXE / "artifacts" / job
+        shutil.rmtree(art, ignore_errors=True)
+        art.mkdir(parents=True)
+        archive = git("archive", "--format=tar", cand, raw=True).stdout
+        if self.incus:
+            c, work = self.slot_name(slot), f"/home/agent/work/{job}"
+            box_sh(c, f"rm -rf {work} && mkdir -p {work}")
+            incus("exec", c, "--user", "1000", "--group", "1000", "--", "tar", "-x", "-C", work, input=archive)
+            envs = [x for k, v in env.items() for x in ("--env", f"{k}={v}")]
+            cmd = ["incus", "exec", c, "--user", "1000", "--group", "1000", "--env", "HOME=/home/agent", "--cwd", work,
+                   *envs, "--", "python3", "ci/accept", "--stage", stage]
+            cwd, penv = None, None
+        else:
+            work = EXE / "jobs" / job
+            shutil.rmtree(work, ignore_errors=True)
+            work.mkdir(parents=True)
+            sh(["tar", "-x", "-C", str(work)], input=archive)
+            cmd = ["systemd-run", "--user", "--scope", "-q", "-p", f"MemoryMax={s['mem']}", "--",
+                   "taskset", "-c", s["cpus"], sys.executable, "ci/accept", "--stage", stage]
+            cwd, penv = work, {**os.environ, **env}
+        logf = open(art / "run.log", "w")
+        proc = subprocess.Popen(cmd, cwd=cwd, env=penv, stdout=logf, stderr=subprocess.STDOUT)
+        self.jobs[job] = {"proc": proc, "slot": slot, "t0": time.time(), "spec": spec, "work": str(work), "log": logf}
+        log(f"作业 {job}：在槽位 {slot}（cpu {s['cpus']}）跑 ci/accept --stage {stage}")
+
+    def finish_job(self, job, j):
+        j["log"].close()
+        spec, slot, rc = j["spec"], j["slot"], j["proc"].returncode
+        art = EXE / "artifacts" / job
+        if self.incus:
+            c = self.slot_name(slot)
+            out = incus("exec", c, "--", "tar", "-C", f"{j['work']}/.build", "-cf", "-", "accept", check=False,
+                        input=b"").stdout
+            if out:
+                sh(["tar", "-x", "-C", str(art)], input=out)
+            box_sh(c, f"rm -rf {j['work']}", check=False)
+        else:
+            if os.path.isdir(f"{j['work']}/.build/accept"):
+                shutil.move(f"{j['work']}/.build/accept", art / "accept")
+            shutil.rmtree(j["work"], ignore_errors=True)
+        text = (art / "run.log").read_text(errors="replace")
+        line = next((l for l in text.splitlines() if l.split(" ")[0] in ("PASS", "FAIL", "SKIP")),
+                    f"FAIL {spec['stage']} rc={rc}")
+        if rc not in (0, 77) and line.startswith("PASS"):
+            line = f"FAIL {spec['stage']} rc={rc}"
+        reports = {"reports/run.log": "\n".join(text.splitlines()[-200:]) + "\n"}
+        rep = art / "accept" / spec["stage"]
+        for p in sorted(rep.rglob("*")) if rep.is_dir() else []:
+            if p.is_file() and p.suffix in (".txt", ".json", ".md") and p.stat().st_size <= 65536:
+                reports[f"reports/{p.relative_to(rep)}"] = p.read_text(errors="replace")
+        if spec.get("pin"):
+            for other in (EXE / "artifacts").glob(f"*.{spec['stage']}"):
+                (other / "PINNED").unlink(missing_ok=True)
+            (art / "PINNED").write_text(now() + "\n")
+        del self.jobs[job]
+        self.push_result(job, spec, slot, rc, time.time() - j["t0"], line, reports)
+
+    def push_result(self, job, spec, slot, rc, secs, line, reports):
+        res = {"job": job, "cid": spec["cid"], "stage": spec["stage"], "cand": spec["cand"], "machine": self.name,
+               "slot": slot, "cpus": self.m["slots"][slot]["cpus"], "backend": self.m["backend"], "rc": rc,
+               "seconds": round(secs, 1), "artifacts": f"{socket.gethostname()}:{EXE / 'artifacts' / job}",
+               "keep": "基线，保留到有新基线" if spec.get("pin") else f"{self.m.get('keep_days', 7)} 天", "at": now()}
+        ok = self.hub.create(f"refs/ci/result/{job}", {"verdict": line + "\n", "result.json": js(res), **reports},
+                             f"result {job}: {line}", parent=spec["cand"])
+        log(f"作业 {job} 结论：{line}" + ("" if ok else "（中枢上已有结论，没覆盖）"))
+
+    # ------------------------------------------------------------ 缓存
+    def ensure_caches(self, cand, needs, cpuset):
+        env = {}
+        os.makedirs(self.cache_dir, exist_ok=True)
+        for name, spec in needs.items():
+            tool = sh(["bash", "-c", spec.get("tool", "true")], check=False)
+            trees = [git("rev-parse", f"{cand}:{p}") for p in spec["inputs"]]
+            key = hashlib.sha256("\n".join([name, *trees, tool.stdout + tool.stderr]).encode()).hexdigest()[:16]
+            d = os.path.join(self.cache_dir, f"{self.proj}-{name}-{key}")
+            if os.path.isdir(d):
+                os.utime(d)
+            else:
+                tmp = f"{d}.tmp-{os.getpid()}"
+                src = EXE / "cachebuild" / name
+                shutil.rmtree(src, ignore_errors=True)
+                shutil.rmtree(tmp, ignore_errors=True)
+                src.mkdir(parents=True)
+                os.makedirs(tmp)
+                sh(["tar", "-x", "-C", str(src)], input=git("archive", "--format=tar", cand, raw=True).stdout)
+                log(f"缓存 {name} 没命中，建 {os.path.basename(d)}")
+                sh(["taskset", "-c", cpuset, "bash", "-c", spec["build"]], cwd=src, env={**os.environ, "CF_CACHE_OUT": tmp})
+                os.rename(tmp, d)
+                shutil.rmtree(src, ignore_errors=True)
+            env[f"CF_CACHE_{name.upper()}"] = f"/cache/{os.path.basename(d)}" if self.incus else d
+        self.evict()
+        return env
+
+    def evict(self):
+        budget = self.m["cache"].get("budget_gb", 100) * 2**30
+        entries = []
+        for e in os.scandir(self.cache_dir):
+            if e.is_dir() and ".tmp-" not in e.name:
+                entries.append((e.stat().st_mtime, du(e.path), e.path))
+        total = sum(x[1] for x in entries)
+        for mtime, size, path in sorted(entries):
+            if total <= budget:
+                break
+            shutil.rmtree(path, ignore_errors=True)
+            total -= size
+            log(f"缓存超预算，按最近使用淘汰 {os.path.basename(path)}")
+
+    # ------------------------------------------------------------ 心跳、每天的报告
+    def beat(self, rs):
+        if time.time() - self.last_beat < 60:
+            return
+        boxes = []
+        if self.incus:
+            boxes = [i["name"] for i in json.loads(incus("list", f"cf-{self.proj}-", "-f", "json").stdout)
+                     if i["name"][len(f"cf-{self.proj}-"):] not in self.m["slots"]]
+        info = {"machine": self.name, "at": now(), "pid": os.getpid(), "backend": self.m["backend"],
+                "shared": self.m.get("shared", False), "slots": {k: v["class"] for k, v in self.m["slots"].items()},
+                "busy": sorted(self.busy()), "jobs": {k: v["slot"] for k, v in self.jobs.items()}, "boxes": boxes,
+                "seats": len(self.m.get("agents", {}).get("seats", []))}
+        ref = f"refs/ci/exec/{self.name}"
+        if self.hub.push(ref, commit({"exec.json": js(info)}, msg=f"exec {self.name}"), rs.get(ref, "")):
+            self.last_beat = time.time()
+
+    def daily(self):
+        stamp = EXE / "daily-at"
+        if stamp.exists() and time.time() - stamp.stat().st_mtime < 86400:
+            return
+        keep = self.m.get("keep_days", 7) * 86400
+        arts, pinned, removed = 0, 0, 0
+        for a in (EXE / "artifacts").glob("*") if (EXE / "artifacts").exists() else []:
+            if (a / "PINNED").exists():
+                pinned += 1
+            elif time.time() - a.stat().st_mtime > keep and a.name.split(".")[0] not in self.jobs:
+                shutil.rmtree(a, ignore_errors=True)
+                removed += 1
+                continue
+            arts += du(a)
+        self.evict()
+        cache = [e for e in os.scandir(self.cache_dir) if e.is_dir()] if os.path.isdir(self.cache_dir) else []
+        conts = []
+        if self.incus:
+            for i in json.loads(incus("list", f"cf-{self.proj}-", "-f", "json").stdout):
+                disk = ((i.get("state") or {}).get("disk") or {}).get("root", {})
+                conts.append({"name": i["name"], "used": disk.get("usage", 0),
+                              "quota": i.get("expanded_devices", {}).get("root", {}).get("size", "")})
+        fs = shutil.disk_usage(self.cache_dir)
+        usage = {"machine": self.name, "at": now(), "cache": {"bytes": sum(du(e.path) for e in cache),
+                 "entries": len(cache), "budget_gb": self.m["cache"].get("budget_gb", 100)},
+                 "artifacts": {"bytes": arts, "pinned": pinned, "removed_today": removed,
+                               "keep_days": self.m.get("keep_days", 7)},
+                 "containers": conts, "build": du(str(BUILD)), "fs_free": fs.free, "fs_total": fs.total}
+        ref = f"refs/ci/usage/{self.name}"
+        cur = self.hub.ls(ref).get(ref, "")
+        if self.hub.push(ref, commit({"usage.json": js(usage)}, msg=f"usage {self.name}"), cur):
+            stamp.write_text(now() + "\n")
+            log(f"占用报告：缓存 {usage['cache']['bytes'] >> 20} MB，产物 {arts >> 20} MB，删了 {removed} 份过期产物")
+
+
+def du(path):
+    r = subprocess.run(["du", "-sb", path], capture_output=True, text=True)
+    return int(r.stdout.split()[0]) if r.returncode == 0 and r.stdout else 0
+
+
+# ---------------------------------------------------------------- probe / install / start / stop
+
+def probe():
+    rows = [l.split(",") for l in sh(["lscpu", "-p=CPU,CORE,SOCKET,NODE,CACHE"]).stdout.splitlines()
+            if not l.startswith("#")]
+    l3 = {}
+    for r in rows:  # CPU,Core,Socket,Node,,L1d,L1i,L2,L3
+        cpu, core, sock, node = r[:4]
+        key = (sock, node or "0", r[-1])
+        l3.setdefault(key, {"cpus": [], "cores": set()})
+        l3[key]["cpus"].append(int(cpu))
+        l3[key]["cores"].add(core)
+
+    def busy_by_cpu():
+        def snap():
+            out = {}
+            for l in open("/proc/stat"):
+                if l.startswith("cpu") and l[3].isdigit():
+                    f = list(map(int, l.split()[1:]))
+                    out[int(l.split()[0][3:])] = (sum(f), f[3] + f[4])
+            return out
+        a = snap()
+        time.sleep(2)
+        b = snap()
+        return {c: 1 - (b[c][1] - a[c][1]) / max(1, b[c][0] - a[c][0]) for c in b}
+    load = busy_by_cpu()
+    nodes = {}
+    for (sock, node, _), v in l3.items():
+        n = nodes.setdefault(node, {"cpus": [], "l3": []})
+        n["cpus"] += v["cpus"]
+        n["l3"].append(compress(v["cpus"]))
+    for node, n in nodes.items():
+        mi = f"/sys/devices/system/node/node{node}/meminfo"
+        if os.path.exists(mi):
+            for l in open(mi):
+                if "MemTotal" in l:
+                    n["mem_gb"] = int(l.split()[-2]) >> 20
+                if "MemFree" in l:
+                    n["free_gb"] = int(l.split()[-2]) >> 20
+        n["busy_pct"] = round(100 * sum(load.get(c, 0) for c in n["cpus"]) / len(n["cpus"]))
+        n["cpus"] = compress(n["cpus"])
+    # sim 槽位 = 一个 L3 域；一个 L3 不到 8 个物理核就同一 NUMA 节点里相邻的几个拼到 8 核
+    sims, acc = [], None
+    for key in sorted(l3, key=lambda k: min(l3[k]["cpus"])):
+        v = l3[key]
+        if acc and acc["node"] == key[1]:
+            acc["cpus"] += v["cpus"]
+            acc["cores"] |= v["cores"]
+        else:
+            acc = {"node": key[1], "cpus": list(v["cpus"]), "cores": set(v["cores"])}
+        if len(acc["cores"]) >= 8:
+            sims.append({"node": acc["node"], "cpus": compress(acc["cpus"]), "cores": len(acc["cores"])})
+            acc = None
+    gpus = sh(["nvidia-smi", "-L"], check=False).stdout.splitlines() if shutil.which("nvidia-smi") else []
+    backend = "incus" if shutil.which("incus") and sh(["incus", "list", "-f", "csv"], check=False).returncode == 0 else \
+        "bare"
+    disks = {p: {"free_gb": shutil.disk_usage(p).free >> 30} for p in ("/", os.path.expanduser("~"))}
+    mem = int(open("/proc/meminfo").readline().split()[1]) >> 20
+    print(json.dumps({"host": socket.gethostname(), "mem_gb": mem, "numa": nodes, "sim_slots": sims, "gpus": gpus,
+                      "backend": backend, "agentctl": shutil.which("agentctl"), "herdr": HERDR if os.path.exists(HERDR)
+                      else None, "docker": bool(shutil.which("docker")), "disks": disks,
+                      "load1": os.getloadavg()[0]}, ensure_ascii=False, indent=1))
+
+
+def compress(cs):
+    cs, out, i = sorted(cs), [], 0
+    while i < len(cs):
+        j = i
+        while j + 1 < len(cs) and cs[j + 1] == cs[j] + 1:
+            j += 1
+        out.append(f"{cs[i]}-{cs[j]}" if j > i else str(cs[i]))
+        i = j + 1
+    return ",".join(out)
+
+
+def install(name):
+    ex = Executor(name)
+    m = ex.m
+    EXE.mkdir(parents=True, exist_ok=True)
+    os.makedirs(ex.cache_dir, exist_ok=True)
+    print("中枢：", ex.hub.ls("refs/heads/main"), "via", ex.hub.url)
+    if ex.incus:
+        inc = m["incus"]
+        for slot, s in m["slots"].items():
+            c = ex.slot_name(slot)
+            if not exists(c):
+                incus("launch", inc["image"], c, "-s", inc["pool"], "-c", f"limits.cpu={s['cpus']}",
+                      "-c", f"limits.memory={s['mem']}", "-d", f"root,size={s['disk']}", "--quiet")
+                incus("config", "device", "add", c, "cache", "disk", f"source={ex.cache_dir}", "path=/cache",
+                      "readonly=true")
+                if "gpu" in s:
+                    incus("config", "device", "add", c, "gpu", "gpu", f"id={s['gpu']}")
+            else:
+                incus("config", "set", c, f"limits.cpu={s['cpus']}", f"limits.memory={s['mem']}")
+            box_sh(c, "python3 -V && mkdir -p ~/work")
+            print(f"槽位容器 {c}：cpu {s['cpus']}，内存 {s['mem']}，盘 {s['disk']}")
+        if m.get("agents", {}).get("seats"):
+            a = m["agents"]
+            print("agentctl：", shutil.which(a.get("agentctl", "agentctl")) or "没有（装 agentbox）")
+    else:
+        sh(["systemd-run", "--user", "--scope", "-q", "-p", "MemoryMax=1G", "true"])
+        print("bare：taskset + systemd-run --user 可用；槽位", ", ".join(f"{k}={v['cpus']}" for k, v in m["slots"].items()))
+    print(f"缓存目录 {ex.cache_dir}（预算 {m['cache'].get('budget_gb', 100)} GB）")
+
+
+def start(name):
+    pid = (EXE / "pid").read_text().strip() if (EXE / "pid").exists() else ""
+    if pid and os.path.exists(f"/proc/{pid}") and "executor" in open(f"/proc/{pid}/cmdline").read():
+        print(f"已经在跑：pid {pid}")
+        return
+    EXE.mkdir(parents=True, exist_ok=True)
+    ws = json.loads(sh([HERDR, "workspace", "create", "--cwd", str(ROOT), "--label",
+                        f"cf-{load_machines()['project']}-executor", "--no-focus"]).stdout)
+    pane = ws["result"]["root_pane"]["pane_id"]
+    (EXE / "herdr-ws").write_text(ws["result"]["workspace"]["workspace_id"] + "\n")
+    cmd = f"{shlex.quote(sys.executable)} ci/executor run --machine {name}"
+    if load_machines()["machines"][name]["backend"] == "incus":
+        cmd = f"sg incus-admin -c {shlex.quote(cmd)}"  # herdr 服务端可能是加进 incus-admin 组之前起的
+    sh([HERDR, "pane", "run", pane, cmd])
+    for _ in range(30):
+        time.sleep(1)
+        if (EXE / "pid").exists() and (EXE / "pid").read_text().strip() != pid:
+            print(f"executor {name} 在 herdr 窗格 {pane} 里跑起来了，pid {(EXE / 'pid').read_text().strip()}")
+            return
+    sys.exit("executor 没起来，herdr 里看窗格 " + pane)
+
+
+def stop():
+    pid = (EXE / "pid").read_text().strip() if (EXE / "pid").exists() else ""
+    if not pid or not os.path.exists(f"/proc/{pid}") or "executor" not in open(f"/proc/{pid}/cmdline").read():
+        print("没有在跑的 executor")
+        return
+    os.kill(int(pid), signal.SIGTERM)
+    print(f"已停 pid {pid}")
+    if (EXE / "herdr-ws").exists():
+        time.sleep(1)
+        sh([HERDR, "workspace", "close", (EXE / "herdr-ws").read_text().strip()], check=False)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="ci/executor", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("op", choices=["probe", "install", "start", "stop", "run"])
+    p.add_argument("--machine")
+    a = p.parse_args()
+    if a.op == "probe":
+        return probe()
+    if a.op == "stop":
+        return stop()
+    if not a.machine:
+        p.error("要给 --machine（ci/machines 里的名字）")
+    {"install": install, "start": start, "run": lambda n: Executor(n).run()}[a.op](a.machine)
+
+
+if __name__ == "__main__":
+    main()
