@@ -27,8 +27,13 @@ import time
 
 sys.dont_write_bytecode = True  # 派生物只准在 .build/ 下，ci/__pycache__ 也不行
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from cflib import (BUILD, ROOT, GitError, Hub, commit, cpus, git, load_machines, now, show,  # noqa: E402
-                   show_json, task_view, under)
+try:
+    from cflib import (BUILD, ROOT, GitError, Hub, commit, cpus, git, load_machines, now, show,  # noqa: E402
+                       show_json, task_view, under)
+except ImportError:  # 引导时单独跑 probe：ssh <别名> python3 - probe < ci/executor
+    from pathlib import Path
+    BUILD = Path.home() / ".build-probe"
+    GitError = RuntimeError
 
 POLL = 10
 EXE = BUILD / "executor"
@@ -243,7 +248,7 @@ class Executor:
 ## 规矩
 - 你在一个独立的容器里，仓库在 /home/agent/{self.proj}，分支 wip/{tid}，从 main 的 {t['base'][:10]} 开出；项目规则见仓库里的 AGENTS.md。
 - 只写代码；不跑整套验收（不要跑不带参数的 ci/accept），最多 3 次短的诊断运行（单个用例或单个快阶段）。整套验收由协调器排队跑。
-- 派生文件只放在 .build/ 下。不要把本文件提交进仓库。
+- 派生文件只放在 .build/ 下；需要的生成物（工具链、模型）先看 /cache（只读的共享缓存），没有就建到 .build/。不要把本文件提交进仓库。
 - 做完：提交，然后 `git push origin HEAD:refs/heads/wip/{tid}`。没 push 上就是没做完。
 - 只汇报一次，在最后：你的最后一条消息就是汇报——改了什么、怎么验证的、哪里没做或拿不准。中途不要停下来问。
 - 同一个问题 2–3 轮没有进展就停：push 已有的东西，在汇报里写清卡在哪、试过什么、你猜原因是什么。
@@ -617,7 +622,8 @@ def install(name):
             c = ex.slot_name(slot)
             if not exists(c):
                 incus("launch", inc["image"], c, "-s", inc["pool"], "-c", f"limits.cpu={s['cpus']}",
-                      "-c", f"limits.memory={s['mem']}", "-d", f"root,size={s['disk']}", "--quiet")
+                      "-c", f"limits.memory={s['mem']}", "--quiet",
+                      *(["-d", f"root,size={s['disk']}"] if s.get("disk") else []))  # dir 池不支持盘限额
                 incus("config", "device", "add", c, "cache", "disk", f"source={ex.cache_dir}", "path=/cache",
                       "readonly=true")
                 if "gpu" in s:
@@ -625,7 +631,7 @@ def install(name):
             else:
                 incus("config", "set", c, f"limits.cpu={s['cpus']}", f"limits.memory={s['mem']}")
             box_sh(c, "python3 -V && mkdir -p ~/work")
-            print(f"槽位容器 {c}：cpu {s['cpus']}，内存 {s['mem']}，盘 {s['disk']}")
+            print(f"槽位容器 {c}：cpu {s['cpus']}，内存 {s['mem']}，盘 {s.get('disk', '不限（dir 池）')}")
         if m.get("agents", {}).get("seats"):
             a = m["agents"]
             print("agentctl：", shutil.which(a.get("agentctl", "agentctl")) or "没有（装 agentbox）")
