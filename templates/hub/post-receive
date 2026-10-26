@@ -1,0 +1,9 @@
+#!/bin/bash
+# 主中枢的 post-receive：每次 ref 更新后把整个仓库镜像到备用中枢（后台跑，不拖慢推送的人）。
+# 装法：cp 到 <repo>.git/hooks/post-receive，chmod +x；git config curryflow.mirror ci@<备用中枢>:<repo>.git
+cat >/dev/null
+url=$(git config curryflow.mirror) || exit 0
+(
+  flock 9
+  git push -q --mirror "$url" >>mirror.log 2>&1 || echo "$(date -Is) mirror push failed" >>mirror.log
+) 9>mirror.lock </dev/null >/dev/null 2>&1 &

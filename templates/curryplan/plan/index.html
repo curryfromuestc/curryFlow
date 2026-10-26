@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>__PROJECT__ 开发流程</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<meta name="theme-color" content="#2747B0">
+<link rel="stylesheet" href="/kit.css">
+<link rel="stylesheet" href="/ui.css">
+<style>
+.chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
+.chip { padding:3px 10px; border-radius:999px; background:var(--sunk); font-size:12.5px; color:var(--ink-2); }
+.chip b { color:var(--ink); }
+code { font-family:var(--mono); font-size:12.5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <a class="back" href="/">← 全部</a>
+  <div class="top"><h1>__PROJECT__ 开发流程</h1><span class="sub">只写最终形态；讨论和拍板在会话里</span></div>
+</header>
+<!-- 一句话：这个项目的验收怎么分级、跑在哪些机器上 -->
+<p class="oneline" data-c="say">__一句话结论__</p>
+
+<section class="sec" id="stages">
+  <h2>验收阶段 <small>ci/accept，0 通过、77 跳过</small></h2>
+  <div class="card wide scroll" data-c="stages">
+    <table class="t">
+      <tr><th>阶段</th><th>槽位</th><th>判据</th><th>用例来自哪个真实 bug</th></tr>
+      <!-- 每个阶段一行，和 ci/accept 的 STAGES 一致 -->
+      <tr><td>__阶段__</td><td>sim</td><td>__判据__</td><td>__bug__</td></tr>
+    </table>
+    <div class="chips"><span class="chip">按风险分级：<b>__哪些改动跑哪些阶段__</b></span></div>
+  </div>
+</section>
+
+<section class="sec" id="machines">
+  <h2>机器和槽位 <small>ci/machines</small></h2>
+  <div class="card wide scroll" data-c="machines">
+    <table class="t">
+      <tr><th>机器</th><th>后端</th><th>槽位</th><th>agent 容器</th><th>备注</th></tr>
+      <tr><td>__机器__</td><td>incus / bare</td><td>__sim × N（1 槽 = 1 个 L3 域）__</td><td>__席位 × 核__</td><td>__共享机标出来__</td></tr>
+    </table>
+    <div class="chips"><span class="chip">中枢 <b>__主中枢__</b> → 镜像 <b>__备用中枢__</b></span><span class="chip">GitHub 只收 main，由人推</span></div>
+  </div>
+</section>
+
+<section class="sec" id="store">
+  <h2>存储</h2>
+  <div class="card wide scroll" data-c="store">
+    <table class="t">
+      <tr><th>类</th><th>例子</th><th>放哪、活多久</th></tr>
+      <tr><td>可共享派生物</td><td>__工具链、模型__</td><td>每机缓存，键 = 输入的 git tree hash + 工具版本；每机 __100__ GB，按最近使用淘汰</td></tr>
+      <tr><td>结果</td><td>一行结论、关键报告</td><td>结论推中枢永久；大文件留执行机 __7__ 天；基线标固定</td></tr>
+    </table>
+  </div>
+</section>
+</div>
+<script src="/kit.js"></script>
+<script src="/ui.js"></script>
+</body>
+</html>

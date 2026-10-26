@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+"""协调器入口。无状态：任何机器上有本仓库的 clone 和中枢 key 就能跑，状态全在中枢的 ref 里。
+
+  ci/coord lease hold [--detach]     拿租约并一直心跳（放后台跑）；同一时间只有一个协调器
+  ci/coord lease show | release
+  ci/coord task new ID --goal TEXT | --goal-file F  [--accept T] [--budget T] [--agent codex|claude]
+                       [--model M] [--effort E] [--machine NAME] [--owner WHO]
+  ci/coord task list | show ID | msg ID TEXT|--file F | close ID
+  ci/coord review ID                 取 wip/ID，diff 落到 .build/coord/review/ID.diff
+  ci/coord queue ID [--commit SHA] [--stages a,b] [--pin]   合成候选，按阶段排进验收队列
+  ci/coord merge CID | drop CID      全绿就快进中枢 main / 撤掉候选
+  ci/coord status [--json]
+  ci/coord wait [--timeout S]        阻塞到有任务或候选到终态，打印事件后退出（0 有事件，3 超时，4 丢了租约）
+
+只有持有租约的协调器能改中枢（task new/msg/close、queue、merge、drop）；status、review、wait 谁都能跑。
+"""
+import argparse
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import uuid
+
+sys.dont_write_bytecode = True  # 派生物只准在 .build/ 下，ci/__pycache__ 也不行
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cflib import (BUILD, ID_RE, IDENT, LOCAL, ROOT, GitError, Hub, candidates, commit, die, git,  # noqa: E402
+                   load_machines, ls_tree, now, show, show_json, task_view, under)
+
+CFG = load_machines()
+HUB = Hub(CFG)
+ME = BUILD / "coord"
+LEASE = "refs/coord/lease"
+BEAT, TTL = 15, 60
+
+
+def mkdir():
+    ME.mkdir(parents=True, exist_ok=True)
+
+
+def read(p, default=""):
+    try:
+        return (ME / p).read_text().strip()
+    except FileNotFoundError:
+        return default
+
+
+def alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (ValueError, ProcessLookupError, PermissionError):
+        return False
+
+
+# ---------------------------------------------------------------- 租约
+
+def lease_now():
+    return HUB.ls(LEASE).get(LEASE)
+
+
+def mine():
+    sha = read("lease-sha")  # hold 推心跳前先写 lease-next，推上了再写 lease-sha；两者之间看到的是哪个都算自己的
+    return bool(sha) and alive(read("hold.pid")) and lease_now() in (sha, read("lease-next"))
+
+
+def require_lease():
+    if not mine():
+        die("没有租约：先在后台跑 ci/coord lease hold（ci/coord lease show 看谁拿着）")
+
+
+def beat_commit(since):
+    info = {"holder": read("holder"), "host": socket.gethostname(), "pid": os.getpid(), "since": since, "beat": now(),
+            "dir": str(ROOT)}
+    return commit({"lease.json": json.dumps(info, ensure_ascii=False) + "\n"}, msg=f"lease {info['holder']}")
+
+
+def take():
+    """Takes the lease: free, or its heartbeat has not moved for TTL seconds. Returns the sha we pushed."""
+    mkdir()
+    if not read("holder"):
+        (ME / "holder").write_text(f"{socket.gethostname()}:{uuid.uuid4().hex[:8]}\n")
+    since = now()
+    seen, t0 = lease_now(), time.time()
+    while True:
+        if seen is None or seen == read("lease-sha") or time.time() - t0 >= TTL:
+            new = beat_commit(since)
+            if HUB.push(LEASE, new, seen or ""):
+                (ME / "lease-sha").write_text(new + "\n")
+                return new, since
+        time.sleep(5)
+        cur = lease_now()
+        if cur != seen:
+            print(f"租约有人在心跳（{lease_holder() or cur[:10]}），等它停 {TTL}s 再接手", flush=True)
+            seen, t0 = cur, time.time()
+
+
+def lease_holder():
+    try:
+        HUB.fetch(f"+{LEASE}:{LOCAL}coord/lease")
+        info = show_json(LOCAL + "coord/lease", "lease.json", {})
+        return f"{info.get('holder')} 在 {info.get('host')}，最后心跳 {info.get('beat')}"
+    except GitError:
+        return None
+
+
+def cmd_lease(a):
+    if a.op == "show":
+        print(lease_holder() or "没有租约")
+        if mine():
+            print("（就是本 clone）")
+        return
+    if a.op == "release":
+        if not mine():
+            die("租约不在本 clone 手里")
+        os.kill(int(read("hold.pid")), signal.SIGTERM)
+        time.sleep(1)
+        HUB.push(LEASE, None, read("lease-sha"))
+        (ME / "lease-sha").unlink(missing_ok=True)
+        print("已释放")
+        return
+    # hold
+    if alive(read("hold.pid")):
+        die(f"本 clone 已有 hold 进程 {read('hold.pid')}")
+    mkdir()
+    (ME / "hold.pid").write_text(f"{os.getpid()}\n")
+    ppid = os.getppid()
+    sha, since = take()
+    print(f"拿到租约：{read('holder')}", flush=True)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    last_ok = time.time()
+    while True:
+        time.sleep(BEAT)
+        if not a.detach and os.getppid() != ppid:
+            sys.exit(0)  # 起它的会话没了：停止心跳，过 TTL 后别人能接手
+        try:
+            new = beat_commit(since)
+            (ME / "lease-next").write_text(new + "\n")
+            if not HUB.push(LEASE, new, sha):
+                die(f"租约被别人接手了（{lease_holder()}），停止心跳", 4)
+            sha, last_ok = new, time.time()
+            (ME / "lease-sha").write_text(sha + "\n")
+        except GitError as e:
+            if time.time() - last_ok > TTL:
+                print(f"已经 {TTL}s 推不上心跳：{e}", file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------- 任务
+
+def tasks(rs):
+    return {i: task_view(sha) for i, sha in under(rs, "refs/tasks/").items()}
+
+
+def cmd_task(a):
+    if a.op in ("new", "msg", "close"):
+        require_lease()
+    rs = HUB.sync()
+    ts = tasks(rs)
+    if a.op == "list":
+        print(f"{'ID':<20}{'STATE':<9}{'R':<3}{'MACHINE':<10}{'AGENT':<8}WIP")
+        for i, t in sorted(ts.items()):
+            print(f"{i:<20}{t.get('state', '?'):<9}{t.get('round', 0):<3}{t.get('machine') or '-':<10}"
+                  f"{t.get('agent', '-'):<8}{(t.get('wip') or '-')[:10]}")
+        return
+    if a.op == "new":
+        if not ID_RE.match(a.id):
+            die("ID 只能是小写字母开头的 [a-z0-9-]，最多 31 个字符（它也是容器名的一部分）")
+        goal = open(a.goal_file).read() if a.goal_file else a.goal
+        if not goal:
+            die("要给 --goal 或 --goal-file")
+        main = rs.get("refs/heads/main")
+        task = {"id": a.id, "goal": goal, "accept": a.accept or "", "budget": a.budget or "", "owner": a.owner,
+                "agent": a.agent, "model": a.model or "", "effort": a.effort or "", "machine": a.machine or "",
+                "base": main, "created": now()}
+        state = {"state": "open", "round": 0, "updated": now()}
+        ok = HUB.create(f"refs/tasks/{a.id}", {"task.json": js(task), "state.json": js(state)}, f"task {a.id}: new")
+        print(f"任务 {a.id} 已建（base {main[:10]}）" if ok else f"任务 {a.id} 已存在")
+        return
+    t = ts.get(a.id) or die(f"没有任务 {a.id}")
+    if a.op == "show":
+        print(json.dumps({k: v for k, v in t.items() if k != "goal"}, ensure_ascii=False, indent=1))
+        print("\n目标：\n" + t.get("goal", ""))
+        for r in sorted(ls_tree(t["sha"], "reports")):
+            print(f"\n--- 汇报 {r} ---\n" + show(t["sha"], f"reports/{r}", ""))
+        return
+    if a.op == "msg":
+        text = open(a.file).read() if a.file else " ".join(a.text)
+
+        def fn(old):
+            st = show_json(old, "state.json")
+            if st["state"] not in ("done", "failed"):
+                die(f"任务 {a.id} 现在是 {st['state']}，等 agent 汇报完再发")
+            n = st["round"] + 1
+            st.update(state="msg", pending=n, updated=now())
+            return {"state.json": js(st), f"msgs/{n:03d}.md": text}
+        HUB.update(f"refs/tasks/{a.id}", fn, f"task {a.id}: msg")
+        print(f"已发给 {a.id}，executor 会在同一个容器里续上会话")
+    elif a.op == "close":
+        def fn(old):
+            st = show_json(old, "state.json")
+            if st["state"] == "closed":
+                return None
+            st.update(state="closed", updated=now())
+            return {"state.json": js(st)}
+        HUB.update(f"refs/tasks/{a.id}", fn, f"task {a.id}: close")
+        print(f"任务 {a.id} 已关；executor 会删掉它的容器和构建")
+
+
+def js(o):
+    return json.dumps(o, ensure_ascii=False, indent=1) + "\n"
+
+
+# ---------------------------------------------------------------- 审查、排队、合并
+
+def cmd_review(a):
+    rs = HUB.sync()
+    wip, main = rs.get(f"refs/heads/wip/{a.id}"), rs.get("refs/heads/main")
+    if not wip:
+        die(f"中枢上没有 wip/{a.id}")
+    base = git("merge-base", main, wip)
+    d = ME / "review"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{a.id}.diff").write_text(git("diff", base, wip) + "\n")
+    print(git("log", "--oneline", f"{base}..{wip}"))
+    print(git("diff", "--stat", base, wip))
+    print(f"全文：{d / (a.id + '.diff')}（交给独立审查者时只给这个 diff）")
+
+
+def accept_of(rev, *args):
+    """Runs the candidate's own ci/accept with ARGS (it must not need its checkout for --list/--plan)."""
+    src = show(rev, "ci/accept") or die(f"{rev[:10]} 里没有 ci/accept")
+    r = subprocess.run([sys.executable, "-", *args], input=src, capture_output=True, text=True)
+    if r.returncode:
+        die(f"ci/accept {' '.join(args)}: {r.stderr.strip()}")
+    return r.stdout
+
+
+def cmd_queue(a):
+    require_lease()
+    rs = HUB.sync()
+    main = rs["refs/heads/main"]
+    if a.commit:
+        cand = git("rev-parse", "--verify", a.commit + "^{commit}")
+        git("cat-file", "-e", cand)
+    else:
+        wip = rs.get(f"refs/heads/wip/{a.id}") or die(f"中枢上没有 wip/{a.id}")
+        if git("merge-base", "--is-ancestor", main, wip, check=False).returncode == 0:
+            cand = wip
+        else:
+            wt = ME / "merge" / a.id
+            shutil.rmtree(wt, ignore_errors=True)
+            git("worktree", "prune")
+            git("worktree", "add", "-q", "--detach", str(wt), main)
+            r = git("-C", str(wt), "merge", "--no-edit", "-m", f"merge wip/{a.id}", wip, check=False, env=IDENT)
+            if r.returncode:
+                die(f"合并冲突，在 {wt} 里解决并提交，然后 ci/coord queue {a.id} --commit <sha>", 2)
+            cand = git("-C", str(wt), "rev-parse", "HEAD")
+            git("worktree", "remove", "--force", str(wt))
+    n = 1 + len([c for c in under(rs, "refs/ci/cand/") if c.rsplit("-", 1)[0] == a.id])
+    cid = f"{a.id}-{n}"
+    if not HUB.push(f"refs/ci/cand/{cid}", cand, ""):
+        die(f"候选 {cid} 已存在")
+    listing = {s["name"]: s for s in json.loads(accept_of(cand, "--list", "--json"))}
+    if a.stages:
+        stages = a.stages.split(",")
+    else:
+        changed = git("diff", "--name-only", main, cand).splitlines()
+        stages = accept_of(cand, "--plan", *changed).split()
+    for s in stages:
+        if s not in listing:
+            die(f"ci/accept 里没有阶段 {s}")
+        job = {"cid": cid, "stage": s, "class": listing[s]["class"], "cand": cand, "base": main, "task": a.id,
+               "pin": a.pin, "at": now(), "by": read("holder")}
+        HUB.create(f"refs/ci/queue/{cid}.{s}", {"job.json": js(job)}, f"queue {cid}.{s}", parent=cand)
+    print(f"候选 {cid} = {cand[:10]}，排队阶段：{', '.join(stages)}")
+
+
+def verdict_of(c):
+    """'PASS' / 'FAIL' when every queued stage has a result, else None."""
+    out = []
+    for stage, v in c.items():
+        if "result" not in v:
+            return None
+        out.append(show(v["result"], "verdict", "FAIL").split()[0])
+    return "FAIL" if any(x not in ("PASS", "SKIP") for x in out) else "PASS"
+
+
+def cmd_merge(a):
+    require_lease()
+    rs = HUB.sync()
+    c = candidates(rs).get(a.cid) or die(f"队列里没有候选 {a.cid}")
+    c = {s: v for s, v in c.items() if "queued" in v}
+    if a.op == "merge":
+        v = verdict_of(c)
+        if v != "PASS":
+            die(f"候选 {a.cid} 还没全绿（{v or '还有阶段没出结论'}）")
+        cand, main = rs[f"refs/ci/cand/{a.cid}"], rs["refs/heads/main"]
+        if git("merge-base", "--is-ancestor", main, cand, check=False).returncode:
+            die("main 在排队之后动过，候选不能快进；重新 queue")
+        if not HUB.push("refs/heads/main", cand, main):
+            die("推 main 时 main 又动了；重新 queue")
+        print(f"中枢 main = {cand[:10]}（{a.cid}）；GitHub 只收 main，由人推")
+    for s, v in c.items():
+        HUB.push(f"refs/ci/queue/{a.cid}.{s}", None, v["queued"])
+        if "claim" in v:
+            HUB.push(f"refs/claims/ci-{a.cid}.{s}", None, v["claim"])
+    if a.op == "drop":
+        print(f"候选 {a.cid} 已撤出队列（结论保留）")
+
+
+# ---------------------------------------------------------------- 状态、等待
+
+def status(rs):
+    ts = tasks(rs)
+    claims = under(rs, "refs/claims/")
+    cands = []
+    for cid, c in sorted(candidates(rs).items()):
+        stages = {}
+        for s, v in c.items():
+            if "result" in v:
+                stages[s] = {"verdict": show(v["result"], "verdict", "?").strip(),
+                             **show_json(v["result"], "result.json", {})}
+            elif "claim" in v:
+                stages[s] = {"verdict": "RUNNING", **show_json(v["claim"], "claim.json", {})}
+            else:
+                stages[s] = {"verdict": "QUEUED"}
+        queued = any("queued" in v for v in c.values())
+        cands.append({"cid": cid, "cand": rs.get(f"refs/ci/cand/{cid}"), "open": queued, "stages": stages,
+                      "verdict": verdict_of({s: v for s, v in c.items() if "queued" in v}) if queued else None})
+    lease = show_json(rs[LEASE], "lease.json", {}) if LEASE in rs else None
+    main = rs.get("refs/heads/main")
+    return {
+        "at": now(), "project": CFG["project"], "hub": HUB.url,
+        "main": {"sha": main, "subject": git("log", "-1", "--format=%s", main) if main else None},
+        "lease": lease,
+        "tasks": [{k: t.get(k) for k in ("id", "state", "round", "machine", "agent", "model", "box", "wip", "tokens",
+                                          "updated", "box_removed", "created")}
+                  | {"claim": show_json(claims[f"task-{i}"], "claim.json", {}) if f"task-{i}" in claims else None,
+                     "report": (show(t["sha"], f"reports/{t.get('round', 0):03d}.md", "") or "")[:400]}
+                  for i, t in sorted(ts.items())],
+        "candidates": cands,
+        "executors": {m: show_json(sha, "exec.json", {}) for m, sha in under(rs, "refs/ci/exec/").items()},
+        "usage": {m: show_json(sha, "usage.json", {}) for m, sha in under(rs, "refs/ci/usage/").items()},
+    }
+
+
+def cmd_status(a):
+    s = status(HUB.sync())
+    if a.json:
+        print(json.dumps(s, ensure_ascii=False, indent=1))
+        return
+    l = s["lease"]
+    print(f"{s['project']} · 中枢 {s['hub']} · main {(s['main']['sha'] or '-')[:10]} {s['main']['subject'] or ''}")
+    print(f"租约：{l['holder']} 在 {l['host']}，心跳 {l['beat']}" if l else "租约：没有")
+    print("任务：")
+    for t in s["tasks"]:
+        print(f"  {t['id']:<20}{t['state']:<8} 第 {t['round']} 轮 {t['machine'] or '-':<8} {t['agent'] or ''}"
+              f" wip {(t['wip'] or '-')[:10]}{'  容器已删' if t['box_removed'] else ''}")
+    print("候选：")
+    for c in s["candidates"]:
+        st = ", ".join(f"{k} {v['verdict'].split()[0]}{'@' + v['machine'] + '/' + v['slot'] if v.get('slot') else ''}"
+                       for k, v in c["stages"].items())
+        print(f"  {c['cid']:<20}{(c['cand'] or '')[:10]}  {'排队中' if c['open'] else '已出队'}  {st}")
+    print("执行端：")
+    for m, e in sorted(s["executors"].items()):
+        print(f"  {m:<10} 心跳 {e.get('at')}  忙 {','.join(e.get('busy', [])) or '无'}  容器 {len(e.get('boxes', []))}")
+
+
+def finals(rs):
+    ev = {}
+    for i, t in tasks(rs).items():
+        if t.get("state") in ("done", "failed"):
+            rep = (show(t["sha"], f"reports/{t['round']:03d}.md", "") or "").strip().splitlines()
+            ev[f"task {i} r{t['round']} {t['state']}"] = (
+                f"任务 {i} 第 {t['round']} 轮 {t['state']}：wip {(t.get('wip') or '无')[:10]}，{t.get('machine')}；"
+                f"汇报首行：{rep[0][:120] if rep else '（空）'}")
+    for cid, c in candidates(rs).items():
+        c = {s: v for s, v in c.items() if "queued" in v}
+        v = verdict_of(c) if c else None
+        if v:
+            lines = "；".join(f"{s} {show(x['result'], 'verdict', '').strip()}" for s, x in c.items())
+            ev[f"cand {cid} {v}"] = f"候选 {cid} {v}：{lines}"
+    return ev
+
+
+def cmd_wait(a):
+    mkdir()
+    seen_f = ME / "seen"
+    seen = set(seen_f.read_text().splitlines()) if seen_f.exists() else set()
+    holding = bool(read("lease-sha"))
+    t0 = time.time()
+    while True:
+        rs = HUB.sync()
+        if holding and not mine():
+            die("租约丢了（hold 进程停了或被别人接手）", 4)
+        new = {k: v for k, v in finals(rs).items() if k not in seen}
+        if new:
+            for v in new.values():
+                print(v)
+            with open(seen_f, "a") as f:
+                f.write("".join(k + "\n" for k in new))
+            return
+        if a.timeout and time.time() - t0 > a.timeout:
+            print("没有新的终态事件")
+            sys.exit(3)
+        time.sleep(10)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="ci/coord", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    s = p.add_subparsers(dest="cmd", required=True)
+    l = s.add_parser("lease")
+    l.add_argument("op", choices=["hold", "show", "release"])
+    l.add_argument("--detach", action="store_true", help="起它的进程退出后照样心跳")
+    t = s.add_parser("task")
+    t.add_argument("op", choices=["new", "list", "show", "msg", "close"])
+    t.add_argument("id", nargs="?")
+    t.add_argument("text", nargs="*")
+    t.add_argument("--goal")
+    t.add_argument("--goal-file")
+    t.add_argument("--file")
+    t.add_argument("--accept")
+    t.add_argument("--budget")
+    t.add_argument("--agent", default="codex", choices=["codex", "claude"])
+    t.add_argument("--model")
+    t.add_argument("--effort")
+    t.add_argument("--machine")
+    t.add_argument("--owner", default=os.environ.get("USER", ""))
+    s.add_parser("review").add_argument("id")
+    q = s.add_parser("queue")
+    q.add_argument("id")
+    q.add_argument("--commit")
+    q.add_argument("--stages")
+    q.add_argument("--pin", action="store_true", help="结果作为基线保留，不按 7 天淘汰")
+    for op in ("merge", "drop"):
+        s.add_parser(op).add_argument("cid")
+    s.add_parser("status").add_argument("--json", action="store_true")
+    s.add_parser("wait").add_argument("--timeout", type=int, default=0)
+    a = p.parse_args()
+    if a.cmd == "task" and a.op != "list" and not a.id:
+        p.error("要给任务 ID")
+    if a.cmd in ("merge", "drop"):
+        a.op = a.cmd
+    try:
+        {"lease": cmd_lease, "task": cmd_task, "review": cmd_review, "queue": cmd_queue, "merge": cmd_merge,
+         "drop": cmd_merge, "status": cmd_status, "wait": cmd_wait}[a.cmd](a)
+    except GitError as e:
+        die(f"中枢操作失败：{e}")
+
+
+if __name__ == "__main__":
+    main()

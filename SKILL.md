@@ -1,189 +1,134 @@
 ---
-name: curryflows
+name: curryflow
 description: >-
-  用 herdr 编排用户指定的 worker CLI：为长跑任务创建独立分支、worktree 和 workspace，
-  启动并识别 agent，发送任务说明，等待与巡检执行状态，组织只读复核，验证后合并到本地 main，
-  并回收运行资源。适用于“起 curryflows”“派 worker 长跑任务”“监督 worker”“组织并行实现或评审”等请求。
+  给一个项目引导出多机开发流程：探测机器、和人定验收阶段与判据、定存储规矩，从模板生成项目自己的
+  ci/（accept、machines、coord、executor）、AGENTS.md 和 .gitignore，建中枢 git 仓库和镜像，在每台机器装
+  executor，开 curryplan 项目；并写清协调器的通用规矩（任务生命周期、只看 diff 的独立审查、一次汇报、
+  按任务挑模型、卡住就停）。触发于："用 curryflow 引导 X"、"给项目搭多机流程"、"起协调器"、"加一台机器"。
 ---
-# curryflows
-用 herdr 管理 worker；不预设本 session 的职责。按用户指定承担派工、评审、裁决或完整流程。
-对用户使用中文。`/curryflows status` 输出 `herdr agent list`、`herdr pane list` 和各线程一句话近况。
-## 运行边界
-- 先执行 `test "${HERDR_ENV:-}" = 1`；失败时说明当前不在 Herdr pane 内并停止。
-- 用 `herdr <命令> --help` 确认当前 CLI 语法，并从 JSON 响应读取 ID。
-- worker 由用户指定；未指定时先询问，启动前执行 `command -v <worker>`。
-- 启动本 session 的第一个可写 worker 前，说明可写参数会自动批准或绕过 worker 的权限检查；
-  Codex 的对应参数还会关闭其沙箱。取得用户明确授权后再启动；未获授权时不启动可写 worker。
-- 本 session 不直接修改任务产物。每个可写 worker 使用独立 `cfx/*` 分支和 worktree。
-- worker 运行期间不修改本地 `main`。只将验证通过的结果合并到本地 `main`；不推送远端。
-- 只操作本 session 创建的 `cfx` 前缀 workspace、tab、pane、worktree 和分支。
-- 只读评审不得写入被审对象；需要运行代码时使用 detached-HEAD worktree，并在评审前后核对仓库状态。
-- 将任务说明写入 worktree 外的临时文件，将事实写入仓库文档，将进度写入 git 和 Herdr label。
-## 并行前检查
-列出 worker 之间共享的可写状态，包括：
-- 浮动 license 和并发额度；
-- 固定输出路径；
-- 共享构建缓存；
-- worktree 中缺失、需要重建的生成物。
-无法确认并行安全时先串行执行。
-## Worker 能力
-| worker | Herdr 控制面 | 完成检测 |
-|---|---|---|
-| Herdr 可识别的 agent | `agent prompt/read/wait/send-keys` | `agent wait`，心跳兜底 |
-| Herdr 未识别的交互式 CLI | `pane send-text/read/send-keys` | 心跳读取 pane |
-可写 worker 必须带对应的全权限参数：
-| worker | 可写参数 |
+
+# curryflow
+
+curryflow 只做引导，本身不带运行时代码，也不知道具体项目。运行时代码都在 `templates/` 里，引导时拷进项目的
+`ci/`，提交进项目仓库；从那以后，项目里的 `ci/` 就是全部真相，curryflow 不再参与。换项目就再引导一次。
+对人的一切叙述用中文。
+
+```
+中枢 hub（小 VPS）    bare 仓库；任务、认领、验收队列、结论、租约全是 git ref（见 ci/cflib.py 开头）
+  └─ 备用中枢         post-receive 每次 ref 更新镜像一份；主中枢连不上时 ci/ 按顺序用它
+协调器（任何地方）    clone + 中枢 key + ci/coord；无状态；租约保证同一时间只有一个
+executor（每台机器）  ci/executor run；只往外连中枢；领任务开 agent 容器，领验收作业跑槽位
+curryplan             人看的状态页（每分钟读中枢）和方案页；讨论和拍板在会话里，不上页面
+```
+
+机器之间只走 git，不挂共享盘；协调器从不登录执行机；token 只放执行机，不过中枢；GitHub 只收 main，只由人推。
+
+## 引导
+
+按顺序做，每步做完核对再往下。需要人拍板的只有第 2 步的判据和第 1 步里"共享机器用多少"；其余自己定，
+定了在最后的汇报里说一句。
+
+1. **探测机器。** 对每个 ssh 别名：`ssh <别名> python3 - probe < templates/ci/executor`，读输出的 JSON
+   （L3 域、NUMA 节点和各自负载、内存、GPU、磁盘、容器后端、agentctl、herdr）。切槽位：
+   - sim = 一个 L3 域：8 个物理核加它们的超线程；一个 L3 不到 8 核（Zen2 的 CCX 是 4 核）就拼同一 NUMA
+     节点里相邻的两个。probe 的 `sim_slots` 已经按这个规则切好。
+   - synth = 一个 NUMA 节点；gpu = 一张卡（槽位加 `"gpu": N`）；build 可超额（不和别的槽位抢核）。
+   - agent 容器是单独的席位，每个 2–4 核，不占上面几类；核不够分的机器（aimax 16 核）席位写成个数、不钉核，
+     并在汇报里说明它和仿真槽共用核。
+   - 共享机器标 `"shared": true`，只占人给的份额，选 probe 里最闲的 NUMA 节点；精确计时的阶段优先放独占机器。
+   - 容器后端：有 incus 就用 incus（agent 容器靠 agentbox，见 agentbox skill；先确认 `agentctl` 和
+     `agentbox-base` 镜像在）；没有容器就是 bare：只跑验收，用 `taskset` + `systemd-run --user -p MemoryMax=` 钉核限内存。
+   - 根分区小的机器，incus 存储池和缓存目录放到大盘（/home）上。
+   - 连中枢 22 端口不稳的机器（国内）：`"hub_proxy": "127.0.0.1:7890"`，git 经本机代理连中枢，agent 容器里同样。
+2. **定验收（和人一起）。** 列阶段：名字、槽位类、命令、判据。用例优先来自真实 bug——问人最近踩过的 bug
+   （死锁、超时、时序为负……），每个做成一个能复现的用例，写清 why。按风险分级（`TIERS`）：只改文档、工具的走
+   快阶段，动核心的走全套。填进 `ci/accept` 的 `STAGES`、`TIERS`。判据由人拍板，不替人定。
+3. **定存储。** 派生物只准在 `.build/`（`ci/accept` 每个阶段前后扫一遍工作区，别处多了或改了文件就判失败）；
+   `.gitignore` 写 `.build/`。可共享的派生物（工具链、编好的模型）在阶段的 `cache` 字段里声明输入路径、取工具
+   版本的命令、构建命令：键 = 输入的 git tree hash + 工具版本，executor 先建到临时目录再 rename，只读挂进
+   容器的 `/cache`，每机预算（默认 100 GB）按最近使用淘汰。验收结论永久在中枢；大文件留执行机 `keep_days`
+   （默认 7）天，`queue --pin` 的基线留到有新基线。容器根盘有 incus 限额。
+4. **生成 ci/。** `cp templates/ci/{accept,coord,executor,cflib.py} <项目>/ci/`，写 `ci/machines`（下面的格式），
+   `AGENTS.md`（从 `templates/project/AGENTS.md` 起，只放项目专属的：测试怎么跑、哪些不能改，保持短），
+   `.gitignore`（`templates/project/gitignore`）。本地跑一遍 `ci/accept` 全绿再提交。
+5. **建中枢。** 主中枢 `ci` 用户下：
+   ```sh
+   ssh <主中枢> 'git init -q --bare -b main <项目>.git'
+   scp templates/hub/post-receive <主中枢>:<项目>.git/hooks/ && ssh <主中枢> 'chmod +x <项目>.git/hooks/post-receive'
+   ssh <主中枢> 'git -C <项目>.git config curryflow.mirror ci@<备用中枢>:<项目>.git'
+   ssh <主中枢> 'git -C <项目>.git config core.sshCommand "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"'
+   ```
+   备用中枢同样有 `ci` 用户和 bare 仓库；主中枢 `ci` 的公钥进备用中枢的 authorized_keys；每台执行机、要起协调器的
+   机器、curryplan 机的公钥进两边。`git push <主中枢> main`，核对备用中枢的 main 几秒内跟上。
+6. **装 executor。** 每台机器 clone 到 `ci/machines` 里的 `dir`，然后
+   `ci/executor install --machine <名>`（建钉核的槽位容器、挂缓存、查 agentctl）和 `ci/executor start --machine <名>`
+   （在本机 herdr 里起，人能 attach 看）。冒烟：协调器 `ci/coord queue smoke --commit main`，`ci/coord wait` 出 PASS 后
+   `ci/coord drop smoke-1`。
+7. **开 curryplan 项目。** 按 curryplan skill 注册项目；状态页用 `templates/curryplan/status/`（把 `__PROJECT__`
+   换成项目名），在 curryplan 机上另 clone 一份，cron 每分钟 `ci/coord status --json` 写到页面目录的 `status.json`；
+   方案页从 `templates/curryplan/plan/` 起，只写最终形态。
+
+`ci/machines`（JSON）：
+
+```json
+{"project": "toy", "hubs": ["ci@<主中枢>:toy.git", "ci@<备用中枢>:toy.git"],
+ "curryplan": {"host": "yanggl@<curryplan 机>", "page": "/var/www/plan/toy/status", "clone": "~/curryflow/toy-status"},
+ "machines": {
+  "aimax": {"ssh": "aimax", "dir": "~/curryflow/toy", "backend": "incus", "shared": false, "hub_proxy": "127.0.0.1:7890",
+            "incus": {"image": "agentbox-base", "pool": "agentbox"},
+            "slots": {"sim0": {"class": "sim", "cpus": "0-7,16-23", "mem": "24GiB", "disk": "20GiB"}},
+            "agents": {"seats": ["4", "4"], "mem": "16GiB", "disk": "30GiB", "token": 1, "agentctl": "agentctl"},
+            "cache": {"dir": "~/.cache/curryflow", "budget_gb": 100}, "keep_days": 7},
+  "bics109": {"ssh": "bics109", "dir": "~/curryflow/toy", "backend": "bare", "shared": true,
+              "slots": {"sim0": {"class": "sim", "cpus": "16-23,144-151", "mem": "16G"}},
+              "cache": {"dir": "~/.cache/curryflow", "budget_gb": 100}}}}
+```
+
+`seats` 每项是一个 incus `limits.cpu`：写个数就不钉核，写 `"48-49,176-177"` 就钉在这几个核上。
+
+## 协调：一个任务怎么走完
+
+1. **拿租约。** `ci/coord lease hold` 放后台跑（Claude Code 用 Bash 的 run_in_background；codex 用
+   `nohup … &`）。没有租约，改中枢的命令都会拒绝。起它的会话没了，心跳就停，60 秒后别处的协调器能接手。
+   换地方起协调器：clone、`lease hold`、`ci/coord status`，就接上了——状态全在中枢，本地什么都不用带。
+2. **建任务。** `ci/coord task new <id> --goal-file <md> --accept <判据> --budget <预算> [--agent claude] [--model M]
+   [--effort E] [--machine 名]`。长目标一律写成 md 文件用 `--goal-file`：executor 把它放进容器的 `~/.cf/TASK.md`，
+   agent 只收到一句"读 TASK.md"（长提示词直接塞给 agent 会被截断、吞回车，已观测）。
+3. **等终态。** `ci/coord wait`：阻塞到某个任务汇报完或某个候选出全部结论，打印事件后退出。只为终态事件花一个
+   回合；不轮询、不挂心跳循环。退出码 4 是租约丢了：先查 hold。
+4. **审查。** `ci/coord review <id>` 把 diff 落到 `.build/coord/review/<id>.diff`。另起一个独立审查者
+   （`codex exec -s read-only` 或 `claude -p`，不是写这段代码的那个），只给它 diff 和判据，不给你的看法；最多 2–3 轮。
+   要 agent 改：`ci/coord task msg <id> --file <md>`，executor 在同一个容器里 resume 同一个会话。小改动（冲突、
+   几行修正）协调器自己改：在 `.build/coord/merge/<id>` 里改完提交，`ci/coord queue <id> --commit <sha>`。
+5. **验收、合并。** `ci/coord queue <id>` 合成候选（main 合上 `wip/<id>`），按 `TIERS` 每个阶段一个作业；executor
+   在钉核的槽位里跑候选自己的 `ci/accept --stage`。`wait` 出 PASS 就 `ci/coord merge <cid>`（只做快进，main 动过
+   就重新 queue）；FAIL 看结论和 `reports/`，再 msg 或自己修；不要了就 `ci/coord drop <cid>`。
+6. **收尾。** `ci/coord task close <id>`，executor 删掉容器和它的构建。告诉人中枢 main 到了哪个提交——推 GitHub 是人的事。
+
+规矩：
+
+- **只汇报一次，在最后。** agent 是这样（TASK.md 里写了），你对人也是：一件事做完报一次，不发进度、不发"在等"。
+- **按任务挑模型。** 小改动用快而便宜的；跨模块、难查的 bug 用强的、effort 高（codex 最高是 `xhigh`，没有 ultra）。
+- **卡住就停下分类。** 同一个问题 2–3 轮没有进展，停，归类：环境/工具坏了、规格不清、实现错、用例本身错、超预算。
+  环境问题修机器；规格问题问人；其余换思路、换模型重开任务，不在原地再磨。
+- **跑检查之前先问**：它能发现什么具体的失败？发现了我会做什么不同的事？答不上就不跑。
+- **不替人拍板，也不卡着等人。** 要人定的事写清选项和你的建议，其余任务照推。
+- **协调器不登录执行机。** 排错看中枢上的 executor 心跳（`ci/coord status`）、任务 ref 里的报错和验收的 `reports/`。
+- token、密码不打印、不写日志、不提交。
+
+## 加一台机器
+
+`probe` → 在 `ci/machines` 加一项 → 提交推中枢 → 那台机器 clone、`install`、`start`。改了 `ci/` 以后各机要
+`ci/executor stop && git pull && ci/executor start --machine <名>`：executor 不会自己更新。
+
+## 排错
+
+| 现象 | 原因 / 做法 |
 |---|---|
-| `codex` / `tcodex` | `--dangerously-bypass-approvals-and-sandbox` |
-| `claude` / `tclaude` | `--dangerously-skip-permissions` |
-| `kimi` | `--yolo` |
-| `codebuddy` | `--dangerously-skip-permissions` |
-包装器只要呈现 Herdr 可识别的上游 UI，也可使用 agent 控制面。以 `herdr agent explain <pane>` 的结果
-为准，不按可执行文件名猜测。
-取得可写授权后、启动第一个正式线程前，用临时 pane 携带同一可写参数启动 worker，并通过 `pane read`
-确认登录状态；检查完关闭临时 pane。
-## 创建可写线程
-```bash
-herdr worktree create \
-  --workspace "$HERDR_WORKSPACE_ID" \
-  --branch cfx/<任务名> \
-  --base main \
-  --label "cfx <任务名>" \
-  --no-focus
-```
-从响应的 `.result.root_pane.pane_id` 读取 `<pane>`，然后启动 worker：
-```bash
-herdr pane run <pane> codex \
-  --dangerously-bypass-approvals-and-sandbox <附加参数...>
-herdr pane run <pane> tcodex \
-  --dangerously-bypass-approvals-and-sandbox <附加参数...>
-herdr pane run <pane> claude \
-  --dangerously-skip-permissions <附加参数...>
-herdr pane run <pane> tclaude \
-  --dangerously-skip-permissions <附加参数...>
-herdr pane run <pane> kimi \
-  --yolo <附加参数...>
-herdr pane run <pane> codebuddy \
-  --dangerously-skip-permissions <附加参数...>
-```
-只执行与用户指定 worker 对应的一条命令。`tcodex` 和 `tclaude` 直接接收并转发这些参数。
-在 60 秒内轮询识别状态：
-```bash
-deadline=$((SECONDS + 60))
-while ! herdr agent explain <pane> >/dev/null 2>&1; do
-  (( SECONDS >= deadline )) && break
-  sleep 2
-done
-```
-识别成功时：
-```bash
-herdr agent read <pane> --source visible
-herdr agent rename <pane> cfx-<小写任务名>
-```
-agent 名必须匹配 `[a-z][a-z0-9_-]{0,31}`。未识别时读取 pane：若显示登录界面，先完成登录；
-若 worker 已正常运行，保留 pane ID，后续使用 pane 控制面。
-每个新 worktree 都可能出现目录信任或登录提示。发送任务前必须读取可见区域：
-1. `agent read <pane> --source visible`，未识别时用 `pane read`；
-2. 仅在明确看到需要确认的安全提示时发送对应按键；
-3. 再次读取，确认已进入 worker 主界面；
-4. 发送任务后再次读取，确认任务已被接收。
-不要仅依据 `idle`、`done` 或命令成功返回判断界面是否就绪。
-## 创建只读评审位
-需要执行验证时先创建隔离副本：
-```bash
-git -C <项目> worktree add --detach <副本路径> <目标commit>
-herdr worktree open \
-  --workspace "$HERDR_WORKSPACE_ID" \
-  --path <副本路径> \
-  --label "cfx-rv <任务名>" \
-  --no-focus
-```
-在评审 workspace 中按视角创建 tab：
-```bash
-herdr tab create --workspace <wid> --label "rv-<视角>" --no-focus
-herdr pane run <root_pane> <worker> <只读参数...>
-```
-只读评审位仅使用对应的只读参数，不叠加可写参数：
-- Codex：`-s read-only`
-- Claude Code：`--permission-mode plan`
-- Kimi：`--plan`
-- CodeBuddy：`--permission-mode plan`
-启动前后分别执行并比对：
-```bash
-{ git status --porcelain; git diff HEAD; git rev-parse HEAD; } | sha256sum
-```
-## 编写并发送任务说明
-长任务说明写入 worktree 外的 Markdown 文件，例如 `/tmp/cfx-<名>.md`。内容包括：
-```text
-OUTCOME
-  明确产物和可核对证据。连续指标写清对象、口径和对照基线。
-VERIFICATION
-  worker 必须执行的自查命令。
-GENERATED_INPUTS
-  所需的 gitignored 生成物及其生成命令。
-BUDGET
-  时间、轮次或资源硬上限。
-BLOCKED_STOP
-  无法继续时停止，并报告阻塞点、已尝试方法和所需输入。
-```
-Herdr 已识别 worker 时：
-```bash
-herdr agent prompt cfx-<名> \
-  "完整任务说明见 /tmp/cfx-<名>.md；先通读，再严格执行。" \
-  --wait \
-  --timeout 60000
-herdr agent read cfx-<名> --source visible
-```
-未识别 worker 时：
-```bash
-herdr pane send-text <pane> \
-  "完整任务说明见 /tmp/cfx-<名>.md；先通读，再严格执行。"
-herdr pane send-keys <pane> enter
-herdr pane read <pane> --source visible
-```
-Codex 的大型、多回合任务可在初始说明前使用 `/goal`。追加指令使用普通消息，避免替换当前 goal。
-其他 worker 使用普通消息。
-## 等待与巡检
-Herdr 已识别 worker：
-```bash
-herdr agent wait cfx-<名> --timeout 3600000
-```
-将长时间等待作为后台 shell 任务运行。等待结束后读取 agent 输出；超时视为巡检信号，不视为失败结论。
-Herdr 未识别 worker 时，在心跳中读取：
-```bash
-herdr pane read <pane> --source visible --lines 50
-```
-每次心跳执行：
-```bash
-herdr agent list
-herdr pane list
-```
-对运行中的线程逐个读取近况。只保留一句状态结论：
-- 继续执行：不干预；
-- 偏离任务：发送 `esc` 软停，再发送纠偏说明；
-- 已完成：进入独立验证；
-- 需要用户裁决：更新 workspace label，并发送通知；
-- 长时间无进展：读取上下文，判断阻塞、纠偏或停止。
-```bash
-herdr agent send-keys cfx-<名> esc
-herdr pane send-keys <pane> esc
-herdr workspace rename <wid> "cfx <任务名> · ❓等你"
-herdr notification show "需要你裁决" --body "<一句话>" --sound request
-```
-有未识别 worker 时，应按其预期运行时长设置足够频繁的心跳。使用 `/loop` 时，每轮先输出中文状态摘要，
-再安排下一次唤醒。
-## 验证与合并
-1. 独立读取有界 diff，不以 worker 的完成声明代替验证。
-2. 独立执行任务说明中的验证命令。
-3. 检查连续指标的对象、口径和基线；无法客观裁定时交由用户。
-4. 验证通过后，将 worker 分支 rebase 到最新本地 `main`。
-5. 合并到本地 `main`，必要时更新基线文档。
-6. 不推送远端。
-## 回收
-```bash
-herdr worktree remove --workspace <wid> --force
-git branch -D cfx/<任务名>
-herdr workspace close <wid>
-git worktree remove <副本路径>
-```
-回收前确认产物、验证记录和需要保留的结论均已落盘。
+| 任务一直 open | 没有带空闲 agent 席位的 executor 在线（`ci/coord status` 看心跳），或 `--machine` 指了别的机器 |
+| executor 日志：没有权限连 incus | herdr 服务端是用户加进 incus-admin 之前起的；`ci/executor start` 已经用 `sg incus-admin` 包了，手动跑也要包 |
+| git 卡在 banner exchange、连中枢超时 | 那台机器到中枢 22 端口不稳：配 `hub_proxy` |
+| `agentctl new` 卡在 Claude token 探测 | `agents.token` 指定号（codex 任务不用 Claude 号） |
+| 验收判 FAIL "写到了 .build/ 以外" | 阶段在仓库里写了派生物（常见：Python 的 `__pycache__`，用 `PYTHONDONTWRITEBYTECODE=1`） |
+| `wait` 退出码 4 | hold 进程停了或被别人接手：`ci/coord lease show` |
+| 主中枢挂了 | `ci/` 自动用备用中枢；主中枢恢复后先在备用中枢上 `git push --mirror <主中枢>` 再切回 |
