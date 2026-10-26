@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>curryplan</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#2747B0">
+<link rel="stylesheet" href="/kit.css">
+<style>
+.gate { min-height: 80vh; display: grid; place-items: center; }
+.gate form { display: grid; gap: 10px; width: min(320px, 100%); }
+.gate h1 { margin: 0 0 4px; font-size: 22px; }
+.gate input { font: 16px var(--sans); padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); }
+.gate button { font: 600 15px var(--sans); padding: 10px; border-radius: 8px; border: none; background: var(--accent); color: var(--surface); cursor: pointer; }
+.gate .err { color: var(--warn); font-size: 13px; min-height: 1.2em; }
+</style>
+</head>
+<body>
+<div class="wrap gate">
+  <form>
+    <h1>curryplan</h1>
+    <input type="password" autocomplete="current-password" placeholder="口令" autofocus>
+    <button type="submit">进入</button>
+    <div class="err"></div>
+  </form>
+</div>
+<script>
+const f = document.querySelector("form");
+f.onsubmit = async (e) => {
+  e.preventDefault();
+  const r = await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pw: f.querySelector("input").value }) }).catch(() => null);
+  if (r && r.ok) location.replace(new URLSearchParams(location.search).get("next") || "/");
+  else f.querySelector(".err").textContent = r ? "口令不对" : "连不上";
+};
+</script>
+</body>
+</html>

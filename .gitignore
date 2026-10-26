@@ -1,1 +1,4 @@
 __pycache__/
+/.conda/
+dsh/.venv/
+dsh/home/

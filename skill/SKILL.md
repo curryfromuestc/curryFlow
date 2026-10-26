@@ -1,13 +1,13 @@
 ---
 name: curryplan
 description: >-
-  往 curryplan（https://plan.example:8443，old-plan.example 上的 nginx）发页面：方案页、论文页、
+  往 curryPlan（https://plan.example:8443，old-plan.example 上的 nginx）发页面：方案页、论文页、
   学习页、笔记、项目状态页。写清页面约定（/kit.css、/ui.css、/ui.js，<项目>/<页面>/index.html + meta.json，
   只写最终形态、中文）、发布（scp 后跑 gen_catalog.py）、注册新项目（projects.json）和读中枢数据的状态页。
-  触发于："发到 curryplan"、"写个方案页 / 学习页 / 论文页"、"给项目开个 curryplan"、"更新状态页"。
+  触发于："发到 curryPlan"、"写个方案页 / 学习页 / 论文页"、"给项目开个 curryPlan"、"更新状态页"。
 ---
 
-# curryplan
+# curryPlan
 
 人看的那一面：一个手机上也好用的页面目录（PWA），按项目分组，最新的在上。每个页面上能选中实体评论（文字或
 手绘）和提问（AI 讲解）。讨论和拍板在会话里，页面只放结果。
@@ -15,7 +15,7 @@ description: >-
 - 主机 `user@old-plan.example`（key 登录），站点根 `/var/www/plan`，nginx 在 8443 端口，口令 cookie 挡在前面。
 - `/api/*` 由 `~/curry-site/server.py`（127.0.0.1:8765）处理：评论、提问、可编辑正文。**不要改它**，也不要动
   站点根下的公共文件（`kit.css`、`ui.css`、`ui.js`、`kit.js`、`app.*`、`index.html`、`sw.js`）——它们的源在
-  box-a 的 `/home/user/code/curryplan/shell/`。
+  box-a 的 `/home/user/code/curryPlan/shell/`。
 - 动手前先看两三个现有页面学样子：`/var/www/plan/curryplan/flow/`（方案页的好样板）、`currygpu/sm/`、`rtlsim/paper/`。
 
 ## 页面约定
@@ -58,17 +58,17 @@ EOF
 mkdir -p <项目> && python3 gen_catalog.py'
 ```
 
-## 状态页（curryflow 项目）
+## 状态页（curryFlow 项目）
 
-模板在 curryflow skill 的 `templates/curryplan/status/index.html`（把 `__PROJECT__` 换成项目名），页面本身不带
+模板在 curryFlow skill 的 `templates/curryplan/status/index.html`（把 `__PROJECT__` 换成项目名），页面本身不带
 数据，每 30 秒读同目录的 `status.json`：租约、任务、候选 × 阶段的结论、executor 心跳和槽位、每台机器每天的磁盘
-占用。`status.json` 由 curryplan 机上的一份项目 clone 每分钟从中枢读出来（`ci/coord status --json`）：
+占用。`status.json` 由 curryPlan 机上的一份项目 clone 每分钟从中枢读出来（`ci/coord status --json`）：
 
 ```sh
-# 一次：clone（curryplan 机的公钥要在中枢 ci 用户的 authorized_keys 里）
+# 一次：clone（curryPlan 机的公钥要在中枢 ci 用户的 authorized_keys 里）
 ssh user@old-plan.example 'mkdir -p ~/curryflow && git clone -q ci@<主中枢>:<项目>.git ~/curryflow/<项目>-status'
 # crontab 加一行（保留已有的行；行尾注释用来认出它）
-* * * * * cd ~/curryflow/<项目>-status && flock -n .git/cf-status.lock sh -c "git pull -q --ff-only; python3 ci/coord status --json > /var/www/plan/<项目>/status/status.json.tmp && mv /var/www/plan/<项目>/status/status.json.tmp /var/www/plan/<项目>/status/status.json" >/dev/null 2>&1  # curryflow <项目> 状态页
+* * * * * cd ~/curryflow/<项目>-status && flock -n .git/cf-status.lock sh -c "git pull -q --ff-only; python3 ci/coord status --json > /var/www/plan/<项目>/status/status.json.tmp && mv /var/www/plan/<项目>/status/status.json.tmp /var/www/plan/<项目>/status/status.json" >/dev/null 2>&1  # curryFlow <项目> 状态页
 ```
 
 状态页的 `meta.json` 用 `"kind": "状态"`。读不到中枢时页面会显示"读不到 status.json"，数据时间写在右上角。

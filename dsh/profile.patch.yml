@@ -1,0 +1,4 @@
+# 不把会话日志随请求上传给 DeepSeek
+- id: session-log-deepseek
+  config:
+    enabled: false

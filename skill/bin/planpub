@@ -1,5 +1,5 @@
 #!/bin/bash
-# 把一个页面目录发布到 curryplan：planpub 项目 页面名 目录 "标题" "一句话结论" [方案|笔记]
+# 把一个页面目录发布到 curryPlan：planpub 项目 页面名 目录 "标题" "一句话结论" [方案|笔记]
 # 目录里要有 index.html；图片等放在同一目录。任何机器上都能用（走 ssh）。
 set -e
 [ $# -ge 5 ] || { sed -n 2,3p "$0"; exit 1; }
