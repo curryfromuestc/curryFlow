@@ -1,4 +1,4 @@
-"""curryflow 运行时的公用部分：读 ci/machines，和中枢之间读写 ref。只用标准库。
+"""curryFlow 运行时的公用部分：读 ci/machines，和中枢之间读写 ref。只用标准库。
 
 中枢上的 ref（全部是普通 git ref，机器之间只走 git）：
   refs/heads/main               主线；只有通过验收的候选才推上来

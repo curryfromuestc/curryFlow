@@ -1,9 +1,9 @@
-# curryflow
+# curryFlow
 
-给一个项目引导出多机开发流程的 Claude Code / codex skill。curryflow 只做引导：探测机器、和人定验收阶段，
+给一个项目引导出多机开发流程的 Claude Code / codex skill。curryFlow 只做引导：探测机器、和人定验收阶段，
 从 `templates/` 生成项目自己的 `ci/`（`accept`、`machines`、`coord`、`executor`、`cflib.py`）、`AGENTS.md`
-和 `.gitignore`，建中枢 git 仓库和镜像，在每台机器装 executor，开 curryplan 项目。生成之后流程跟着项目仓库走，
-和 curryflow 无关。全部约定见 [SKILL.md](SKILL.md)。
+和 `.gitignore`，建中枢 git 仓库和镜像，在每台机器装 executor，开 curryPlan 项目。生成之后流程跟着项目仓库走，
+和 curryFlow 无关。全部约定见 [SKILL.md](SKILL.md)。
 
 ```
 templates/
@@ -22,7 +22,7 @@ templates/
 ## 安装
 
 ```sh
-git clone git@github.com:curryfromuestc/curryflow.git ~/code/curryflow
-ln -s ~/code/curryflow ~/.claude/skills/curryflow
-ln -s ~/code/curryflow ~/.codex/skills/curryflow
+git clone git@github.com:curryfromuestc/curryFlow.git ~/code/curryFlow
+ln -s ~/code/curryFlow ~/.claude/skills/curryflow
+ln -s ~/code/curryFlow ~/.codex/skills/curryflow
 ```

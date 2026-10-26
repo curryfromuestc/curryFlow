@@ -3,14 +3,14 @@ name: curryflow
 description: >-
   给一个项目引导出多机开发流程：探测机器、和人定验收阶段与判据、定存储规矩，从模板生成项目自己的
   ci/（accept、machines、coord、executor）、AGENTS.md 和 .gitignore，建中枢 git 仓库和镜像，在每台机器装
-  executor，开 curryplan 项目；并写清协调器的通用规矩（任务生命周期、只看 diff 的独立审查、一次汇报、
-  按任务挑模型、卡住就停）。触发于："用 curryflow 引导 X"、"给项目搭多机流程"、"起协调器"、"加一台机器"。
+  executor，开 curryPlan 项目；并写清协调器的通用规矩（任务生命周期、只看 diff 的独立审查、一次汇报、
+  按任务挑模型、卡住就停）。触发于："用 curryFlow 引导 X"、"给项目搭多机流程"、"起协调器"、"加一台机器"。
 ---
 
-# curryflow
+# curryFlow
 
-curryflow 只做引导，本身不带运行时代码，也不知道具体项目。运行时代码都在 `templates/` 里，引导时拷进项目的
-`ci/`，提交进项目仓库；从那以后，项目里的 `ci/` 就是全部真相，curryflow 不再参与。换项目就再引导一次。
+curryFlow 只做引导，本身不带运行时代码，也不知道具体项目。运行时代码都在 `templates/` 里，引导时拷进项目的
+`ci/`，提交进项目仓库；从那以后，项目里的 `ci/` 就是全部真相，curryFlow 不再参与。换项目就再引导一次。
 对人的一切叙述用中文。
 
 ```
@@ -18,7 +18,7 @@ curryflow 只做引导，本身不带运行时代码，也不知道具体项目�
   └─ 备用中枢         post-receive 每次 ref 更新镜像一份；主中枢连不上时 ci/ 按顺序用它
 协调器（任何地方）    clone + 中枢 key + ci/coord；无状态；租约保证同一时间只有一个
 executor（每台机器）  ci/executor run；只往外连中枢；领任务开 agent 容器，领验收作业跑槽位
-curryplan             人看的状态页（每分钟读中枢）和方案页；讨论和拍板在会话里，不上页面
+curryPlan             人看的状态页（每分钟读中枢）和方案页；讨论和拍板在会话里，不上页面
 ```
 
 机器之间只走 git，不挂共享盘；协调器从不登录执行机；token 只放执行机，不过中枢；GitHub 只收 main，只由人推。
@@ -61,20 +61,20 @@ curryplan             人看的状态页（每分钟读中枢）和方案页；�
    ssh <主中枢> 'git -C <项目>.git config core.sshCommand "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"'
    ```
    备用中枢同样有 `ci` 用户和 bare 仓库；主中枢 `ci` 的公钥进备用中枢的 authorized_keys；每台执行机、要起协调器的
-   机器、curryplan 机的公钥进两边。`git push <主中枢> main`，核对备用中枢的 main 几秒内跟上。
+   机器、curryPlan 机的公钥进两边。`git push <主中枢> main`，核对备用中枢的 main 几秒内跟上。
 6. **装 executor。** 每台机器 clone 到 `ci/machines` 里的 `dir`，然后
    `ci/executor install --machine <名>`（建钉核的槽位容器、挂缓存、查 agentctl）和 `ci/executor start --machine <名>`
    （在本机 herdr 里起，人能 attach 看）。冒烟：协调器 `ci/coord queue smoke --commit main`，`ci/coord wait` 出 PASS 后
    `ci/coord drop smoke-1`。
-7. **开 curryplan 项目。** 按 curryplan skill 注册项目；状态页用 `templates/curryplan/status/`（把 `__PROJECT__`
-   换成项目名），在 curryplan 机上另 clone 一份，cron 每分钟 `ci/coord status --json` 写到页面目录的 `status.json`；
+7. **开 curryPlan 项目。** 按 curryPlan skill 注册项目；状态页用 `templates/curryplan/status/`（把 `__PROJECT__`
+   换成项目名），在 curryPlan 机上另 clone 一份，cron 每分钟 `ci/coord status --json` 写到页面目录的 `status.json`；
    方案页从 `templates/curryplan/plan/` 起，只写最终形态。
 
 `ci/machines`（JSON）：
 
 ```json
 {"project": "toy", "hubs": ["ci@<主中枢>:toy.git", "ci@<备用中枢>:toy.git"],
- "curryplan": {"host": "yanggl@<curryplan 机>", "page": "/var/www/plan/toy/status", "clone": "~/curryflow/toy-status"},
+ "curryPlan": {"host": "yanggl@<curryPlan 机>", "page": "/var/www/plan/toy/status", "clone": "~/curryflow/toy-status"},
  "machines": {
   "aimax": {"ssh": "aimax", "dir": "~/curryflow/toy", "backend": "incus", "shared": false, "hub_proxy": "127.0.0.1:7890",
             "incus": {"image": "agentbox-base", "pool": "agentbox"},
