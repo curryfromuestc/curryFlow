@@ -1,7 +1,7 @@
 ---
 name: curryplan
 description: >-
-  往 curryPlan（https://plan.example:8443，old-plan.example 上的 nginx）发页面：方案页、论文页、
+  往 curryPlan（https://plan.example:8443，阿里云 plan.example 上的 nginx）发页面：方案页、论文页、
   学习页、笔记、项目状态页。写清页面约定（/kit.css、/ui.css、/ui.js，<项目>/<页面>/index.html + meta.json，
   只写最终形态、中文）、发布（scp 后跑 gen_catalog.py）、注册新项目（projects.json）和读中枢数据的状态页。
   触发于："发到 curryPlan"、"写个方案页 / 学习页 / 论文页"、"给项目开个 curryPlan"、"更新状态页"。
@@ -12,7 +12,8 @@ description: >-
 人看的那一面：一个手机上也好用的页面目录（PWA），按项目分组，最新的在上。每个页面上能选中实体评论（文字或
 手绘）和提问（AI 讲解）。讨论和拍板在会话里，页面只放结果。
 
-- 主机 `user@old-plan.example`（key 登录），站点根 `/var/www/plan`，nginx 在 8443 端口，口令 cookie 挡在前面。
+- 主机 `user@plan.example`（key 登录），站点根 `/var/www/plan`，nginx 在 8443 端口，口令 cookie 挡在前面。
+- 域名还没备案，现在直接用 IP 访问（Let's Encrypt IP 证书，服务器上 lego-renew.timer 自动续期）；备案完成后改成正式域名。
 - `/api/*` 由 `~/curry-site/server.py`（127.0.0.1:8765）处理：评论、提问、可编辑正文。**不要改它**，也不要动
   站点根下的公共文件（`kit.css`、`ui.css`、`ui.js`、`kit.js`、`app.*`、`index.html`、`sw.js`）——它们的源在
   box-a 的 `/home/user/code/curryPlan/shell/`。
@@ -37,9 +38,9 @@ description: >-
 ## 发布
 
 ```sh
-ssh user@old-plan.example 'mkdir -p /var/www/plan/<项目>/<页面>'
-scp -r <目录>/* user@old-plan.example:/var/www/plan/<项目>/<页面>/
-ssh user@old-plan.example 'python3 /var/www/plan/gen_catalog.py'     # 重写首页目录 catalog.json
+ssh user@plan.example 'mkdir -p /var/www/plan/<项目>/<页面>'
+scp -r <目录>/* user@plan.example:/var/www/plan/<项目>/<页面>/
+ssh user@plan.example 'python3 /var/www/plan/gen_catalog.py'     # 重写首页目录 catalog.json
 ```
 
 每次发布都更新 `meta.json` 的 `updated`。`bin/planpub 项目 页面名 目录 "标题" "一句话结论" [种类]` 一条命令做完
@@ -50,7 +51,7 @@ ssh user@old-plan.example 'python3 /var/www/plan/gen_catalog.py'     # 重写首
 `/var/www/plan/projects.json` 是 `[{"id", "name"}, …]`，顺序就是首页顺序；`id` 也是目录名。
 
 ```sh
-ssh user@old-plan.example 'cd /var/www/plan && python3 - <<EOF
+ssh user@plan.example 'cd /var/www/plan && python3 - <<EOF
 import json; p = json.load(open("projects.json"))
 p.append({"id": "<项目>", "name": "<显示名>"}) if all(x["id"] != "<项目>" for x in p) else None
 json.dump(p, open("projects.json", "w"), ensure_ascii=False)
@@ -66,7 +67,7 @@ mkdir -p <项目> && python3 gen_catalog.py'
 
 ```sh
 # 一次：clone（curryPlan 机的公钥要在中枢 ci 用户的 authorized_keys 里）
-ssh user@old-plan.example 'mkdir -p ~/curryflow && git clone -q ci@<主中枢>:<项目>.git ~/curryflow/<项目>-status'
+ssh user@plan.example 'mkdir -p ~/curryflow && git clone -q ci@<主中枢>:<项目>.git ~/curryflow/<项目>-status'
 # crontab 加一行（保留已有的行；行尾注释用来认出它）
 * * * * * cd ~/curryflow/<项目>-status && flock -n .git/cf-status.lock sh -c "git pull -q --ff-only; python3 ci/coord status --json > /var/www/plan/<项目>/status/status.json.tmp && mv /var/www/plan/<项目>/status/status.json.tmp /var/www/plan/<项目>/status/status.json" >/dev/null 2>&1  # curryFlow <项目> 状态页
 ```
