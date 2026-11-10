@@ -494,7 +494,8 @@ def c_codes(r):
     return f"退出码 {rc1}、{rc2}", rc1 == 3 and rc2 == 99
 
 
-@case("H-lost", "作业在跑时它的启动进程和监管进程都被 kill -9（作业的进程也结束）", "结论 255（丢了），flow wait 以 255 退出")
+@case("H-lost", "作业在跑时它的启动进程和监管进程都被 kill -9（作业的进程也结束）",
+      "结论 255（丢了），flow wait 以 255 退出；这是本机 executor 的定论，flow ls 不把它列进「判丢了」")
 def c_lost(r):
     pf = f"{r.out}/lost.pid"
     rid = r.submit("--machine", "t1", "--", f"echo $$ > {pf}; exec sleep 300")
@@ -508,7 +509,10 @@ def c_lost(r):
             pass
     os.kill(int(lines(pf)[0]), signal.SIGKILL)
     rc, out = r.flow("wait", rid, timeout=120)
-    return f"flow wait 退出码 {rc}：{out.splitlines()[-1] if out else ''}", rc == 255
+    _, ls = r.flow("ls")
+    listed = "判丢了" in ls and rid in ls.split("判丢了", 1)[1].split("最近完成", 1)[0]
+    return f"flow wait 退出码 {rc}：{out.splitlines()[-1] if out else ''}；flow ls 的「判丢了」里{'有' if listed else '没有'}它", (
+        rc == 255 and not listed)
 
 
 @case("D-prio", "t2 唯一的槽位被占着时，依次提交 night、normal、gate 三个作业", "槽位空出来后按 gate、normal、night 的顺序跑")

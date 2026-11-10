@@ -368,7 +368,7 @@ def cmd_cancel(a):
     if "q" not in st and "run" not in st:
         if "done" not in st:
             die(f"{rid}：没有这个请求")
-        if patient(read, "done", rid).get("reason") != "lost":
+        if not patient(read, "done", rid).get("judged_by"):
             die(f"{rid}：已经结束了")
         return cancel_lost(a, rid, st["done"])
     if "run" not in st:
@@ -513,7 +513,7 @@ def cmd_ls(a):
     running = sorted(s["run"], key=lambda r: r["id"])
     done = sorted(s["done"], key=lambda d: d["end"] if isinstance(d.get("end"), (int, float)) else 0, reverse=True)
     t = time.time()
-    lost = [d for d in done if d.get("reason") == "lost" and d.get("machine")
+    lost = [d for d in done if d.get("reason") == "lost" and d.get("judged_by")
             and isinstance(d.get("start"), (int, float)) and t - d["start"] < TIMEOUT_MAX]
     if not a.all:
         done = done[:10]

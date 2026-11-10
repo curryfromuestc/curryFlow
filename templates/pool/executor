@@ -1161,7 +1161,7 @@ class Executor:
         d = {k: r.get(k) for k in ("kind", "who", "project", "commit", "cmd", "prio", "submitted", "machine", "slot", "start")}
         d.update(id=rid, who=d["who"] if isinstance(d["who"], str) else "?", end=t,
                  secs=t - int(r["start"]) if num(r.get("start"), 0, t) else 0, code=CODE_LOST, reason="lost",
-                 note=f"{why}；{self.machine} 判它丢了", last="", tail=[],
+                 judged_by=self.machine, note=f"{why}；{self.machine} 判它丢了", last="", tail=[],
                  log={"machine": r["machine"], "path": os.path.join(r["rundir"], "log")}
                  if r.get("kind") == "job" and isinstance(r.get("rundir"), str) else None)
         if self.conclude(rid, d, q=q.get(rid), run=run[rid], cancel=cancel.get(rid)):
