@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>机器</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<meta name="theme-color" content="#2747B0">
+<link rel="stylesheet" href="/kit.css">
+<link rel="stylesheet" href="/ui.css">
+<style>
+.mono { font: 12.5px var(--mono); }
+.dim { color: var(--ink-3); }
+.stale { color: var(--warn); font-weight: 600; }
+.b { display: inline-block; width: 84px; height: 8px; background: var(--sunk); border-radius: 4px; overflow: hidden; vertical-align: middle; margin-right: 6px; }
+.b i { display: block; height: 100%; background: var(--accent); }
+.b.hot i { background: var(--warn); }
+.v { font: 600 12px var(--mono); padding: 1px 7px; border-radius: 999px; background: var(--sunk); color: var(--ink-2); white-space: nowrap; }
+.v.free { background: color-mix(in srgb, var(--c3) 18%, transparent); color: var(--c3); }
+.v.busy { background: var(--accent-soft); color: var(--accent); }
+.v.off { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+.nums { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-bottom: 8px; }
+.nums div { min-width: 0; }
+.nums b { display: block; font: 700 19px var(--mono); }
+.nums span { font-size: 12px; color: var(--ink-3); }
+svg.sp { display: block; width: 100%; height: 44px; margin-top: 4px; }
+svg.sp polyline { fill: none; stroke: var(--accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+svg.sp line { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-stroke; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <a class="back" href="/">← 全部</a>
+  <div class="top"><h1>机器</h1><span class="sub" id="sub">读取中…</span><span class="dl" id="at"></span></div>
+</header>
+<p class="oneline" id="line" data-c="say"></p>
+<div id="machines"></div>
+</div>
+<script>
+(function () {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const secs = (t) => (Date.now() - Date.parse(t.replace(/([+-]\d\d)(\d\d)$/, "$1:$2"))) / 1000;
+  const ago = (t) => { if (!t) return "-"; const s = secs(t); return s < 90 ? Math.round(s) + " 秒前" : s < 5400 ? Math.round(s / 60) + " 分前" : s < 172800 ? Math.round(s / 3600) + " 小时前" : Math.round(s / 86400) + " 天前"; };
+  const gb = (b) => b == null ? "-" : b >= 2 ** 40 ? (b / 2 ** 40).toFixed(1) + " T" : (b / 2 ** 30).toFixed(0) + " G";
+  const bar = (x, of) => { const p = of ? Math.min(100, 100 * x / of) : 0; return `<span class="b${p >= 75 ? " hot" : ""}"><i style="width:${p.toFixed(0)}%"></i></span>`; };
+  const row = (cells) => "<tr>" + cells.map((c) => `<td>${c}</td>`).join("") + "</tr>";
+  const head = (cols) => "<tr>" + cols.map((c) => `<th>${c}</th>`).join("") + "</tr>";
+  const who = (top) => (top || []).map((p) => `${esc(p.user)} <span class="dim mono">${esc(p.cmd)} ×${p.threads}</span>`).join("<br>") || '<span class="dim">-</span>';
+  const FREE = 0.1;
+  function spark(points, of) {
+    if (!points || points.length < 2) return "";
+    const n = points.length, xs = (i) => (100 * i / (n - 1)).toFixed(2), ys = (v) => (40 - 38 * Math.min(1, v / of)).toFixed(2);
+    return `<svg class="sp" viewBox="0 0 100 42" preserveAspectRatio="none"><line x1="0" y1="40" x2="100" y2="40"/><line x1="0" y1="2" x2="100" y2="2"/>` +
+      `<polyline points="${points.map((p, i) => xs(i) + "," + ys(p[1])).join(" ")}"/></svg>` +
+      `<div class="dim" style="font-size:12px">忙线程，最近 ${n} 分钟（顶线 = ${of} 线程）</div>`;
+  }
+  function machine(m) {
+    const b = m.beat, c = m.conf;
+    if (!b) return `<section class="sec" data-c="m-${esc(m.name)}"><h2>${esc(m.name)} <small class="stale">没有心跳</small></h2></section>`;
+    const stale = secs(b.at) > 200;
+    const slots = (b.slots || []).map((s) => {
+      const box = s.container && (b.containers || []).find((x) => x.name === s.container);
+      const state = s.container && !box ? ["off", "没有容器"] : box && box.state !== "Running" ? ["off", "容器已停"] : s.busy / s.threads > FREE ? ["busy", "在用"] : ["free", "空闲"];
+      return row([`<b>${esc(s.name)}</b>${s.note ? ` <span class="dim">${esc(s.note)}</span>` : ""}`, `<span class="v ${state[0]}">${state[1]}</span>`,
+        `<span class="mono">${esc(s.cpus)}</span>`, `${bar(s.busy, s.threads)}<span class="mono">${s.busy} / ${s.threads}</span>`,
+        box ? `<span class="mono">${gb(box.mem_used)} / ${esc(s.mem || box.mem_limit || "-")}</span>` : `<span class="mono dim">${esc(s.mem || "-")}</span>`, who(s.top)]);
+    }).join("");
+    const pool = new Set((b.slots || []).map((s) => s.container).filter(Boolean));
+    const others = (b.containers || []).filter((x) => !pool.has(x.name));
+    const boxes = others.map((x) => row([`<b>${esc(x.name)}</b>`, `<span class="v ${x.state === "Running" ? "busy" : ""}">${x.state === "Running" ? "运行" : "停"}</span>`,
+      `<span class="mono">${esc(x.cpus || "不限")}</span>`, x.busy == null ? "" : `<span class="mono">${x.busy}</span>`,
+      `<span class="mono">${x.state === "Running" ? gb(x.mem_used) + " / " : ""}${esc(x.mem_limit || "不限")}</span>`, `<span class="mono">${x.procs || ""}</span>`])).join("");
+    const nodes = (b.nodes || []).map((n) => row([`节点 ${n.id}`, `<span class="mono dim">${esc(n.cpus)}</span>`, `${bar(n.busy, n.threads)}<span class="mono">${n.busy} / ${n.threads}</span>`])).join("");
+    const gpus = (b.gpus || []).map((g) => row([`${g.index}`, esc(g.name.replace("NVIDIA ", "")), `${bar(g.util, 100)}<span class="mono">${g.util}%</span>`,
+      `<span class="mono">${gb(g.mem_used)} / ${gb(g.mem_total)}</span>`, esc([...new Set(g.procs.map((p) => p.user))].join(" ")) || '<span class="dim">-</span>'])).join("");
+    const disks = (b.disks || []).map((d) => d.error ? row([esc(d.mount), esc(d.error), ""]) :
+      row([`<span class="mono">${esc(d.mount)}</span>`, `${bar(d.total - d.free, d.total)}<span class="mono">${(100 * (d.total - d.free) / d.total).toFixed(0)}%</span>`, `<span class="mono">剩 ${gb(d.free)} / ${gb(d.total)}</span>`])).join("");
+    const users = (b.users || []).map((u) => `${esc(u.user)} <span class="mono dim">×${u.threads}</span>`).join(" · ");
+    const used = b.mem.total - b.mem.avail;
+    return `<section class="sec" data-c="m-${esc(m.name)}"><h2>${esc(m.name)} <small>${c.shared ? "共享机" : "独占机"} · ${b.threads} 线程 · 心跳 <span class="${stale ? "stale" : ""}">${ago(b.at)}</span></small></h2>
+      <div class="wall">
+        <div class="card" data-c="m-${esc(m.name)}-load"><div class="nums">
+          <div><b>${b.busy.toFixed(0)}<span class="dim" style="font-size:13px"> / ${b.threads}</span></b><span>忙线程</span></div>
+          <div><b>${gb(used)}<span class="dim" style="font-size:13px"> / ${gb(b.mem.total)}</span></b><span>内存</span></div>
+          <div><b>${b.load.toFixed(0)}</b><span>负载</span></div></div>
+          ${spark(m.history, b.threads)}
+          <p class="say" style="margin-top:8px">${users || "没有占 CPU 的用户"}</p></div>
+        <div class="card scroll" data-c="m-${esc(m.name)}-nodes"><table class="t">${head(["NUMA", "核", "忙"])}${nodes}</table></div>
+        <div class="card wide scroll" data-c="m-${esc(m.name)}-slots"><h3>槽位</h3><table class="t">${head(["槽位", "状态", "核", "忙线程", "内存", "谁在用"])}${slots}</table></div>
+        ${boxes ? `<div class="card wide scroll" data-c="m-${esc(m.name)}-boxes"><h3>池外的容器</h3><table class="t">${head(["容器", "状态", "核", "忙线程", "内存", "进程"])}${boxes}</table></div>` : ""}
+        ${gpus ? `<div class="card scroll" data-c="m-${esc(m.name)}-gpus"><h3>显卡</h3><table class="t">${head(["#", "型号", "占用", "显存", "用户"])}${gpus}</table></div>` : ""}
+        <div class="card scroll" data-c="m-${esc(m.name)}-disks"><h3>磁盘</h3><table class="t">${head(["挂载点", "已用", "容量"])}${disks}</table></div>
+      </div></section>`;
+  }
+  function render(s) {
+    const ms = s.machines, live = ms.filter((m) => m.beat && secs(m.beat.at) <= 200);
+    let free = 0, total = 0;
+    ms.forEach((m) => (m.beat ? m.beat.slots : []).forEach((x) => {
+      total++;
+      const box = x.container && (m.beat.containers || []).find((y) => y.name === x.container);
+      if ((!x.container || (box && box.state === "Running")) && x.busy / x.threads <= FREE && secs(m.beat.at) <= 200) free++;
+    }));
+    $("sub").textContent = `${ms.length} 台 · ${live.length} 台有心跳`;
+    $("at").textContent = "数据 " + ago(s.at);
+    $("line").innerHTML = `空闲槽位 <b>${free}</b> / ${total}` + live.map((m) => ` · ${esc(m.name)} ${m.beat.busy.toFixed(0)}/${m.beat.threads}`).join("");
+    $("machines").innerHTML = ms.map(machine).join("");
+  }
+  function load() {
+    fetch("status.json", { cache: "no-store" }).then((r) => r.json()).then(render)
+      .catch(() => { $("sub").textContent = "读不到 status.json（中枢不通，或定时任务没跑）"; });
+  }
+  load(); setInterval(load, 30000);
+})();
+</script>
+<script src="/kit.js"></script>
+<script src="/ui.js"></script>
+</body>
+</html>

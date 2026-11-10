@@ -1,10 +1,12 @@
 ---
 name: curryflow
 description: >-
-  给一个项目引导出多机开发流程：探测机器、和人定验收阶段与判据、定存储规矩，从模板生成项目自己的
+  多机开发流程的唯一入口。给一个项目引导出流程：探测机器、和人定验收阶段与判据、定存储规矩，从模板生成项目自己的
   ci/（accept、machines、coord、executor）、AGENTS.md 和 .gitignore，建中枢 git 仓库和镜像，在每台机器装
-  executor，开 curryPlan 项目；并写清协调器的通用规矩（任务生命周期、只看 diff 的独立审查、一次汇报、
-  按任务挑模型、卡住就停）。触发于："用 curryFlow 引导 X"、"给项目搭多机流程"、"起协调器"、"加一台机器"。
+  executor；写清协调器的通用规矩（任务生命周期、只看 diff 的独立审查、一次汇报、按任务挑模型、卡住就停）；
+  管机器池（机器清单、每分钟心跳、curryPlan 上的"机器"页）；往 curryPlan 发页面（方案页、论文页、学习页、笔记、
+  状态页，约定在 curryplan.md）。触发于："用 curryFlow 引导 X"、"给项目搭多机流程"、"起协调器"、"加一台机器"、
+  "看机器负载 / 槽位"、"发到 curryPlan"、"写个方案页 / 学习页 / 论文页"、"给项目开个 curryPlan"、"更新状态页"。
 ---
 
 # curryFlow
@@ -67,7 +69,7 @@ curryPlan             人看的状态页（每分钟读中枢）和方案页；�
    `ci/executor install --machine <名>`（建钉核的槽位容器、挂缓存、查 agentctl）和 `ci/executor start --machine <名>`
    （在本机 herdr 里起，人能 attach 看）。冒烟：协调器 `ci/coord queue smoke --commit main`，`ci/coord wait` 出 PASS 后
    `ci/coord drop smoke-1`。
-7. **开 curryPlan 项目。** 按 curryPlan skill 注册项目；状态页用 `templates/curryplan/status/`（把 `__PROJECT__`
+7. **开 curryPlan 项目。** 按 `curryplan.md` 注册项目；状态页用 `templates/curryplan/status/`（把 `__PROJECT__`
    换成项目名），在 curryPlan 机上另 clone 一份，cron 每分钟 `ci/coord status --json` 写到页面目录的 `status.json`；
    方案页从 `templates/curryplan/plan/` 起，只写最终形态。
 
@@ -136,6 +138,26 @@ curryPlan             人看的状态页（每分钟读中枢）和方案页；�
 - **只动自己起的进程。** 结束进程只按自己记下的 PID；不用 `pkill -f`、`pgrep -f` 找进程或写等待循环——它们会
   匹配到发命令的 shell 自己。等后台作业就等它的 PID。
 - token、密码不打印、不写日志、不提交。
+
+## 机器池
+
+槽位归机器，不归项目：几个项目共用同一批机器，机器清单只有一份。中枢上的 `machines.git` 放它：
+
+- `machines.json`：每台机器的槽位（钉的核、内存、容器名）和要报告的挂载点；`beat`、`status` 从 `templates/pool/` 拷来。
+- 每台机器 clone 到 `~/curryflow/machines`，cron 每分钟跑 `python3 beat --machine <名>`，把本机状态推成
+  `refs/hb/<名>`（一个 JSON blob）：各 NUMA 节点和各槽位的忙线程、内存、磁盘、显卡、incus 容器、谁在占 CPU。
+  国内机器在 `machines.json` 里写 `hub_proxy`。
+- curryPlan 机 clone 到 `~/curryflow/machines-status`，cron 每分钟取全部心跳，`python3 status --history hist.json`
+  写出 `/var/www/plan/curryplan/machines/status.json`；页面是 `templates/curryplan/machines/index.html`。
+- 改槽位：改 `machines.json` 推到 `machines.git`，各机器十分钟内自己拉到。加机器：加一项，在那台机器上 clone、装 cron。
+
+通用容器（incus 机器）：同一个镜像（基础系统加构建用的包），钉在一个槽位的核上，依赖缓存只读挂入，工作目录是宿主机
+`~/<容器名>` 同路径挂入；会变的工具（仿真器）走依赖缓存，不进镜像。
+
+## curryPlan
+
+人看的页面都发到 curryPlan。页面约定、发布（`bin/planpub`）、注册项目、状态页的做法在 `curryplan.md`，发之前先读它；
+页面骨架在 `templates/curryplan/`（`page/` 通用、`plan/` 方案、`status/` 项目状态、`machines/` 机器）。
 
 ## 加一台机器
 

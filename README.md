@@ -14,6 +14,10 @@ templates/
   hub/post-receive     主中枢镜像到备用中枢
   project/AGENTS.md    项目规则骨架；project/gitignore
   curryplan/plan/      方案页骨架；curryplan/status/ 读中枢数据的状态页
+  curryplan/page/      通用页面骨架；curryplan/machines/ 机器页
+  pool/beat            每台机器每分钟一份心跳；pool/status 把心跳汇成机器页的 status.json
+bin/planpub            把一个页面目录发布到 curryPlan
+curryplan.md           curryPlan 的页面约定、发布、注册项目、状态页
 ```
 
 只用 Python 3 标准库、git、ssh；incus 机器上的 agent 容器靠 [agentbox](https://github.com/curryfromuestc/agentbox)

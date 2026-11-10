@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""One heartbeat of this machine, pushed to the hub as refs/hb/<machine> (a JSON blob).
+
+usage: beat --machine NAME [--print]
+
+Run every minute by cron from a clone of the pool repository. machines.json names the machine's slots and the
+mounts to report; everything else is read from the machine: busy threads per NUMA node and per slot, memory,
+disks, GPUs, incus containers, who uses the CPUs.
+"""
+import argparse
+import collections
+import json
+import os
+import pwd
+import shutil
+import subprocess
+import time
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def run(cmd, timeout=20, shell=False):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, shell=shell)
+        return r.stdout if r.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def cpu_list(spec):
+    out = []
+    for part in spec.replace(" ", "").split(","):
+        if not part:
+            continue
+        a, _, b = part.partition("-")
+        out += range(int(a), int(b or a) + 1)
+    return out
+
+
+def cpu_times():
+    t = {}
+    for line in open("/proc/stat"):
+        if line.startswith("cpu") and line[3].isdigit():
+            p = line.split()
+            v = [int(x) for x in p[1:9]]
+            t[int(p[0][3:])] = (sum(v), v[3] + v[4])
+    return t
+
+
+def busy_per_cpu(seconds=2.0):
+    a = cpu_times()
+    time.sleep(seconds)
+    b = cpu_times()
+    return {c: 1 - (b[c][1] - a[c][1]) / max(1, b[c][0] - a[c][0]) for c in b if c in a}
+
+
+def numa_nodes():
+    base = "/sys/devices/system/node"
+    nodes = []
+    for d in sorted(os.listdir(base)) if os.path.isdir(base) else []:
+        if d.startswith("node") and d[4:].isdigit():
+            nodes.append((int(d[4:]), open(f"{base}/{d}/cpulist").read().strip()))
+    return sorted(nodes)
+
+
+def memory():
+    m = {}
+    for line in open("/proc/meminfo"):
+        k, v = line.split(":")
+        m[k] = int(v.split()[0]) * 1024
+    return {"total": m["MemTotal"], "avail": m["MemAvailable"]}
+
+
+def disks(mounts):
+    out = []
+    for mount in mounts:
+        try:
+            u = shutil.disk_usage(os.path.expanduser(mount))
+            out.append({"mount": mount, "total": u.total, "free": u.free})
+        except OSError as e:
+            out.append({"mount": mount, "error": str(e)})
+    return out
+
+
+def user_of(pid):
+    try:
+        uid = os.stat(f"/proc/{pid}").st_uid
+    except OSError:
+        return "?"
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return "容器" if uid >= 100000 else str(uid)
+
+
+def gpus():
+    q = run(["nvidia-smi", "--query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total",
+             "--format=csv,noheader,nounits"])
+    out, by_uuid = [], {}
+    for line in q.splitlines():
+        p = [x.strip() for x in line.split(",")]
+        if len(p) < 6:
+            continue
+        g = {"index": int(p[0]), "name": p[2], "util": int(p[3] or 0), "mem_used": int(p[4] or 0) << 20,
+             "mem_total": int(p[5] or 0) << 20, "procs": []}
+        by_uuid[p[1]] = g
+        out.append(g)
+    apps = run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_memory", "--format=csv,noheader,nounits"])
+    for line in apps.splitlines():
+        p = [x.strip() for x in line.split(",")]
+        if len(p) == 3 and p[0] in by_uuid:
+            by_uuid[p[0]]["procs"].append({"user": user_of(p[1]), "mem": int(p[2] or 0) << 20})
+    return out
+
+
+def containers():
+    text = run(["incus", "list", "--format", "json"], timeout=30)
+    if not text and shutil.which("sg"):
+        text = run(["sg", "incus-admin", "-c", "incus list --format json"], timeout=30)
+    if not text:
+        return None if not shutil.which("incus") else []
+    out = []
+    for c in json.loads(text):
+        cfg, st = c.get("config") or {}, c.get("state") or {}
+        work = [d.get("source") for d in (c.get("expanded_devices") or {}).values()
+                if d.get("type") == "disk" and d.get("path") != "/" and d.get("readonly") != "true"]
+        out.append({"name": c["name"], "state": c.get("status"), "cpus": cfg.get("limits.cpu"),
+                    "mem_limit": cfg.get("limits.memory"), "mem_used": (st.get("memory") or {}).get("usage"),
+                    "procs": st.get("processes"), "image": cfg.get("image.description"),
+                    "gpu": any(d.get("type") == "gpu" for d in (c.get("expanded_devices") or {}).values()),
+                    "work": [w for w in work if w]})
+    return out
+
+
+def processes():
+    out = []
+    for line in run(["ps", "-eo", "psr=,pcpu=,uid=,comm="]).splitlines():
+        p = line.split(None, 3)
+        if len(p) == 4 and float(p[1]) >= 5:
+            out.append((int(p[0]), float(p[1]) / 100, int(p[2]), p[3]))
+    return out
+
+
+def user_name(uid):
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return "容器" if uid >= 100000 else str(uid)
+
+
+def collect(name, conf):
+    busy = busy_per_cpu()
+    procs = processes()
+    total = lambda spec: round(sum(busy.get(c, 0) for c in cpu_list(spec)), 1)
+
+    def top(spec, n=2):
+        cs, agg = set(cpu_list(spec)), collections.Counter()
+        for psr, load, uid, comm in procs:
+            if psr in cs:
+                agg[(user_name(uid), comm)] += load
+        return [{"user": u, "cmd": c, "threads": round(v, 1)} for (u, c), v in agg.most_common(n) if v >= 0.5]
+
+    users = collections.Counter()
+    for psr, load, uid, comm in procs:
+        users[user_name(uid)] += load
+    beat = {
+        "machine": name, "host": os.uname().nodename, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "threads": len(busy), "busy": round(sum(busy.values()), 1), "load": os.getloadavg()[0],
+        "nodes": [{"id": i, "cpus": spec, "threads": len(cpu_list(spec)), "busy": total(spec)} for i, spec in numa_nodes()],
+        "mem": memory(), "disks": disks(conf.get("disks", ["/"])), "gpus": gpus(), "containers": containers(),
+        "slots": [{"name": s, "cpus": d["cpus"], "threads": len(cpu_list(d["cpus"])), "busy": total(d["cpus"]),
+                   "top": top(d["cpus"]), **{k: d[k] for k in ("mem", "container", "note") if k in d}}
+                  for s, d in conf.get("slots", {}).items()],
+        "users": [{"user": u, "threads": round(v, 1)} for u, v in users.most_common(6) if v >= 0.5],
+    }
+    for c in beat["containers"] or []:
+        if c.get("cpus") and c.get("state") == "Running":
+            c["busy"] = total(c["cpus"])
+    return beat
+
+
+def git(*args, input=None, proxy=None):
+    ssh = "ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+    if proxy:
+        ssh += f" -o 'ProxyCommand=nc -X connect -x {proxy} %h %p'"
+    env = {**os.environ, "GIT_SSH_COMMAND": ssh, "GIT_TERMINAL_PROMPT": "0"}
+    r = subprocess.run(["git", *args], cwd=ROOT, input=input, capture_output=True, text=True, env=env, timeout=45)
+    if r.returncode:
+        raise SystemExit(f"git {' '.join(args)}: {r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--machine", required=True)
+    ap.add_argument("--print", action="store_true")
+    a = ap.parse_args()
+    conf = json.load(open(os.path.join(ROOT, "machines.json")))["machines"].get(a.machine)
+    if conf is None:
+        raise SystemExit(f"machines.json has no machine {a.machine}")
+    beat = collect(a.machine, conf)
+    text = json.dumps(beat, ensure_ascii=False)
+    if a.print:
+        print(json.dumps(beat, ensure_ascii=False, indent=1))
+        return
+    proxy = conf.get("hub_proxy")
+    blob = git("hash-object", "-w", "--stdin", input=text)
+    git("push", "-q", "-f", "origin", f"{blob}:refs/hb/{a.machine}", proxy=proxy)
+    minute = time.localtime().tm_min
+    if minute % 10 == 0:
+        git("pull", "-q", "--ff-only", proxy=proxy)
+    if minute == 7:
+        git("gc", "-q", "--prune=now")
+
+
+if __name__ == "__main__":
+    main()
