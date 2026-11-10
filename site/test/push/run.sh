@@ -28,7 +28,9 @@ stage "a data directory the server cannot write: the other routes still come up"
 
 rm -rf "$W/home" "$W/www" "$W/new" "$W/chrome" "$FAKE"; mkdir -p "$DATA" "$W/www/t/p" "$W/new"
 python3 "$HERE/fake_service.py" certs "$FAKE" || lack "cannot make the stand-in push service's certificates"
-for f in $(git -C "$REPO" ls-tree --name-only "$OLD" shell/); do git -C "$REPO" show "$OLD:$f" > "$W/www/$(basename "$f")"; done
+# shell/ of $OLD: under site/ since curryPlan moved into curryFlow, at the top in the revisions from before.
+OLD_SHELL=$(git -C "$REPO" rev-parse --show-prefix)shell; git -C "$REPO" cat-file -e "$OLD:$OLD_SHELL" 2>/dev/null || OLD_SHELL=shell
+for f in $(git -C "$REPO" ls-tree --full-tree --name-only "$OLD" "$OLD_SHELL/"); do git -C "$REPO" show "$OLD:$f" > "$W/www/$(basename "$f")"; done
 cp "$REPO"/shell/* "$W/new/"
 echo '{"projects":[{"id":"t","name":"测试项目"}],"pages":[{"project":"t","url":"/t/p/","title":"一个页面","say":"结论","kind":"方案","updated":"2026-11-10 10:00"}]}' | tee "$W/new/catalog.json" > "$W/www/catalog.json"
 echo '<!doctype html><meta charset=utf-8><title>页</title><p>页面正文' > "$W/www/t/p/index.html"
@@ -40,8 +42,8 @@ python3 "$HERE/mock_nginx.py" "$W/www" 18443 > "$W/nginx.out" 2>&1 & NGINX=$!
 google-chrome --headless=new --remote-debugging-port=9333 --user-data-dir="$W/chrome" --no-first-run --no-default-browser-check ${PROXY:+--proxy-server=http://$PROXY} --window-size=390,844 about:blank > "$W/chrome.out" 2>&1 & CHROME=$!
 trap 'kill $SERVER $NGINX $CHROME $FAKESVC 2>/dev/null; sleep 1; rm -rf "$W/chrome"' EXIT
 for i in $(seq 1 40); do sleep 0.5; curl -s --noproxy localhost,127.0.0.1 -m 2 -o /dev/null http://127.0.0.1:9333/json/version && curl -s --noproxy localhost,127.0.0.1 -m 2 -o /dev/null $SITE/api/push/key && break; done
-OLD_CACHE=$(git -C "$REPO" show "$OLD:shell/sw.js" | grep -o 'curryplan-v[0-9]*' | head -1); NEW_CACHE=$(grep -o 'curryplan-v[0-9]*' "$REPO/shell/sw.js" | head -1)
-OLD_BELL=$(git -C "$REPO" cat-file -e "$OLD:shell/push.js" 2>/dev/null && echo 1 || echo 0)
+OLD_CACHE=$(git -C "$REPO" show "$OLD:$OLD_SHELL/sw.js" | grep -o 'curryplan-v[0-9]*' | head -1); NEW_CACHE=$(grep -o 'curryplan-v[0-9]*' "$REPO/shell/sw.js" | head -1)
+OLD_BELL=$(git -C "$REPO" cat-file -e "$OLD:$OLD_SHELL/push.js" 2>/dev/null && echo 1 || echo 0)
 export SITE DATA OUT=$W WWW=$W/www NEW=$W/new HOME_FOR_NOTIFY=$W/home NGINX_PID=$NGINX SERVER_PID=$SERVER FAKE FAKE_PORT OLD_CACHE NEW_CACHE OLD_BELL
 cd "$HERE"
 stage "an old client picks up the new service worker and page" node --experimental-websocket sw_update.mjs

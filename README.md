@@ -21,6 +21,7 @@ templates/
 bin/planpub            把一个页面目录发布到 curryPlan
 test/pool/e2e          机器池的端到端测试：本机上的假中枢、两台假机器，跑完写出 results.tsv
 curryplan.md           curryPlan 的页面约定、发布、注册项目、状态页
+site/                  curryPlan 站点本身：shell/（页面目录和公共文件）、server/（评论、提问、通知）、test/push/（通知的端到端测试）
 ```
 
 只用 Python 3 标准库、git、ssh；incus 机器上的 agent 容器靠 [agentbox](https://github.com/curryfromuestc/agentbox)

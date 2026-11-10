@@ -7,7 +7,7 @@
 - 域名还没备案，现在直接用 IP 访问（Let's Encrypt IP 证书，服务器上 lego-renew.timer 自动续期）；备案完成后改成正式域名。
 - `/api/*` 由 `~/curry-site/server.py`（127.0.0.1:8765）处理：评论、提问、可编辑正文。**不要改它**，也不要动
   站点根下的公共文件（`kit.css`、`ui.css`、`ui.js`、`kit.js`、`app.*`、`index.html`、`sw.js`）——它们的源在
-  box-a 的 `/home/user/code/curryPlan/shell/`。
+  本仓库（curryFlow）的 `site/shell/`，服务端在 `site/server/`，端到端测试在 `site/test/push/`。
 - 动手前先看两三个现有页面学样子：`/var/www/plan/curryplan/flow/`（方案页的好样板）、`currygpu/sm/`、`rtlsim/paper/`。
 
 ## 页面约定
