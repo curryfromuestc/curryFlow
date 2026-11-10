@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>curryPlan</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="theme-color" content="#2747B0">
+<link rel="stylesheet" href="/kit.css">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="apphead">
+    <h1>curryPlan</h1>
+    <input id="q" type="search" placeholder="搜索标题和结论" autocomplete="off">
+  </header>
+  <div class="bar">
+    <nav class="seg" id="seg">
+      <button type="button" data-k="" class="on">全部</button><button type="button" data-k="方案">方案</button><button type="button" data-k="笔记">笔记</button>
+    </nav>
+    <button type="button" class="bell" id="bell" data-s="wait" aria-expanded="false" aria-controls="push">通知：…</button>
+  </div>
+  <section class="push" id="push" hidden>
+    <p class="msg"></p>
+    <div class="acts"><button type="button" data-a="on" hidden>开启通知</button><button type="button" data-a="test" hidden>发一条测试</button><button type="button" data-a="off" hidden>关闭通知</button></div>
+  </section>
+  <main id="list"><p class="empty">加载中…</p></main>
+</div>
+<script src="/app.js"></script>
+<script src="/push.js"></script>
+</body>
+</html>

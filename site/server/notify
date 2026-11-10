@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""notify "标题" "正文" [url] [--tag 名字]: sends one notification to every device that turned notifications on in
+curryPlan.  For cron jobs and scripts on the server: it calls /api/notify of the service on 127.0.0.1:8765 with the
+key in notify.key next to this file.  Two notifications with the same tag replace each other on the device.
+
+Exit status: 0 at least one device's push service took it; 1 none did (the reasons are printed); 2 could not ask.
+"""
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+URL = "http://127.0.0.1:8765/api/notify"
+
+
+def main(argv):
+    tag = None
+    if "--tag" in argv:
+        i = argv.index("--tag")
+        if i + 1 >= len(argv):
+            return usage()
+        tag = argv[i + 1]
+        del argv[i:i + 2]
+    if not 1 <= len(argv) <= 3 or argv[0] in ("-h", "--help"):
+        return usage()
+    msg = {"title": argv[0], "body": argv[1] if len(argv) > 1 else ""}
+    if len(argv) > 2:
+        msg["url"] = argv[2]
+    if tag:
+        msg["tag"] = tag
+    try:
+        with open(os.path.join(HERE, "notify.key")) as f:
+            key = f.read().strip()
+    except OSError as e:
+        print("notify: 读不到密钥 notify.key（%s）" % e, file=sys.stderr)
+        return 2
+    req = urllib.request.Request(URL, data=json.dumps(msg).encode(), headers={"Content-Type": "application/json", "X-Notify-Key": key})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # always the local service, never a proxy
+    try:
+        # the service gives up on the push services after 60 s (push.LIMIT) and answers; 90 s leaves room for that
+        with opener.open(req, timeout=90) as r:
+            res = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            res = json.loads(e.read().decode())
+        except ValueError:
+            res = {}
+        if "results" not in res:
+            print("notify: 服务拒绝了（%d）：%s" % (e.code, res.get("error", "")), file=sys.stderr)
+            return 2
+    except (OSError, ValueError) as e:
+        print("notify: 连不上本机的 curry-choices 服务（%s）" % e, file=sys.stderr)
+        return 2
+    for o in res["results"]:
+        if not o["ok"]:
+            print("notify: %s（%s）没发出去：%s" % (o["device"], o["id"], o["reason"]), file=sys.stderr)
+    if res.get("truncated"):
+        print("notify: 正文太长，截短了", file=sys.stderr)
+    if not res["results"]:
+        print("notify: 没有设备开启通知", file=sys.stderr)
+    print("发出 %d，失败 %d" % (res["sent"], res["failed"]))
+    return 0 if res["sent"] else 1
+
+
+def usage():
+    print('用法：notify "标题" ["正文" [url]] [--tag 名字]', file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
