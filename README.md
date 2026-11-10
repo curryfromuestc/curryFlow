@@ -15,13 +15,33 @@ templates/
   project/AGENTS.md    项目规则骨架；project/gitignore
   curryplan/plan/      方案页骨架；curryplan/status/ 读中枢数据的状态页
   curryplan/page/      通用页面骨架；curryplan/machines/ 机器页
-  pool/beat            每台机器每分钟一份心跳；pool/status 把心跳汇成机器页的 status.json
+  pool/beat            每台机器每分钟一份心跳；pool/status 把心跳、队列和结论汇成机器页的 status.json
+  pool/executor        机器级 executor：每台机器一个，管这台机器的槽位，服务所有项目
+  pool/flow            拿槽位的命令：flow run（提交作业并等结论）、flow hold（占用槽位）、ls、cancel、release
 bin/planpub            把一个页面目录发布到 curryPlan
 curryplan.md           curryPlan 的页面约定、发布、注册项目、状态页
 ```
 
 只用 Python 3 标准库、git、ssh；incus 机器上的 agent 容器靠 [agentbox](https://github.com/curryfromuestc/agentbox)
 的 `agentctl`，herdr 让人能 attach 到 executor 和容器里的 agent。
+
+## 机器池：两条命令
+
+几个项目共用同一批机器；每台机器的 `~/curryflow/machines`（中枢 `machines.git` 的 clone）里有 `flow`：
+
+```sh
+# 提交一个作业并等结论（退出码 = 作业的退出码；124 超时、143 取消、99 没跑起来、255 丢了）
+~/curryflow/machines/flow run --project curryGPU --here -- ci/accept --stage func
+~/curryflow/machines/flow run --project curryGPU --commit main --machine box-b --tag synth --timeout 28800 -- ci/accept --stage synth
+# 占用一个槽位若干小时（最长 8 小时，到期自动放），打印机器、槽位、核、容器、目录
+~/curryflow/machines/flow hold --hours 2 --machine box-b
+~/curryflow/machines/flow release <id>
+# 排队、在跑、最近完成；取消
+~/curryflow/machines/flow ls
+~/curryflow/machines/flow cancel <id>
+```
+
+作业落在哪个槽位、谁提的、跑了多久、排队情况都在 curryPlan 的"机器"页上。规则、布局和装法见 SKILL.md 的"机器池"一节。
 
 ## 安装
 

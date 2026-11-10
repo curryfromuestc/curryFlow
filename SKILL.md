@@ -4,9 +4,10 @@ description: >-
   多机开发流程的唯一入口。给一个项目引导出流程：探测机器、和人定验收阶段与判据、定存储规矩，从模板生成项目自己的
   ci/（accept、machines、coord、executor）、AGENTS.md 和 .gitignore，建中枢 git 仓库和镜像，在每台机器装
   executor；写清协调器的通用规矩（任务生命周期、只看 diff 的独立审查、一次汇报、按任务挑模型、卡住就停）；
-  管机器池（机器清单、每分钟心跳、curryPlan 上的"机器"页）；往 curryPlan 发页面（方案页、论文页、学习页、笔记、
-  状态页，约定在 curryplan.md）。触发于："用 curryFlow 引导 X"、"给项目搭多机流程"、"起协调器"、"加一台机器"、
-  "看机器负载 / 槽位"、"发到 curryPlan"、"写个方案页 / 学习页 / 论文页"、"给项目开个 curryPlan"、"更新状态页"。
+  管机器池（机器清单、每分钟心跳、每台机器一个服务所有项目的 executor、拿槽位的 flow run / flow hold、curryPlan 上的
+  "机器"页）；往 curryPlan 发页面（方案页、论文页、学习页、笔记、状态页，约定在 curryplan.md）。触发于："用 curryFlow
+  引导 X"、"给项目搭多机流程"、"起协调器"、"加一台机器"、"看机器负载 / 槽位"、"在机器池上跑个作业 / 占个槽位"、
+  "发到 curryPlan"、"写个方案页 / 学习页 / 论文页"、"给项目开个 curryPlan"、"更新状态页"。
 ---
 
 # curryFlow
@@ -141,18 +142,59 @@ curryPlan             人看的状态页（每分钟读中枢）和方案页；�
 
 ## 机器池
 
-槽位归机器，不归项目：几个项目共用同一批机器，机器清单只有一份。中枢上的 `machines.git` 放它：
+槽位归机器，不归项目：几个项目共用同一批机器，机器清单只有一份，每台机器一个 executor 管它的槽位。重活（仿真、综合、
+验收阶段）不自己 `taskset`、不自己 ssh 进容器跑，向机器池要槽位。两条命令，在任何一台机器的 `~/curryflow/machines` 里：
 
-- `machines.json`：每台机器的槽位（钉的核、内存、容器名）和要报告的挂载点；`beat`、`status` 从 `templates/pool/` 拷来。
-- 每台机器 clone 到 `~/curryflow/machines`，cron 每分钟跑 `python3 beat --machine <名>`，把本机状态推成
-  `refs/hb/<名>`（一个 JSON blob）：各 NUMA 节点和各槽位的忙线程、内存、磁盘、显卡、incus 容器、谁在占 CPU。
-  国内机器在 `machines.json` 里写 `hub_proxy`。
-- curryPlan 机 clone 到 `~/curryflow/machines-status`，cron 每分钟取全部心跳，`python3 status --history hist.json`
-  写出 `/var/www/plan/curryplan/machines/status.json`；页面是 `templates/curryplan/machines/index.html`。
-- 改槽位：改 `machines.json` 推到 `machines.git`，各机器十分钟内自己拉到。加机器：加一项，在那台机器上 clone、装 cron。
+```sh
+# 提交一个作业并等结论：打印日志最后 40 行、结论和完整日志的位置，退出码就是作业的退出码
+~/curryflow/machines/flow run --project curryGPU --here -- ci/accept --stage func
+# 占用一个槽位若干小时（最长 8）：打印机器、槽位、核、容器、目录；用完 flow release <id>，到期自动放
+~/curryflow/machines/flow hold --hours 2 --machine box-b
+```
+
+- `flow run --project <名> [--commit <提交或中枢分支> | --here] [--threads N] [--mem G] [--gpu] [--machine M] [--slot S]
+  [--prio gate|normal|night] [--timeout 秒] [--tag synth] [--no-wait] -- <命令>`。不给 `--commit`、`--here` 就用中枢 main；
+  `--here` 用当前仓库的 HEAD，中枢上没有分支指着它时推到一个临时 ref（不建分支，executor 取到后删）。命令只有一个词时
+  用 `bash -c` 跑（`-- "make -j && ctest"`）。默认超时 4 小时。退出码：作业自己的；124 超时，143 被取消，99 executor
+  没能把它跑起来（取不到提交等），255 丢了。`--no-wait` 只打印 id，之后 `flow wait <id>`。
+- `flow ls`：排队、在跑、最近完成。`flow cancel <id>`：没开始的撤掉，在跑的结束它的全部进程。
+- 作业的环境：工作目录是这个槽位里该项目的常驻工作树，checkout 到指定提交；`.gitignore` 里的东西（`.build`）留着做
+  增量构建，别的未跟踪文件清掉。环境变量有 `CF_DEPS_CACHE`、`PYTHONDONTWRITEBYTECODE=1`、`TMPDIR=<工作树>/.build/tmp`、
+  `CF_SLOT`、`CF_CPUS`、`CF_THREADS`（并行度用它）、`CF_JOB`。没有容器的机器上是 `taskset` 钉核加带内存上限的 systemd
+  用户 scope；有容器的机器上在槽位的容器里以宿主机用户的 uid/gid 跑，写出的文件属主是宿主机用户，不是 root。
+- 排队规则：先按优先级（gate > normal > night），同优先级里提交人轮转，再按提交时间；一个作业占一个槽位；`--tag synth`
+  的作业一台机器同时只跑一个。槽位可排 = 没有 executor 自己的作业或占用，并且实测忙线程不到 20%；共享机上别人直接用过
+  的槽位要安静 5 分钟才算空闲。**要在槽位的核上手工跑东西，先 `flow hold`**：不占用的话 executor 只能靠负载猜。
+- 谁提的：`$CF_WHO`，没设就是 `用户@主机:分支`。
+
+中枢上的 `machines.git` 放机器池的全部东西，每台机器 clone 到 `~/curryflow/machines`：
+
+- `machines.json`：每台机器的槽位（钉的核、内存、容器名、有没有 NV 显卡 `gpu`）、要报告的挂载点、`executor: true`、依赖缓存
+  `deps_cache`、给作业加的环境变量 `env`；国内机器写 `hub_proxy`（和 `host`）。`projects` 是项目名到中枢地址的表：`seed` 是
+  每台机器上已有的 clone（镜像从它建），`seed_only` 表示不许从中枢全量取（中枢小，大仓库都要写）。
+- `beat`、`status`、`executor`、`flow` 从 `templates/pool/` 拷来。
+- 状态全是 ref（JSON blob，格式见 `executor` 开头）：`refs/hb/<机器>` 心跳；`refs/q/<id>` 请求；`refs/run/<id>` 认领，用
+  "该 ref 必须不存在"的 push 建，两个 executor 抢同一个请求只有一个成功；`refs/done/<id>` 结论（退出码、最后一行、用时、
+  日志最后 40 行、完整日志在哪台机器的哪个路径），7 天后清；`refs/cancel/<id>` 取消在跑的。不碰项目仓库的 ref。
+- 每台机器两行 cron（装的时候保留已有的行；远端用脚本整段重写，不在 `set -e` 下 `crontab -l | grep -v`）：
+  ```
+  * * * * * cd ~/curryflow/machines && flock -n .git/beat.lock timeout 55 python3 beat --machine <名> >/dev/null 2>&1  # curryFlow 机器心跳
+  * * * * * cd ~/curryflow/machines && flock -n .git/executor.lock python3 executor run --machine <名> >/dev/null 2>&1  # curryFlow executor
+  ```
+  beat 每分钟把本机状态推成心跳：各 NUMA 节点和各槽位的忙线程、内存、磁盘、显卡、incus 容器、谁在占 CPU、每个槽位里的
+  作业或占用；每 10 分钟自己 `git pull`。executor 每 15 秒经一条复用的 ssh 连接看一次队列（取项目的提交另开连接）；文件
+  变了且手上没有作业时自己换成新版本；被结束了一分钟内由 cron 拉起，接着等在跑的作业，不重跑。
+- 机器上的布局：`~/curryflow/mirror/<项目>.git` 每个项目一份 bare 镜像，只对中枢增量取；槽位目录是 `~/<容器名>`（有容器，
+  容器里同路径）或 `~/curryflow/slots/<槽位>`，里面 `<项目>/` 是工作树，`.cf/<id>/` 是作业目录（`log` 是完整日志）；
+  executor 自己的日志和状态在 `~/curryflow/exec/<机器>/`。
+- curryPlan 机 clone 到 `~/curryflow/machines-status`，cron 每分钟取心跳、队列和结论，`python3 status --history hist.json`
+  写出 `/var/www/plan/curryplan/machines/status.json`；页面是 `templates/curryplan/machines/index.html`：槽位表的"作业"列、
+  "排队"和"最近完成"两张表。重发这个页面只 scp `index.html` 和 `meta.json`（`bin/planpub` 会清掉目录里的 `status.json`）。
+- 改槽位、加项目：改 `machines.json` 推到 `machines.git`，各机器十分钟内自己拉到。加机器：加一项，在那台机器上 clone、
+  装两行 cron。
 
 通用容器（incus 机器）：同一个镜像（基础系统加构建用的包），钉在一个槽位的核上，依赖缓存只读挂入，工作目录是宿主机
-`~/<容器名>` 同路径挂入；会变的工具（仿真器）走依赖缓存，不进镜像。
+`~/<容器名>` 同路径挂入（`shift=true`，容器里的 uid 和宿主机一一对应）；会变的工具（仿真器）走依赖缓存，不进镜像。
 
 ## curryPlan
 

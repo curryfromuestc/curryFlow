@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""The pool's status as JSON, from the heartbeats fetched into this clone (refs/hb/*).
+"""The pool's status as JSON, from the refs fetched into this clone: the heartbeats (refs/hb/*), the queue (refs/q/*),
+what runs (refs/run/*) and the conclusions (refs/done/*).
 
 usage: status [--history FILE]
 
-Run every minute on the curryPlan machine after `git fetch origin '+refs/hb/*:refs/hb/*'`. With --history, FILE keeps
-the last three hours of each machine's busy threads and used memory, one point a minute, and the output carries it.
+Run every minute on the curryPlan machine after
+`git fetch --prune origin '+refs/hb/*:refs/hb/*' '+refs/q/*:refs/q/*' '+refs/run/*:refs/run/*' '+refs/done/*:refs/done/*'`.
+With --history, FILE keeps the last three hours of each machine's busy threads and used memory, one point a minute, and
+the output carries it. The output has the requests nobody took yet (queue), the jobs and holds in slots (running) and
+the latest 20 conclusions (done, without the log tails).
 """
 import argparse
 import json
@@ -14,6 +18,7 @@ import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 KEEP = 180
+DONE = 20
 
 
 def git(*args):
@@ -21,16 +26,29 @@ def git(*args):
     return r.stdout if r.returncode == 0 else ""
 
 
+def blobs(kind, last=None):
+    """{name: JSON} of the blobs behind refs/<kind>/* (only the last ones by name with last=N)."""
+    out = {}
+    for ref in git("for-each-ref", "--format=%(refname)", f"refs/{kind}/").split()[-(last or 0):]:
+        try:
+            out[ref.split("/", 2)[2]] = json.loads(git("cat-file", "blob", ref))
+        except ValueError:
+            pass
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--history")
     a = ap.parse_args()
     conf = json.load(open(os.path.join(ROOT, "machines.json")))
-    beats = {}
-    for ref in git("for-each-ref", "--format=%(refname)", "refs/hb/").split():
-        text = git("cat-file", "blob", ref)
-        if text:
-            beats[ref.rsplit("/", 1)[1]] = json.loads(text)
+    beats = blobs("hb")
+    running = blobs("run")
+    queue = sorted((r for rid, r in blobs("q").items() if rid not in running), key=lambda r: r["id"])
+    # Ids start with the time of the request, so the latest conclusions are among the last names.
+    done = sorted(blobs("done", last=4 * DONE).values(), key=lambda d: d.get("end") or 0, reverse=True)[:DONE]
+    for d in done:
+        d.pop("tail", None)
     hist = {}
     if a.history:
         if os.path.exists(a.history):
@@ -43,7 +61,8 @@ def main():
         tmp = a.history + ".tmp"
         json.dump(hist, open(tmp, "w"))
         os.replace(tmp, a.history)
-    out = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "hub": conf["hub"],
+    out = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "now": int(time.time()), "hub": conf["hub"],
+           "queue": queue, "running": sorted(running.values(), key=lambda r: r["id"]), "done": done,
            "machines": [{"name": name, "conf": c, "beat": beats.get(name), "history": hist.get(name, [])}
                         for name, c in conf["machines"].items()]}
     print(json.dumps(out, ensure_ascii=False))

@@ -5,7 +5,8 @@ usage: beat --machine NAME [--print]
 
 Run every minute by cron from a clone of the pool repository. machines.json names the machine's slots and the
 mounts to report; everything else is read from the machine: busy threads per NUMA node and per slot, memory,
-disks, GPUs, incus containers, who uses the CPUs.
+disks, GPUs, incus containers, who uses the CPUs, and from the machine's executor (its state.json): the job or
+hold in each slot and whether the executor would schedule the slot.
 """
 import argparse
 import collections
@@ -148,7 +149,17 @@ def user_name(uid):
         return "容器" if uid >= 100000 else str(uid)
 
 
+def executor_state(name):
+    """What the machine's executor last wrote (every few seconds while it runs); None when it is not running."""
+    try:
+        st = json.load(open(os.path.expanduser(f"~/curryflow/exec/{name}/state.json")))
+    except (OSError, ValueError):
+        return None
+    return st if time.time() - st.get("at", 0) < 120 else None
+
+
 def collect(name, conf):
+    ex = executor_state(name)
     busy = busy_per_cpu()
     procs = processes()
     total = lambda spec: round(sum(busy.get(c, 0) for c in cpu_list(spec)), 1)
@@ -172,7 +183,14 @@ def collect(name, conf):
                    "top": top(d["cpus"]), **{k: d[k] for k in ("mem", "container", "note") if k in d}}
                   for s, d in conf.get("slots", {}).items()],
         "users": [{"user": u, "threads": round(v, 1)} for u, v in users.most_common(6) if v >= 0.5],
+        "executor": ex and {k: ex.get(k) for k in ("at", "poll", "queued", "memcap")},
     }
+    for s in beat["slots"]:
+        e = ((ex or {}).get("slots") or {}).get(s["name"])
+        if e:
+            s["sched"] = e.get("state")
+            if e.get("job"):
+                s["job"] = e["job"]
     for c in beat["containers"] or []:
         if c.get("cpus") and c.get("state") == "Running":
             c["busy"] = total(c["cpus"])
@@ -211,7 +229,7 @@ def main():
     if minute % 10 == 0:
         git("pull", "-q", "--ff-only", proxy=proxy)
     if minute == 7:
-        git("gc", "-q", "--prune=now")
+        git("gc", "-q", "--prune=10.minutes.ago")      # not now: executor and flow push blobs they have just written
 
 
 if __name__ == "__main__":

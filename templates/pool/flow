@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""A slot of the machine pool in two commands: run a job and wait for its conclusion, or hold a slot for some hours.
+
+usage: flow run --project P [--commit REV | --here] [--threads N] [--mem G] [--gpu] [--machine M] [--slot S]
+                [--prio gate|normal|night] [--timeout SECONDS] [--tag synth] [--no-wait] -- COMMAND...
+       flow hold --hours N [--machine M] [--slot S] [--threads N] [--mem G] [--gpu] [--no-wait]
+       flow release ID | flow cancel ID [--no-wait]
+       flow ls [--all] [--json]
+       flow wait ID
+
+run    queues COMMAND for the project at a commit: REV is a commit or a branch of the project's hub (default main);
+       --here takes the current repository's HEAD and, when no branch of the hub ends there, pushes it to a temporary
+       ref of the hub (no branch is created; the executor deletes the ref once it has the commit). A COMMAND of one
+       word is run by bash -c, so "make -j && ctest" works. flow waits for the conclusion, prints the last 40 lines of
+       the log and exits with the job's exit code (124 timeout, 143 cancelled, 99 the executor could not start it,
+       255 lost); with --no-wait it prints the id and returns.
+hold   takes a slot out of scheduling for N hours (at most 8) and prints machine, slot, CPUs, container and
+       directory; the slot comes back at release or when the hours are over.
+ls     the queue, what runs, the latest conclusions.
+
+It runs from a clone of the pool repository (machines.git, on every machine in ~/curryflow/machines): requests are
+JSON blobs behind refs/q/<id> there, the executors answer with refs/run/<id> and refs/done/<id> (see executor).
+Who asks is $CF_WHO, else user@host:branch.
+"""
+import argparse
+import getpass
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+import unicodedata
+
+ROOT = os.path.dirname(os.path.realpath(__file__))
+SHA = re.compile(r"[0-9a-f]{40}")
+HOLD_MAX_HOURS = 8
+VERDICT = {"exit": "结束", "timeout": "超时", "cancelled": "已取消", "error": "没跑起来", "lost": "丢了",
+           "expired": "占用到期", "released": "占用已放"}
+
+
+class GitError(Exception):
+    pass
+
+
+def die(text):
+    raise SystemExit(f"flow: {text}")
+
+
+def note(text):
+    print(f"[flow] {text}", file=sys.stderr, flush=True)
+
+
+def git(*args, cwd=ROOT, input=None, timeout=90, bulk=False):
+    # The pool's refs go over the machine's one persistent connection to the hub (shared with beat and the executor);
+    # a push of commits (bulk) takes its own connection, so it does not hold up the others on a slow link.
+    ssh = "ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+    ssh += (" -o ControlMaster=no -o ControlPath=none" if bulk else
+            " -o ControlMaster=auto -o ControlPersist=10m -o ControlPath=~/.ssh/cf-%C")
+    if PROXY:
+        ssh += f" -o 'ProxyCommand=nc -X connect -x {PROXY} %h %p'"
+    env = {**os.environ, "GIT_SSH_COMMAND": ssh, "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        r = subprocess.run(["git", *args], cwd=cwd, input=input, capture_output=True, text=True, env=env, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise GitError(f"git {' '.join(args[:2])}：{timeout} 秒没有回音")
+    if r.returncode:
+        raise GitError(f"git {' '.join(args)}：{r.stderr.strip()[-400:]}")
+    return r.stdout
+
+
+def patient(fn, *args, tries=4):
+    """A call to the hub, again after a network error."""
+    for i in range(tries):
+        try:
+            return fn(*args)
+        except GitError as e:
+            if i == tries - 1:
+                die(str(e))
+            time.sleep(3)
+
+
+def cpu_count(spec):
+    n = 0
+    for part in str(spec).replace(" ", "").split(","):
+        if part:
+            a, _, b = part.partition("-")
+            n += int(b or a) - int(a) + 1
+    return n
+
+
+def mem_gb(text):
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([KMGT]?)(?:i?B)?\s*", str(text), re.I)
+    return float(m.group(1)) * 1024 ** (" KMGT".index(m.group(2).upper() or " ") - 3) if m else 0
+
+
+def who():
+    if os.environ.get("CF_WHO"):
+        return os.environ["CF_WHO"]
+    name = f"{getpass.getuser()}@{os.uname().nodename}"
+    try:
+        branch = git("rev-parse", "--abbrev-ref", "HEAD", cwd=os.getcwd()).strip()
+    except GitError:
+        branch = ""
+    return f"{name}:{branch}" if branch and branch != "HEAD" else name
+
+
+def new_id():
+    return time.strftime("%y%m%d-%H%M%S", time.gmtime()) + "-" + os.urandom(2).hex()[:3]
+
+
+def blob(obj):
+    return git("hash-object", "-w", "--stdin", input=json.dumps(obj, ensure_ascii=False)).strip()
+
+
+def state(rid):
+    """{kind: sha} of the refs a request has now."""
+    out = {}
+    for line in git("ls-remote", "origin", *[f"refs/{k}/{rid}" for k in ("q", "run", "done", "cancel")]).splitlines():
+        sha, ref = line.split("\t")
+        out[ref.split("/")[1]] = sha
+    return out
+
+
+def read(kind, rid):
+    local = f"refs/flow/tmp/{os.getpid()}"
+    git("fetch", "-q", "--no-tags", "--no-write-fetch-head", "origin", f"+refs/{kind}/{rid}:{local}")
+    text = git("cat-file", "blob", local)
+    git("update-ref", "-d", local)
+    return json.loads(text)
+
+
+def need_of(a):
+    need = {}
+    for key, value in (("threads", a.threads), ("mem_gb", a.mem), ("gpu", a.gpu), ("machine", a.machine),
+                       ("slot", a.slot), ("tags", getattr(a, "tag", None))):
+        if value:
+            need[key] = value
+    machines = CONF["machines"]
+    if a.machine and a.machine not in machines:
+        die(f"machines.json 里没有机器 {a.machine}（有 {'、'.join(machines)}）")
+    if a.machine and not machines[a.machine].get("executor"):
+        die(f"{a.machine} 上没有 executor")
+    fit = [f"{m}/{s}" for m, c in machines.items() if c.get("executor") and a.machine in (None, m)
+           for s, d in c.get("slots", {}).items()
+           if a.slot in (None, s) and (a.threads or 0) <= cpu_count(d["cpus"]) and (a.mem or 0) <= mem_gb(d.get("mem", ""))
+           and (not a.gpu or d.get("gpu"))]
+    if not fit:
+        die(f"没有哪个槽位满足这些需求：{json.dumps(need, ensure_ascii=False)}")
+    return need
+
+
+def submit(req):
+    err = None
+    for _ in range(5):
+        try:
+            git("push", "-q", f"--force-with-lease=refs/q/{req['id']}:", "origin", f"{blob(req)}:refs/q/{req['id']}")
+            return req["id"]
+        except GitError as e:
+            err = e
+            if "stale info" in str(e):          # the id is taken
+                req["id"] = new_id()
+            else:
+                time.sleep(3)
+    die(f"请求没推上去：{err}")
+
+
+def commit_of(a, hub, rid):
+    """(commit, a ref of the hub that leads to it or None, whether that ref is a temporary one)."""
+    refs = {}
+    for line in patient(git, "ls-remote", hub).splitlines():
+        sha, ref = line.split("\t")
+        refs[ref] = sha
+    here = os.getcwd()
+
+    def local(rev):
+        try:
+            return git("rev-parse", "--verify", "-q", rev + "^{commit}", cwd=here).strip()
+        except GitError:
+            return None
+
+    if a.here:
+        sha = local("HEAD") or die("--here：当前目录不在 git 仓库里")
+        try:
+            if git("--no-optional-locks", "status", "--porcelain", "--untracked-files=no", cwd=here).strip():
+                note("工作区有没提交的改动，作业跑的是 HEAD，不带这些改动")
+        except GitError:
+            pass
+    else:
+        rev = a.commit or "main"
+        if SHA.fullmatch(rev):
+            sha = rev
+        else:
+            for name in (rev, f"refs/heads/{rev}", f"refs/tags/{rev}"):
+                if name in refs:
+                    return refs[name], name, False
+            sha = local(rev) or die(f"中枢 {hub} 上没有 {rev}，当前目录的仓库也解析不了它")
+    tips = sorted(r for r, s in refs.items() if s == sha and r.startswith("refs/heads/"))
+    if tips:
+        return sha, tips[0], False
+    if local(sha) != sha:
+        return sha, None, False               # the executor looks for it in the hub's branches
+    tmp = f"refs/cf/tmp/{rid}"
+    patient(lambda: git("push", "-q", hub, f"{sha}:{tmp}", cwd=here, timeout=600, bulk=True))
+    return sha, tmp, True
+
+
+def show(d):
+    for line in d.get("tail") or []:
+        print(line)
+    where = f"，{d['machine']}/{d['slot']}" if d.get("machine") else ""
+    print(f"[flow] {d['id']} {VERDICT.get(d.get('reason'), d.get('reason'))}：退出码 {d.get('code')}，{d.get('secs', 0)} 秒{where}"
+          + (f"；{d['note']}" if d.get("note") else "") + (f"；最后一行：{d['last']}" if d.get("last") else ""))
+    if d.get("log"):
+        print(f"[flow] 完整日志 {d['log']['machine']}:{d['log']['path']}")
+    sys.stdout.flush()
+
+
+def wait(rid, until="done", limit=None):
+    """Follow a request to its conclusion (or, until="run", to the moment an executor takes it)."""
+    t0, seen, missing = time.time(), None, 0
+    try:
+        while True:
+            try:
+                st = state(rid)
+                if "done" in st:
+                    return read("done", rid)
+                if "run" in st and seen != "run":
+                    seen, r = "run", read("run", rid)
+                    if until == "run":
+                        return r
+                    note(f"{rid} 在 {r['machine']}/{r['slot']} 上开始")
+                elif "q" in st and seen is None:
+                    seen = "q"
+                    note(f"{rid} 排队中")
+                elif not st:
+                    missing += 1
+                    if missing >= 3:
+                        die(f"{rid}：中枢上没有这个请求（已取消，或结论已过期）")
+            except GitError as e:
+                note(f"中枢暂时读不到，接着等（{e}）")
+            if limit and time.time() - t0 > limit:
+                return None
+            age = time.time() - t0
+            time.sleep(4 if age < 60 else 8 if age < 900 else 15)
+    except KeyboardInterrupt:
+        note(f"不等了；作业不受影响：flow wait {rid} 接着等，flow cancel {rid} 取消")
+        sys.exit(130)
+
+
+def code_of(d):
+    c = d.get("code")
+    return c if isinstance(c, int) and 0 <= c <= 255 else 1
+
+
+def cmd_run(a):
+    if not a.command:
+        die("-- 后面要有命令")
+    if a.project not in CONF.get("projects", {}):
+        die(f"machines.json 里没有项目 {a.project}（有 {'、'.join(CONF.get('projects', {}))}）")
+    need, rid = need_of(a), new_id()
+    sha, ref, tmp = commit_of(a, CONF["projects"][a.project]["hub"], rid)
+    req = {"id": rid, "kind": "job", "submitted": round(time.time(), 3), "who": who(), "project": a.project, "commit": sha,
+           "argv": a.command, "cmd": a.command[0] if len(a.command) == 1 else shlex.join(a.command), "need": need,
+           "prio": a.prio, "timeout": a.timeout}
+    if ref:
+        req["ref"] = ref
+        req["tmp"] = tmp
+    rid = submit(req)
+    if a.no_wait:
+        print(rid)
+        return 0
+    note(f"{rid} {a.project}@{sha[:12]} {req['cmd']}")
+    d = wait(rid)
+    show(d)
+    return code_of(d)
+
+
+def cmd_hold(a):
+    if not 0 < a.hours <= HOLD_MAX_HOURS:
+        die(f"--hours 要在 0 到 {HOLD_MAX_HOURS} 之间")
+    req = {"id": new_id(), "kind": "hold", "submitted": round(time.time(), 3), "who": who(), "hours": a.hours,
+           "need": need_of(a), "prio": a.prio, "cmd": f"占用 {a.hours:g} 小时"}
+    rid = submit(req)
+    if a.no_wait:
+        print(rid)
+        return 0
+    r = wait(rid, until="run")
+    if r.get("reason"):                    # ended before any executor gave it a slot
+        show(r)
+        return 1
+    print(f"占用 {rid}\n  机器 {r['machine']}\n  槽位 {r['slot']}\n  核   {r['cpus']}\n  容器 {r.get('container') or '-'}\n"
+          f"  目录 {r['dir']}\n  到期 {time.strftime('%Y-%m-%d %H:%M', time.localtime(r['until']))}"
+          f"（到期自动放；提前放：flow release {rid}）")
+    return 0
+
+
+def cmd_cancel(a):
+    rid = a.id
+    st = patient(state, rid)
+    if "q" not in st and "run" not in st:
+        die(f"{rid}：" + ("已经结束了" if "done" in st else "没有这个请求"))
+    if "run" not in st:
+        req = patient(read, "q", rid)
+        try:
+            git("push", "-q", f"--force-with-lease=refs/q/{rid}:{st['q']}", "origin", f":refs/q/{rid}")
+        except GitError:
+            pass
+        if req.get("tmp") and req.get("ref") and req.get("project") in CONF.get("projects", {}):
+            try:
+                git("push", "-q", CONF["projects"][req["project"]]["hub"], ":" + req["ref"])
+            except GitError:
+                pass
+        st = patient(state, rid)
+        if "run" not in st and "done" not in st:
+            t = int(time.time())
+            d = {k: req.get(k) for k in ("id", "kind", "who", "project", "commit", "cmd", "prio", "submitted")}
+            d.update(machine=None, slot=None, start=None, end=t, secs=0, code=143, reason="cancelled", note="排队时取消",
+                     last="", tail=[], log=None)
+            patient(lambda: git("push", "-q", "origin", f"+{blob(d)}:refs/done/{rid}"))
+            show(d)
+            return 0
+    if "run" in st and "cancel" not in st:
+        try:
+            git("push", "-q", f"--force-with-lease=refs/cancel/{rid}:", "origin",
+                f"{blob({'id': rid, 'who': who(), 'at': int(time.time())})}:refs/cancel/{rid}")
+        except GitError as e:
+            if "stale info" not in str(e):
+                die(str(e))
+    if a.no_wait:
+        note(f"{rid}：已请求取消")
+        return 0
+    d = wait(rid, limit=180)
+    if d is None:
+        die(f"{rid}：请求了取消，180 秒内没等到结论（flow ls 看 executor 的心跳）")
+    show(d)
+    return 0
+
+
+def snapshot():
+    """Every request, run and conclusion of the hub: {kind: [blob, ...]}."""
+    patient(lambda: git("fetch", "-q", "--no-tags", "--no-write-fetch-head", "--prune", "origin",
+                        "+refs/q/*:refs/flow/q/*", "+refs/run/*:refs/flow/run/*", "+refs/done/*:refs/flow/done/*"))
+    refs = [line.split() for line in git("for-each-ref", "--format=%(objectname) %(refname)", "refs/flow/q", "refs/flow/run",
+                                         "refs/flow/done").splitlines()]
+    p = subprocess.run(["git", "cat-file", "--batch"], cwd=ROOT, input="".join(s + "\n" for s, _ in refs).encode(),
+                       capture_output=True)
+    out, data, pos = {"q": [], "run": [], "done": []}, p.stdout, 0
+    for sha, ref in refs:
+        end = data.index(b"\n", pos)
+        head = data[pos:end].split()
+        pos = end + 1
+        if len(head) != 3:
+            continue
+        size = int(head[2])
+        try:
+            out[ref.split("/")[2]].append(json.loads(data[pos:pos + size]))
+        except ValueError:
+            pass
+        pos += size + 1
+    return out
+
+
+def width(text):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+
+
+def table(title, cols, rows):
+    print(f"{title}（{len(rows)}）")
+    if not rows:
+        return
+    rows = [[str(c) for c in r] for r in [cols] + rows]
+    w = [max(width(r[i]) for r in rows) for i in range(len(cols))]
+    for r in rows:
+        print("  " + "  ".join(c + " " * (w[i] - width(c)) for i, c in enumerate(r)).rstrip())
+
+
+def span(seconds):
+    s = max(0, int(seconds))
+    return f"{s} 秒" if s < 120 else f"{s // 60} 分" if s < 7200 else f"{s / 3600:.1f} 小时"
+
+
+def cut(text, n):
+    text = str(text or "")
+    return text if len(text) <= n else text[:n - 1] + "…"
+
+
+def cmd_ls(a):
+    s = snapshot()
+    taken = {r["id"] for r in s["run"]}
+    queue = sorted((r for r in s["q"] if r["id"] not in taken), key=lambda r: r["id"])
+    running = sorted(s["run"], key=lambda r: r["id"])
+    done = sorted(s["done"], key=lambda d: d.get("end") or 0, reverse=True)
+    if not a.all:
+        done = done[:10]
+    if a.json:
+        print(json.dumps({"queue": queue, "running": running, "done": done}, ensure_ascii=False, indent=1))
+        return 0
+    t = time.time()
+    needs = lambda n: " ".join(f"{k}={','.join(v) if isinstance(v, list) else v}" for k, v in n.items()) or "-"
+    table("排队", ["id", "优先级", "谁", "项目", "命令", "等了", "需求"],
+          [[r["id"], r["prio"], r["who"], r.get("project") or "-", cut(r.get("cmd"), 48), span(t - r["submitted"]),
+            needs(r.get("need", {}))] for r in queue])
+    table("在跑", ["id", "机器/槽位", "谁", "项目", "命令", "已跑", "executor 心跳"],
+          [[r["id"], f"{r['machine']}/{r['slot']}", r["who"], r.get("project") or "-", cut(r.get("cmd"), 48),
+            span(t - r["start"]), span(t - r["hb"]) + "前" + ("（停了？）" if t - r["hb"] > 200 else "")] for r in running])
+    table("最近完成", ["id", "结论", "退出码", "用时", "机器/槽位", "谁", "项目", "命令", "最后一行"],
+          [[d["id"], VERDICT.get(d.get("reason"), d.get("reason")), d.get("code"), span(d.get("secs", 0)),
+            f"{d['machine']}/{d['slot']}" if d.get("machine") else "-", d["who"], d.get("project") or "-",
+            cut(d.get("cmd"), 40), cut(d.get("last"), 60)] for d in done])
+    return 0
+
+
+def cmd_wait(a):
+    d = wait(a.id)
+    show(d)
+    return code_of(d)
+
+
+def main():
+    argv = sys.argv[1:]
+    command = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, command = argv[:i], argv[i + 1:]
+    ap = argparse.ArgumentParser(prog="flow", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def needs(p):
+        p.add_argument("--threads", type=int, help="至少这么多线程的槽位")
+        p.add_argument("--mem", type=float, help="至少这么多 GiB 内存的槽位")
+        p.add_argument("--gpu", action="store_true", help="要 NV 显卡")
+        p.add_argument("--machine")
+        p.add_argument("--slot")
+        p.add_argument("--prio", choices=["gate", "normal", "night"], default="normal")
+        p.add_argument("--no-wait", action="store_true")
+
+    r = sub.add_parser("run")
+    r.add_argument("--project", required=True)
+    g = r.add_mutually_exclusive_group()
+    g.add_argument("--commit")
+    g.add_argument("--here", action="store_true")
+    r.add_argument("--timeout", type=int, default=14400, help="秒，默认 4 小时")
+    r.add_argument("--tag", action="append", choices=["synth"], help="synth：同一台机器同时只跑一个")
+    needs(r)
+    h = sub.add_parser("hold")
+    h.add_argument("--hours", type=float, required=True)
+    needs(h)
+    for name in ("release", "cancel"):
+        c = sub.add_parser(name)
+        c.add_argument("id")
+        c.add_argument("--no-wait", action="store_true")
+    ls = sub.add_parser("ls")
+    ls.add_argument("--all", action="store_true")
+    ls.add_argument("--json", action="store_true")
+    sub.add_parser("wait").add_argument("id")
+    a = ap.parse_args(argv)
+    a.command = command
+    return {"run": cmd_run, "hold": cmd_hold, "release": cmd_cancel, "cancel": cmd_cancel, "ls": cmd_ls,
+            "wait": cmd_wait}[a.cmd](a)
+
+
+try:
+    CONF = json.load(open(os.path.join(ROOT, "machines.json")))
+except (OSError, ValueError) as e:
+    raise SystemExit(f"flow: 读不了 {ROOT}/machines.json（flow 要放在 machines.git 的 clone 里）：{e}")
+# A machine that reaches the hub through a proxy says so in machines.json (hub_proxy, with its host name).
+PROXY = os.environ.get("CF_HUB_PROXY") or next((c.get("hub_proxy") for c in CONF["machines"].values()
+                                                if c.get("host") == os.uname().nodename), None)
+
+if __name__ == "__main__":
+    sys.exit(main())
