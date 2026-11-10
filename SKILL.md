@@ -78,7 +78,7 @@ curryPlan             人看的状态页（每分钟读中枢）和方案页；�
 
 ```json
 {"project": "toy", "hubs": ["ci@<主中枢>:toy.git", "ci@<备用中枢>:toy.git"],
- "curryPlan": {"host": "user@<curryPlan 机>", "page": "/var/www/plan/toy/status", "clone": "~/curryflow/toy-status"},
+ "curryPlan": {"host": "<用户>@<curryPlan 机>", "page": "/var/www/plan/toy/status", "clone": "~/curryflow/toy-status"},
  "machines": {
   "box-c": {"ssh": "box-c", "dir": "~/curryflow/toy", "backend": "incus", "shared": false, "hub_proxy": "127.0.0.1:7890",
             "incus": {"image": "agentbox-base", "pool": "agentbox"},

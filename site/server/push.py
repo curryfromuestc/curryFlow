@@ -18,6 +18,8 @@ Files, all under ~/curry-site/:
                   fcm.googleapis.com:443, like ssh's ProxyCommand (TLS still ends at Google).  This server
                   cannot reach Google directly.
   push.log        one line per send, without endpoints
+  site.env        SITE=https://<host>[:port], the site's own origin: the VAPID "sub" and the only origin a
+                  notification may open.  Required to send; it is not in the repository.
 """
 import base64
 import hashlib
@@ -47,7 +49,6 @@ from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 DATA_DIR = os.path.expanduser("~/curry-site")
-SITE = "https://plan.example:8443"   # the VAPID "sub": the site itself, never a person's address
 SUBS = os.path.join(DATA_DIR, "push-subs.json")
 LOG = os.path.join(DATA_DIR, "push.log")
 CST = timezone(timedelta(hours=8))
@@ -205,11 +206,27 @@ def origin(url):
     return "https://" + u.hostname + (":%d" % u.port if u.port not in (None, 443) else "")
 
 
-def vapid_header(endpoint, key=None, now=None):
+def site():
+    """The site's own origin from SITE= in site.env (the VAPID "sub": the site itself, never a person's address)."""
+    try:
+        with open(os.path.join(DATA_DIR, "site.env"), encoding="utf-8") as f:
+            for line in f:
+                if line.strip().startswith("SITE="):
+                    value = line.strip().split("=", 1)[1].rstrip("/")
+                    u = urlsplit(value)
+                    if u.scheme == "https" and u.hostname and not u.path and "%s://%s" % (u.scheme, u.netloc.lower()) == value:
+                        return value
+                    raise RuntimeError("site.env 的 SITE=%r 不是 https://<主机>[:端口]" % value)
+    except FileNotFoundError:
+        pass
+    raise RuntimeError("%s 里没有 SITE=https://<主机>[:端口]（本站地址，不入库）" % os.path.join(DATA_DIR, "site.env"))
+
+
+def vapid_header(endpoint, key=None, now=None, sub=None):
     key = key or vapid_key()
     part = lambda obj: b64u(json.dumps(obj, separators=(",", ":")).encode())
     signed = part({"typ": "JWT", "alg": "ES256"}) + "." + part(
-        {"aud": origin(endpoint), "exp": int(now or time.time()) + TOKEN_LIFE, "sub": SITE})
+        {"aud": origin(endpoint), "exp": int(now or time.time()) + TOKEN_LIFE, "sub": sub or site()})
     r, s = decode_dss_signature(key.sign(signed.encode(), ec.ECDSA(hashes.SHA256())))
     # JWS ES256 (RFC 7518 section 3.4): R and S as two 32-octet big-endian integers, not the DER the library returns
     return "vapid t=%s.%s, k=%s" % (signed, b64u(r.to_bytes(32, "big") + s.to_bytes(32, "big")), b64u(point(key.public_key())))
@@ -650,14 +667,14 @@ def deliver(subs, payload, what):
 
 
 def on_site(url):
-    """A path on this site, or an absolute URL whose origin is SITE.  No backslash (browsers read "/\\x" as "//x"), no
+    """A path on this site, or an absolute URL whose origin is site().  No backslash (browsers read "/\\x" as "//x"), no
     space or control character, no "//" at the start (a URL on another host)."""
     if not isinstance(url, str) or not 0 < len(url) <= 500 or "\\" in url or BAD_CHARS.search(url):
         return False
     if url.startswith("/"):
         return not url.startswith("//")
     u = urlsplit(url)
-    return u.scheme == "https" and not u.username and not u.password and "%s://%s" % (u.scheme, u.netloc.lower()) == SITE
+    return u.scheme == "https" and not u.username and not u.password and "%s://%s" % (u.scheme, u.netloc.lower()) == site()
 
 
 def message(title, body="", url=None, tag=None):
@@ -667,7 +684,7 @@ def message(title, body="", url=None, tag=None):
     if not isinstance(body, str):
         raise ValueError("body 要是字符串")
     if url is not None and not on_site(url):
-        raise ValueError("url 只能是本站的地址：/ 开头的路径，或 %s 开头，最长 500（点通知会打开它，外站地址不收）" % (SITE + "/"))
+        raise ValueError("url 只能是本站的地址：/ 开头的路径，或 %s 开头，最长 500（点通知会打开它，外站地址不收）" % (site() + "/"))
     if tag is not None and not (isinstance(tag, str) and 0 < len(tag) <= 64):
         raise ValueError("tag 要是 1 到 64 个字的字符串")
     msg = {"title": title.strip(), "body": body, "url": url or "/"}
@@ -778,6 +795,8 @@ def selftest():
       12 a payload over 3993 octets is not refused
     1-7 are settled by RFC 8291 appendix A (every intermediate value) and section 5 (the body); 8-10 by vapid_check,
     whose own reading of the format is checked on the token printed in RFC 8292 section 2.4; 11-12 by round trips."""
+    # the VAPID tokens of the selftest name an example site, not this one (site.env is the server's)
+    vh = lambda endpoint, key=None, now=None: vapid_header(endpoint, key, now, sub="https://plan.example")
     failed = []
 
     def check(name, ok, detail=""):
@@ -873,30 +892,30 @@ def selftest():
                           ("https://fcm.googleapis.com:443/fcm/send/a:b", "https://fcm.googleapis.com"),
                           ("https://updates.push.services.mozilla.com/wpush/v2/gAAAA?x=1", "https://updates.push.services.mozilla.com")):
         try:
-            claims = vapid_check(vapid_header(endpoint, key, now), endpoint, now)
-            check("VAPID for " + aud, claims == {"aud": aud, "exp": now + TOKEN_LIFE, "sub": SITE} and "@" not in json.dumps(claims),
+            claims = vapid_check(vh(endpoint, key, now), endpoint, now)
+            check("VAPID for " + aud, claims == {"aud": aud, "exp": now + TOKEN_LIFE, "sub": "https://plan.example"} and "@" not in json.dumps(claims),
                   "ES256, exp in %d h, sub %s" % (TOKEN_LIFE // 3600, claims["sub"]))
         except ValueError as e:
             check("VAPID for " + aud, False, str(e))
     try:
         for _ in range(600):   # enough signatures to meet R or S with a leading zero octet
-            vapid_check(vapid_header("https://web.push.apple.com/x", key, now), "https://web.push.apple.com/x", now)
+            vapid_check(vh("https://web.push.apple.com/x", key, now), "https://web.push.apple.com/x", now)
         check("600 more tokens verify (64-octet signatures every time)", True)
     except ValueError as e:
         check("600 more tokens verify (64-octet signatures every time)", False, str(e))
-    check("k is the signing key", unb64u(vapid_header("https://web.push.apple.com/x", key).rsplit("k=", 1)[1]) == point(key.public_key()))
+    check("k is the signing key", unb64u(vh("https://web.push.apple.com/x", key).rsplit("k=", 1)[1]) == point(key.public_key()))
     for name, header, endpoint, at in (
-            ("a token for another origin is caught", vapid_header("https://web.push.apple.com/x", key, now), "https://fcm.googleapis.com/x", now),
-            ("a token past its exp is caught", vapid_header("https://web.push.apple.com/x", key, now - TOKEN_LIFE - 1), "https://web.push.apple.com/x", now),
-            ("a token with exp over 24 h ahead is caught", vapid_header("https://web.push.apple.com/x", key, now + 13 * 3600), "https://web.push.apple.com/x", now)):
+            ("a token for another origin is caught", vh("https://web.push.apple.com/x", key, now), "https://fcm.googleapis.com/x", now),
+            ("a token past its exp is caught", vh("https://web.push.apple.com/x", key, now - TOKEN_LIFE - 1), "https://web.push.apple.com/x", now),
+            ("a token with exp over 24 h ahead is caught", vh("https://web.push.apple.com/x", key, now + 13 * 3600), "https://web.push.apple.com/x", now)):
         try:
             vapid_check(header, endpoint, at)
             check(name, False)
         except ValueError:
             check(name, True)
-    other = vapid_header("https://web.push.apple.com/x", ec.generate_private_key(ec.SECP256R1()), now)
+    other = vh("https://web.push.apple.com/x", ec.generate_private_key(ec.SECP256R1()), now)
     try:
-        vapid_check(vapid_header("https://web.push.apple.com/x", key, now).rsplit("k=", 1)[0] + "k=" + other.rsplit("k=", 1)[1], "https://web.push.apple.com/x", now)
+        vapid_check(vh("https://web.push.apple.com/x", key, now).rsplit("k=", 1)[0] + "k=" + other.rsplit("k=", 1)[1], "https://web.push.apple.com/x", now)
         check("a token under somebody else's k is caught", False)
     except ValueError:
         check("a token under somebody else's k is caught", True)

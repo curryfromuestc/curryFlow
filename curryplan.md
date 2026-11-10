@@ -3,7 +3,9 @@
 人看的那一面：一个手机上也好用的页面目录（PWA），按项目分组，最新的在上。每个页面上能选中实体评论（文字或
 手绘）和提问（AI 讲解）。讨论和拍板在会话里，页面只放结果。
 
-- 主机 `user@plan.example`（key 登录），站点根 `/var/www/plan`，nginx 在 8443 端口，口令 cookie 挡在前面。
+- 主机和地址只在本地文件 `~/.config/curryflow/local.env` 里（不入库）：`CURRYPLAN_SSH=用户@主机`、
+  `CURRYPLAN_URL=https://主机:端口`；下面的命令先 `. ~/.config/curryflow/local.env`。
+- 主机 `$CURRYPLAN_SSH`（key 登录），站点根 `/var/www/plan`，nginx 在 8443 端口，口令 cookie 挡在前面。
 - 域名还没备案，现在直接用 IP 访问（Let's Encrypt IP 证书，服务器上 lego-renew.timer 自动续期）；备案完成后改成正式域名。
 - `/api/*` 由 `~/curry-site/server.py`（127.0.0.1:8765）处理：评论、提问、可编辑正文。**不要改它**，也不要动
   站点根下的公共文件（`kit.css`、`ui.css`、`ui.js`、`kit.js`、`app.*`、`index.html`、`sw.js`）——它们的源在
@@ -29,20 +31,20 @@
 ## 发布
 
 ```sh
-ssh user@plan.example 'mkdir -p /var/www/plan/<项目>/<页面>'
-scp -r <目录>/* user@plan.example:/var/www/plan/<项目>/<页面>/
-ssh user@plan.example 'python3 /var/www/plan/gen_catalog.py'     # 重写首页目录 catalog.json
+ssh "$CURRYPLAN_SSH" 'mkdir -p /var/www/plan/<项目>/<页面>'
+scp -r <目录>/* "$CURRYPLAN_SSH":/var/www/plan/<项目>/<页面>/
+ssh "$CURRYPLAN_SSH" 'python3 /var/www/plan/gen_catalog.py'     # 重写首页目录 catalog.json
 ```
 
 每次发布都更新 `meta.json` 的 `updated`。`bin/planpub 项目 页面名 目录 "标题" "一句话结论" [种类]` 一条命令做完
-上面三步（自己写 meta.json，任何机器上都能用）。地址是 `https://plan.example:8443/<项目>/<页面>/`。
+上面三步（自己写 meta.json，任何机器上都能用）。地址是 `$CURRYPLAN_URL/<项目>/<页面>/`。
 
 ## 注册新项目
 
 `/var/www/plan/projects.json` 是 `[{"id", "name"}, …]`，顺序就是首页顺序；`id` 也是目录名。
 
 ```sh
-ssh user@plan.example 'cd /var/www/plan && python3 - <<EOF
+ssh "$CURRYPLAN_SSH" 'cd /var/www/plan && python3 - <<EOF
 import json; p = json.load(open("projects.json"))
 p.append({"id": "<项目>", "name": "<显示名>"}) if all(x["id"] != "<项目>" for x in p) else None
 json.dump(p, open("projects.json", "w"), ensure_ascii=False)
@@ -58,7 +60,7 @@ mkdir -p <项目> && python3 gen_catalog.py'
 
 ```sh
 # 一次：clone（curryPlan 机的公钥要在中枢 ci 用户的 authorized_keys 里）
-ssh user@plan.example 'mkdir -p ~/curryflow && git clone -q ci@<主中枢>:<项目>.git ~/curryflow/<项目>-status'
+ssh "$CURRYPLAN_SSH" 'mkdir -p ~/curryflow && git clone -q ci@<主中枢>:<项目>.git ~/curryflow/<项目>-status'
 # crontab 加一行（保留已有的行；行尾注释用来认出它）
 * * * * * cd ~/curryflow/<项目>-status && flock -n .git/cf-status.lock sh -c "git pull -q --ff-only; python3 ci/coord status --json > /var/www/plan/<项目>/status/status.json.tmp && mv /var/www/plan/<项目>/status/status.json.tmp /var/www/plan/<项目>/status/status.json" >/dev/null 2>&1  # curryFlow <项目> 状态页
 ```
@@ -82,9 +84,9 @@ curryPlan 能往手机推通知（标准 Web Push）：机器告警、作业完�
   ~/curry-site/notify "标题" "正文" [url] [--tag 名字]
   ```
 
-  发给所有开了通知的设备。`url` 是点通知后打开的地址，只收本站的（`/` 开头的路径或 `https://plan.example:8443/…`，不写就是首页）；同一个
+  发给所有开了通知的设备。`url` 是点通知后打开的地址，只收本站的（`/` 开头的路径或 `$CURRYPLAN_URL/…`（服务器上 `~/curry-site/site.env` 的 `SITE=`，不入库），不写就是首页）；同一个
   `--tag` 的新通知顶掉设备上旧的那条。退出码：0 至少一台设备的推送服务收下了，1 一台也没有（原因在 stderr），
-  2 没问成。别的机器上：`ssh user@plan.example '~/curry-site/notify "标题" "正文"'`。
+  2 没问成。别的机器上：`ssh "$CURRYPLAN_SSH" '~/curry-site/notify "标题" "正文"'`。
 - 接口是 `POST /api/notify {title, body, url?, tag?}`，要带 `X-Notify-Key`（`~/curry-site/notify.key`）：nginx 把外面来的
   `/api/*` 也从 127.0.0.1 转给服务，来源地址分不出本机，所以认密钥。每次发送在 `~/curry-site/push.log` 记一行；推送
   服务说已失效（404/410）的订阅自动删。实现在 curryPlan 仓库的 `server/push.py`（RFC 8291 加密、RFC 8292 VAPID），

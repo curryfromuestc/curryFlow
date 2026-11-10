@@ -12,7 +12,7 @@
 HERE=$(cd "$(dirname "$0")" && pwd); REPO=$(cd "$HERE/../.." && pwd)
 [ -n "$1" ] || { echo "usage: $0 WORKDIR"; exit 2; }
 mkdir -p "$1" && W=$(cd "$1" && pwd) || exit 2
-SITE=http://localhost:18443; OLD=${OLD:-e41974c}; DATA=$W/home/curry-site; FAKE=$W/fake; FAKE_PORT=18444; failed=""
+SITE=http://localhost:18443; PUSH_SITE=https://plan.example:8443; OLD=${OLD:-e41974c}; DATA=$W/home/curry-site; FAKE=$W/fake; FAKE_PORT=18444; failed=""
 lack() { echo "RESULT env: $1"; exit 99; }
 python3 -c "import cryptography" 2>/dev/null || lack "python3 has no cryptography"
 node --experimental-websocket -e "WebSocket" 2>/dev/null || lack "node cannot do --experimental-websocket"
@@ -36,6 +36,8 @@ echo '{"projects":[{"id":"t","name":"测试项目"}],"pages":[{"project":"t","ur
 echo '<!doctype html><meta charset=utf-8><title>页</title><p>页面正文' > "$W/www/t/p/index.html"
 cp "$REPO/server/notify" "$DATA/notify"
 [ -n "$PROXY" ] && echo "FCM_PROXY_CMD=nc -X connect -x $PROXY %h %p" > "$DATA/push.env" || : > "$DATA/push.env"
+# the server's own origin (site.env, not in the repository): an example here; the test never connects to it
+echo "SITE=$PUSH_SITE" > "$DATA/site.env"
 HOME=$W/home SSL_CERT_FILE=$FAKE/bundle.pem python3 "$REPO/server/server.py" > "$W/server.out" 2>&1 & SERVER=$!
 python3 "$HERE/fake_service.py" serve "$FAKE" $FAKE_PORT > "$W/fake.out" 2>&1 & FAKESVC=$!
 python3 "$HERE/mock_nginx.py" "$W/www" 18443 > "$W/nginx.out" 2>&1 & NGINX=$!
@@ -44,7 +46,7 @@ trap 'kill $SERVER $NGINX $CHROME $FAKESVC 2>/dev/null; sleep 1; rm -rf "$W/chro
 for i in $(seq 1 40); do sleep 0.5; curl -s --noproxy localhost,127.0.0.1 -m 2 -o /dev/null http://127.0.0.1:9333/json/version && curl -s --noproxy localhost,127.0.0.1 -m 2 -o /dev/null $SITE/api/push/key && break; done
 OLD_CACHE=$(git -C "$REPO" show "$OLD:$OLD_SHELL/sw.js" | grep -o 'curryplan-v[0-9]*' | head -1); NEW_CACHE=$(grep -o 'curryplan-v[0-9]*' "$REPO/shell/sw.js" | head -1)
 OLD_BELL=$(git -C "$REPO" cat-file -e "$OLD:$OLD_SHELL/push.js" 2>/dev/null && echo 1 || echo 0)
-export SITE DATA OUT=$W WWW=$W/www NEW=$W/new HOME_FOR_NOTIFY=$W/home NGINX_PID=$NGINX SERVER_PID=$SERVER FAKE FAKE_PORT OLD_CACHE NEW_CACHE OLD_BELL
+export SITE PUSH_SITE DATA OUT=$W WWW=$W/www NEW=$W/new HOME_FOR_NOTIFY=$W/home NGINX_PID=$NGINX SERVER_PID=$SERVER FAKE FAKE_PORT OLD_CACHE NEW_CACHE OLD_BELL
 cd "$HERE"
 stage "an old client picks up the new service worker and page" node --experimental-websocket sw_update.mjs
 stage "the switch: on, test, notify, reload, off (a real subscription, a real delivery)" node --experimental-websocket toggle.mjs

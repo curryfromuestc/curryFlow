@@ -1,12 +1,14 @@
 """Faults on the sending side, against the stand-in push service (fake_service.py) behind FCM_PROXY_CMD (relay.py): each check
 reproduces a problem found in review of e41974c.  Endpoints here are made up; none is printed.
-env: SITE, DATA (the server's ~/curry-site), FAKE (fake_service.py's directory), FAKE_PORT, SERVER_PID.
+env: SITE, PUSH_SITE (the origin in site.env), DATA (the server's ~/curry-site), FAKE (fake_service.py's directory), FAKE_PORT, SERVER_PID.
 One line per check ("ok" / "FAIL"); exit 1 when any failed."""
 import base64, json, os, secrets, string, subprocess, sys, time, urllib.error, urllib.request
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
 SITE, DATA, FAKE = os.environ["SITE"], os.environ["DATA"], os.environ["FAKE"]
+PUSH_SITE = os.environ["PUSH_SITE"]   # the origin in the server's site.env
+PUSH_HOST = PUSH_SITE.split("://", 1)[1]
 RELAY = "FCM_PROXY_CMD=%s %s %s\n" % (sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "relay.py"), os.environ["FAKE_PORT"])
 SUBS, LOG, ENV, KEY = (os.path.join(DATA, n) for n in ("push-subs.json", "push.log", "push.env", "notify.key"))
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -173,9 +175,9 @@ try:
     must(code == 200, "with the key back, notify works again", "HTTP %s %s" % (code, res.get("note")))
 
     # 6. the url a click opens: this site only
-    for url, want in (("https://evil.example/x", 400), ("//evil.example/x", 400), ("/\\evil.example/x", 400), ("http://plan.example:8443/x", 400),
-                      ("https://plan.example:8443.evil.example/x", 400), ("javascript:alert(1)", 400), ("/a b", 400),
-                      ("/t/p/", 200), ("https://plan.example:8443/t/p/", 200)):
+    for url, want in (("https://evil.example/x", 400), ("//evil.example/x", 400), ("/\\evil.example/x", 400), ("http://" + PUSH_HOST + "/x", 400),
+                      (PUSH_SITE + ".evil.example/x", 400), ("javascript:alert(1)", 400), ("/a b", 400),
+                      ("/t/p/", 200), (PUSH_SITE + "/t/p/", 200)):
         code, res, _ = call("/api/notify", {"title": "链接", "url": url}, key())
         must(code == want, "notify with url %r: HTTP %d" % (url, want), "HTTP %s %s" % (code, res.get("error", res.get("note"))))
 

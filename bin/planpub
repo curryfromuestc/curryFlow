@@ -1,13 +1,17 @@
 #!/bin/bash
 # 把一个页面目录发布到 curryPlan：planpub 项目 页面名 目录 "标题" "一句话结论" [方案|笔记]
 # 目录里要有 index.html；图片等放在同一目录。任何机器上都能用（走 ssh）。
+# 主机和地址在本地文件 ~/.config/curryflow/local.env（不入库）：CURRYPLAN_SSH=用户@主机，CURRYPLAN_URL=https://主机:端口
 set -e
-[ $# -ge 5 ] || { sed -n 2,3p "$0"; exit 1; }
+[ $# -ge 5 ] || { sed -n 2,4p "$0"; exit 1; }
 proj=$1 slug=$2 dir=$3 title=$4 say=$5 kind=${6:-方案}
-host=user@plan.example
+conf=~/.config/curryflow/local.env
+[ -f "$conf" ] && . "$conf"
+[ -n "${CURRYPLAN_SSH:-}" ] && [ -n "${CURRYPLAN_URL:-}" ] || { echo "planpub: $conf 里要有 CURRYPLAN_SSH 和 CURRYPLAN_URL"; exit 1; }
+host=$CURRYPLAN_SSH
 [ -f "$dir/index.html" ] || { echo "$dir/index.html 不存在"; exit 1; }
 python3 -c 'import json,sys,datetime,socket; json.dump({"title":sys.argv[1],"say":sys.argv[2],"kind":sys.argv[3],"updated":datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),"machine":socket.gethostname()},open(sys.argv[4],"w"),ensure_ascii=False)' "$title" "$say" "$kind" "$dir/meta.json"
 ssh -o BatchMode=yes $host "mkdir -p /var/www/plan/$proj/$slug"
 rsync -rlt --delete -e "ssh -o BatchMode=yes" "$dir/" "$host:/var/www/plan/$proj/$slug/"
 ssh -o BatchMode=yes $host "python3 /var/www/plan/gen_catalog.py"
-echo "https://plan.example:8443/$proj/$slug/"
+echo "${CURRYPLAN_URL%/}/$proj/$slug/"
