@@ -491,7 +491,7 @@ def job_main(rundir):
     waited = False
     while not os.path.exists(exit_json) and fresh(alive):
         if not waited:
-            say(f"{'incus exec' if job.get('container') else '监管进程'}返回了（rc={rc}），监管进程还在：接着等它的结论")
+            say(f"{'incus exec ' if job.get('container') else '监管进程'}返回了（rc={rc}），监管进程还在：接着等它的结论")
             waited = True
         time.sleep(2)
     if not os.path.exists(exit_json):

@@ -532,7 +532,7 @@ def c_flowcheck(r):
 def c_late(r):
     log = f"{r.out}/J2a.log"
     rid = r.rid()
-    delay = r.tune["GIT_TIMEOUT"] + 4 if not r.baseline else 64
+    delay = r.tune["GIT_TIMEOUT"] + 1 if not r.baseline else 61
     r.mark("delay-secs", str(delay))
     r.mark("delay-run", rid)
     r.queue(rid, r.job(rid, f"echo x >> {log}", need={"machine": "t1"}))

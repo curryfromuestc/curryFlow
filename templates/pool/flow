@@ -441,11 +441,12 @@ def beat_of(beats, r, t):
     if not b:
         return "没有心跳"
     try:
-        age = t - datetime.datetime.strptime(b["at"], "%Y-%m-%dT%H:%M:%S%z").timestamp()
+        at = datetime.datetime.strptime(b["at"], "%Y-%m-%dT%H:%M:%S%z").timestamp()
     except (KeyError, TypeError, ValueError):
         return "?"
-    ex = b.get("executor")
-    held = isinstance(ex, dict) and (not isinstance(ex.get("jobs"), list) or r["id"] in ex["jobs"])
+    age, ex = t - at, b.get("executor")
+    held = (isinstance(ex, dict) and (not isinstance(ex.get("jobs"), list) or r["id"] in ex["jobs"])
+            or isinstance(r.get("start"), (int, float)) and r["start"] >= at - 60)
     return span(age) + "前" + ("（停了？）" if age > 200 else "") + ("" if held else "（executor 没在管它）")
 
 
