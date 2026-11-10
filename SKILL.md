@@ -154,17 +154,24 @@ curryPlan             人看的状态页（每分钟读中枢）和方案页；�
 
 - `flow run --project <名> [--commit <提交或中枢分支> | --here] [--threads N] [--mem G] [--gpu] [--machine M] [--slot S]
   [--prio gate|normal|night] [--timeout 秒] [--tag synth] [--no-wait] -- <命令>`。不给 `--commit`、`--here` 就用中枢 main；
-  `--here` 用当前仓库的 HEAD，中枢上没有分支指着它时推到一个临时 ref（不建分支，executor 取到后删）。命令只有一个词时
-  用 `bash -c` 跑（`-- "make -j && ctest"`）。默认超时 4 小时。退出码：作业自己的；124 超时，143 被取消，99 executor
-  没能把它跑起来（取不到提交等），255 丢了。`--no-wait` 只打印 id，之后 `flow wait <id>`。
+  `--here` 用当前仓库的 HEAD，中枢上没有分支指着它时推到项目中枢的临时 ref `refs/cf/tmp/<id>`（不建分支，executor
+  取到后删）。命令只有一个词时用 `bash -c` 跑（`-- "make -j && ctest"`）。默认超时 4 小时，最长 24 小时。退出码：作业
+  自己的；124 超时，143 被取消，99 executor 没能把它跑起来（取不到提交，或请求不合规），255 丢了（跑它的机器心跳停了、
+  executor 没在管它，或机器不在 `machines.json` 里了，十分钟后由别的 executor 判）；254 是 `flow wait` 不等了：认领它的
+  机器 20 分钟没有心跳（作业也许还在跑，结论回来后 `flow wait <id>` 能取到）。`--no-wait` 只打印 id，之后
+  `flow wait <id>`。
 - `flow ls`：排队、在跑、最近完成。`flow cancel <id>`：没开始的撤掉，在跑的结束它的全部进程。
 - 作业的环境：工作目录是这个槽位里该项目的常驻工作树，checkout 到指定提交；`.gitignore` 里的东西（`.build`）留着做
   增量构建，别的未跟踪文件清掉。环境变量有 `CF_DEPS_CACHE`、`PYTHONDONTWRITEBYTECODE=1`、`TMPDIR=<工作树>/.build/tmp`、
-  `CF_SLOT`、`CF_CPUS`、`CF_THREADS`（并行度用它）、`CF_JOB`。没有容器的机器上是 `taskset` 钉核加带内存上限的 systemd
-  用户 scope；有容器的机器上在槽位的容器里以宿主机用户的 uid/gid 跑，写出的文件属主是宿主机用户，不是 root。
+  `CF_SLOT`、`CF_CPUS`、`CF_THREADS`（并行度用它）、`CF_JOB`；`HOME` 在容器里是 `<槽位目录>/.home`，不用容器时是真实的
+  家目录。没有容器的机器上是 `taskset` 钉核加带内存上限的 systemd 用户 scope；有容器的机器上在槽位的容器里以宿主机
+  用户的 uid/gid 跑，写出的文件属主是宿主机用户，不是 root（容器里这个用户名被别的 uid 占了时，用户名是 `cf<uid>`）。
+  准备阶段的 git 在宿主机上跑，也钉在槽位的核上。
 - 排队规则：先按优先级（gate > normal > night），同优先级里提交人轮转，再按提交时间；一个作业占一个槽位；`--tag synth`
   的作业一台机器同时只跑一个。槽位可排 = 没有 executor 自己的作业或占用，并且实测忙线程不到 20%；共享机上别人直接用过
   的槽位要安静 5 分钟才算空闲。**要在槽位的核上手工跑东西，先 `flow hold`**：不占用的话 executor 只能靠负载猜。
+  hold 期间直接在 `<槽位目录>/<项目>` 工作树里改的东西，下一个作业的 `checkout -f` 和 `clean` 会清掉（`.gitignore` 里的
+  除外）：要留的先提交或拷走。
 - 谁提的：`$CF_WHO`，没设就是 `用户@主机:分支`。
 
 中枢上的 `machines.git` 放机器池的全部东西，每台机器 clone 到 `~/curryflow/machines`：
@@ -174,8 +181,12 @@ curryPlan             人看的状态页（每分钟读中枢）和方案页；�
   每台机器上已有的 clone（镜像从它建），`seed_only` 表示不许从中枢全量取（中枢小，大仓库都要写）。
 - `beat`、`status`、`executor`、`flow` 从 `templates/pool/` 拷来。
 - 状态全是 ref（JSON blob，格式见 `executor` 开头）：`refs/hb/<机器>` 心跳；`refs/q/<id>` 请求；`refs/run/<id>` 认领，用
-  "该 ref 必须不存在"的 push 建，两个 executor 抢同一个请求只有一个成功；`refs/done/<id>` 结论（退出码、最后一行、用时、
-  日志最后 40 行、完整日志在哪台机器的哪个路径），7 天后清；`refs/cancel/<id>` 取消在跑的。不碰项目仓库的 ref。
+  "该 ref 必须不存在"的 push 建，只写这一次，两个 executor 抢同一个请求只有一个成功；`refs/done/<id>` 结论（退出码、
+  最后一行、用时、日志最后 40 行、完整日志在哪台机器的哪个路径），结束 7 天后清；`refs/cancel/<id>` 取消在跑的。作业
+  活着靠机器心跳：beat 把 executor 手上的请求 id 带进 `refs/hb/<机器>`，不按作业推心跳。不合规的请求（字段类型或取值
+  不对、半小时没有哪个槽位满足）由先看到的 executor 写一个 99 的结论并撤掉。项目仓库上只碰 `refs/cf/tmp/<id>`：flow 推，
+  executor 取到提交后删；flow 没交上请求（失败或 Ctrl-C）时自己删；剩下的 executor 每小时清一次（没有请求在用、推了
+  一小时以上的）。
 - 每台机器两行 cron（装的时候保留已有的行；远端用脚本整段重写，不在 `set -e` 下 `crontab -l | grep -v`）：
   ```
   * * * * * cd ~/curryflow/machines && flock -n .git/beat.lock timeout 55 python3 beat --machine <名> >/dev/null 2>&1  # curryFlow 机器心跳

@@ -31,9 +31,11 @@ def blobs(kind, last=None):
     out = {}
     for ref in git("for-each-ref", "--format=%(refname)", f"refs/{kind}/").split()[-(last or 0):]:
         try:
-            out[ref.split("/", 2)[2]] = json.loads(git("cat-file", "blob", ref))
+            d = json.loads(git("cat-file", "blob", ref))
         except ValueError:
-            pass
+            continue
+        if isinstance(d, dict) and (kind == "hb" or isinstance(d.get("id"), str)):
+            out[ref.split("/", 2)[2]] = d
     return out
 
 
@@ -46,7 +48,8 @@ def main():
     running = blobs("run")
     queue = sorted((r for rid, r in blobs("q").items() if rid not in running), key=lambda r: r["id"])
     # Ids start with the time of the request, so the latest conclusions are among the last names.
-    done = sorted(blobs("done", last=4 * DONE).values(), key=lambda d: d.get("end") or 0, reverse=True)[:DONE]
+    done = sorted(blobs("done", last=4 * DONE).values(), key=lambda d: d["end"] if isinstance(d.get("end"), (int, float))
+                  else 0, reverse=True)[:DONE]
     for d in done:
         d.pop("tail", None)
     hist = {}

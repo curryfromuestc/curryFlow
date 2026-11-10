@@ -6,7 +6,8 @@ usage: beat --machine NAME [--print]
 Run every minute by cron from a clone of the pool repository. machines.json names the machine's slots and the
 mounts to report; everything else is read from the machine: busy threads per NUMA node and per slot, memory,
 disks, GPUs, incus containers, who uses the CPUs, and from the machine's executor (its state.json): the job or
-hold in each slot and whether the executor would schedule the slot.
+hold in each slot, whether the executor would schedule the slot, and the ids of every request the executor holds
+(flow and the other executors take a run as alive while its machine's heartbeat moves and lists it).
 """
 import argparse
 import collections
@@ -183,7 +184,7 @@ def collect(name, conf):
                    "top": top(d["cpus"]), **{k: d[k] for k in ("mem", "container", "note") if k in d}}
                   for s, d in conf.get("slots", {}).items()],
         "users": [{"user": u, "threads": round(v, 1)} for u, v in users.most_common(6) if v >= 0.5],
-        "executor": ex and {k: ex.get(k) for k in ("at", "poll", "queued", "memcap")},
+        "executor": ex and {k: ex.get(k) for k in ("at", "poll", "queued", "memcap", "jobs")},
     }
     for s in beat["slots"]:
         e = ((ex or {}).get("slots") or {}).get(s["name"])
@@ -199,7 +200,7 @@ def collect(name, conf):
 
 def git(*args, input=None, proxy=None):
     ssh = ("ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
-           " -o ControlMaster=auto -o ControlPersist=10m -o ControlPath=~/.ssh/cf-%C")
+           " -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPersist=10m -o ControlPath=~/.ssh/cf-%C")
     if proxy:
         ssh += f" -o 'ProxyCommand=nc -X connect -x {proxy} %h %p'"
     env = {**os.environ, "GIT_SSH_COMMAND": ssh, "GIT_TERMINAL_PROMPT": "0"}

@@ -86,7 +86,8 @@ svg.sp line { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-s
     if (s.container && !box) return ["off", "没有容器"];
     if (box && box.state !== "Running") return ["off", "容器已停"];
     if (j) return ["busy", j.kind === "hold" ? "占用" : "作业"];
-    if (s.sched) return s.sched === "foreign" ? ["busy", "在用"] : ["free", "空闲"];
+    if (s.sched) return { free: ["free", "空闲"], foreign: ["busy", "在用"], warming: ["", "测量中"], claiming: ["busy", "认领中"],
+      job: ["busy", "认领中"], hold: ["busy", "认领中"], off: ["off", "没有容器"] }[s.sched] || ["", s.sched];
     return s.busy / s.threads > FREE ? ["busy", "在用"] : ["free", "空闲"];
   }
   function spark(points, of) {

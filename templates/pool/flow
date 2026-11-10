@@ -12,17 +12,22 @@ run    queues COMMAND for the project at a commit: REV is a commit or a branch o
        --here takes the current repository's HEAD and, when no branch of the hub ends there, pushes it to a temporary
        ref of the hub (no branch is created; the executor deletes the ref once it has the commit). A COMMAND of one
        word is run by bash -c, so "make -j && ctest" works. flow waits for the conclusion, prints the last 40 lines of
-       the log and exits with the job's exit code (124 timeout, 143 cancelled, 99 the executor could not start it,
-       255 lost); with --no-wait it prints the id and returns.
+       the log and exits with the job's exit code (124 timeout, 143 cancelled, 99 the executor could not start it or
+       the request was not well formed, 255 lost); with --no-wait it prints the id and returns. When it fails before the
+       request is queued (or is interrupted), it deletes the temporary ref it pushed.
 hold   takes a slot out of scheduling for N hours (at most 8) and prints machine, slot, CPUs, container and
        directory; the slot comes back at release or when the hours are over.
 ls     the queue, what runs, the latest conclusions.
+wait   follows a request to its conclusion. While an executor has it, the heartbeat of that machine has to move and
+       list the request; without that for 20 minutes wait gives up with exit code 254 (the job may still run, its
+       conclusion comes back with the machine).
 
 It runs from a clone of the pool repository (machines.git, on every machine in ~/curryflow/machines): requests are
 JSON blobs behind refs/q/<id> there, the executors answer with refs/run/<id> and refs/done/<id> (see executor).
 Who asks is $CF_WHO, else user@host:branch.
 """
 import argparse
+import datetime
 import getpass
 import json
 import os
@@ -36,6 +41,9 @@ import unicodedata
 ROOT = os.path.dirname(os.path.realpath(__file__))
 SHA = re.compile(r"[0-9a-f]{40}")
 HOLD_MAX_HOURS = 8
+TIMEOUT_MAX = 86400
+HB_LOST, HB_CHECK, WAIT_STEP = 1200, 120, 4
+CODE_GONE = 254
 VERDICT = {"exit": "结束", "timeout": "超时", "cancelled": "已取消", "error": "没跑起来", "lost": "丢了",
            "expired": "占用到期", "released": "占用已放"}
 
@@ -55,7 +63,8 @@ def note(text):
 def git(*args, cwd=ROOT, input=None, timeout=90, bulk=False):
     # The pool's refs go over the machine's one persistent connection to the hub (shared with beat and the executor);
     # a push of commits (bulk) takes its own connection, so it does not hold up the others on a slow link.
-    ssh = "ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+    ssh = ("ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+           " -o ServerAliveInterval=15 -o ServerAliveCountMax=3")
     ssh += (" -o ControlMaster=no -o ControlPath=none" if bulk else
             " -o ControlMaster=auto -o ControlPersist=10m -o ControlPath=~/.ssh/cf-%C")
     if PROXY:
@@ -114,10 +123,11 @@ def blob(obj):
     return git("hash-object", "-w", "--stdin", input=json.dumps(obj, ensure_ascii=False)).strip()
 
 
-def state(rid):
-    """{kind: sha} of the refs a request has now."""
+def state(rid, machine=None):
+    """{kind: sha} of the refs a request has now, and the heartbeat of a machine (hb)."""
     out = {}
-    for line in git("ls-remote", "origin", *[f"refs/{k}/{rid}" for k in ("q", "run", "done", "cancel")]).splitlines():
+    hb = [f"refs/hb/{machine}"] if machine else []
+    for line in git("ls-remote", "origin", *[f"refs/{k}/{rid}" for k in ("q", "run", "done", "cancel")], *hb).splitlines():
         sha, ref = line.split("\t")
         out[ref.split("/")[1]] = sha
     return out
@@ -132,6 +142,10 @@ def read(kind, rid):
 
 
 def need_of(a):
+    if a.threads is not None and a.threads < 1:
+        die("--threads 至少是 1")
+    if a.mem is not None and not 0 < a.mem < float("inf"):
+        die("--mem 要大于 0")
     need = {}
     for key, value in (("threads", a.threads), ("mem_gb", a.mem), ("gpu", a.gpu), ("machine", a.machine),
                        ("slot", a.slot), ("tags", getattr(a, "tag", None))):
@@ -166,8 +180,9 @@ def submit(req):
     die(f"请求没推上去：{err}")
 
 
-def commit_of(a, hub, rid):
-    """(commit, a ref of the hub that leads to it or None, whether that ref is a temporary one)."""
+def commit_of(a, hub, rid, pushed):
+    """(commit, a ref of the hub that leads to it or None, whether that ref is a temporary one); a temporary ref is
+    added to pushed before it is pushed."""
     refs = {}
     for line in patient(git, "ls-remote", hub).splitlines():
         sha, ref = line.split("\t")
@@ -202,6 +217,7 @@ def commit_of(a, hub, rid):
     if local(sha) != sha:
         return sha, None, False               # the executor looks for it in the hub's branches
     tmp = f"refs/cf/tmp/{rid}"
+    pushed.append(tmp)
     patient(lambda: git("push", "-q", hub, f"{sha}:{tmp}", cwd=here, timeout=600, bulk=True))
     return sha, tmp, True
 
@@ -219,31 +235,50 @@ def show(d):
 
 def wait(rid, until="done", limit=None):
     """Follow a request to its conclusion (or, until="run", to the moment an executor takes it)."""
-    t0, seen, missing = time.time(), None, 0
+    t0, seen, missing, machine, run = time.time(), None, 0, None, None
+    hb, moved, checked, away = None, t0, 0, None
     try:
         while True:
             try:
-                st = state(rid)
+                st = state(rid, machine)
+                t = time.time()
                 if "done" in st:
                     return read("done", rid)
-                if "run" in st and seen != "run":
-                    seen, r = "run", read("run", rid)
+                missing = 0 if set(st) - {"hb"} else missing + 1
+                if missing >= 3:
+                    die(f"{rid}：中枢上没有这个请求（已取消，或结论已过期）")
+                if "run" in st and st["run"] != run:
+                    seen, run, r = "run", st["run"], read("run", rid)
                     if until == "run":
                         return r
-                    note(f"{rid} 在 {r['machine']}/{r['slot']} 上开始")
+                    machine, hb, moved, checked, away = r.get("machine"), None, t, 0, None
+                    note(f"{rid} 在 {machine}/{r.get('slot')} 上开始")
                 elif "q" in st and seen is None:
                     seen = "q"
                     note(f"{rid} 排队中")
-                elif not st:
-                    missing += 1
-                    if missing >= 3:
-                        die(f"{rid}：中枢上没有这个请求（已取消，或结论已过期）")
+                if machine and "run" in st:
+                    if st.get("hb") != hb:
+                        hb, moved = st.get("hb"), t
+                    if hb and t - checked >= HB_CHECK:
+                        checked = t
+                        ex = read("hb", machine).get("executor")
+                        held = isinstance(ex, dict) and (not isinstance(ex.get("jobs"), list) or rid in ex["jobs"])
+                        away = None if held else away or t
+                    why = None
+                    if t - moved >= HB_LOST:
+                        why = f"认领它的 {machine} 已经 {span(t - moved)}没有心跳（机器或网络断了）"
+                    elif away and t - away >= HB_LOST:
+                        why = f"{machine} 的 executor 已经 {span(t - away)}没在管它"
+                    if why:
+                        note(f"{rid}：{why}。作业也许还在跑，机器回来后结论照常回来：flow wait {rid} 接着等，"
+                             f"flow cancel {rid} 撤掉")
+                        sys.exit(CODE_GONE)
             except GitError as e:
                 note(f"中枢暂时读不到，接着等（{e}）")
             if limit and time.time() - t0 > limit:
                 return None
             age = time.time() - t0
-            time.sleep(4 if age < 60 else 8 if age < 900 else 15)
+            time.sleep(WAIT_STEP if age < 60 else 2 * WAIT_STEP if age < 900 else 4 * WAIT_STEP)
     except KeyboardInterrupt:
         note(f"不等了；作业不受影响：flow wait {rid} 接着等，flow cancel {rid} 取消")
         sys.exit(130)
@@ -259,15 +294,26 @@ def cmd_run(a):
         die("-- 后面要有命令")
     if a.project not in CONF.get("projects", {}):
         die(f"machines.json 里没有项目 {a.project}（有 {'、'.join(CONF.get('projects', {}))}）")
-    need, rid = need_of(a), new_id()
-    sha, ref, tmp = commit_of(a, CONF["projects"][a.project]["hub"], rid)
-    req = {"id": rid, "kind": "job", "submitted": round(time.time(), 3), "who": who(), "project": a.project, "commit": sha,
-           "argv": a.command, "cmd": a.command[0] if len(a.command) == 1 else shlex.join(a.command), "need": need,
-           "prio": a.prio, "timeout": a.timeout}
-    if ref:
-        req["ref"] = ref
-        req["tmp"] = tmp
-    rid = submit(req)
+    if not 0 < a.timeout <= TIMEOUT_MAX:
+        die(f"--timeout 要在 1 到 {TIMEOUT_MAX} 秒之间")
+    need, rid, hub, pushed = need_of(a), new_id(), CONF["projects"][a.project]["hub"], []
+    try:
+        sha, ref, tmp = commit_of(a, hub, rid, pushed)
+        req = {"id": rid, "kind": "job", "submitted": round(time.time(), 3), "who": who(), "project": a.project,
+               "commit": sha, "argv": a.command, "cmd": a.command[0] if len(a.command) == 1 else shlex.join(a.command),
+               "need": need, "prio": a.prio, "timeout": a.timeout}
+        if ref:
+            req["ref"] = ref
+            req["tmp"] = tmp
+        rid = submit(req)
+    except (SystemExit, KeyboardInterrupt):
+        for ref in pushed:
+            try:
+                git("push", "-q", hub, ":" + ref, timeout=60, bulk=True)
+                note(f"请求没交上，删掉了刚推的临时 ref {ref}")
+            except (GitError, KeyboardInterrupt) as e:
+                note(f"临时 ref {ref} 没删掉（executor 的清理过一小时会删）：{e}")
+        raise
     if a.no_wait:
         print(rid)
         return 0
@@ -339,14 +385,15 @@ def cmd_cancel(a):
 
 
 def snapshot():
-    """Every request, run and conclusion of the hub: {kind: [blob, ...]}."""
+    """Every request, run, conclusion and heartbeat of the hub: {kind: [blob, ...]}."""
     patient(lambda: git("fetch", "-q", "--no-tags", "--no-write-fetch-head", "--prune", "origin",
-                        "+refs/q/*:refs/flow/q/*", "+refs/run/*:refs/flow/run/*", "+refs/done/*:refs/flow/done/*"))
+                        "+refs/q/*:refs/flow/q/*", "+refs/run/*:refs/flow/run/*", "+refs/done/*:refs/flow/done/*",
+                        "+refs/hb/*:refs/flow/hb/*"))
     refs = [line.split() for line in git("for-each-ref", "--format=%(objectname) %(refname)", "refs/flow/q", "refs/flow/run",
-                                         "refs/flow/done").splitlines()]
+                                         "refs/flow/done", "refs/flow/hb").splitlines()]
     p = subprocess.run(["git", "cat-file", "--batch"], cwd=ROOT, input="".join(s + "\n" for s, _ in refs).encode(),
                        capture_output=True)
-    out, data, pos = {"q": [], "run": [], "done": []}, p.stdout, 0
+    out, data, pos = {"q": [], "run": [], "done": [], "hb": []}, p.stdout, 0
     for sha, ref in refs:
         end = data.index(b"\n", pos)
         head = data[pos:end].split()
@@ -355,7 +402,9 @@ def snapshot():
             continue
         size = int(head[2])
         try:
-            out[ref.split("/")[2]].append(json.loads(data[pos:pos + size]))
+            d = json.loads(data[pos:pos + size])
+            if isinstance(d, dict) and isinstance(d.get("id" if ref.split("/")[2] != "hb" else "machine"), str):
+                out[ref.split("/")[2]].append(d)
         except ValueError:
             pass
         pos += size + 1
@@ -386,12 +435,26 @@ def cut(text, n):
     return text if len(text) <= n else text[:n - 1] + "…"
 
 
+def beat_of(beats, r, t):
+    """How the heartbeat of a run's machine looks: its age, and whether its executor holds the run."""
+    b = beats.get(r.get("machine"))
+    if not b:
+        return "没有心跳"
+    try:
+        age = t - datetime.datetime.strptime(b["at"], "%Y-%m-%dT%H:%M:%S%z").timestamp()
+    except (KeyError, TypeError, ValueError):
+        return "?"
+    ex = b.get("executor")
+    held = isinstance(ex, dict) and (not isinstance(ex.get("jobs"), list) or r["id"] in ex["jobs"])
+    return span(age) + "前" + ("（停了？）" if age > 200 else "") + ("" if held else "（executor 没在管它）")
+
+
 def cmd_ls(a):
     s = snapshot()
     taken = {r["id"] for r in s["run"]}
     queue = sorted((r for r in s["q"] if r["id"] not in taken), key=lambda r: r["id"])
     running = sorted(s["run"], key=lambda r: r["id"])
-    done = sorted(s["done"], key=lambda d: d.get("end") or 0, reverse=True)
+    done = sorted(s["done"], key=lambda d: d["end"] if isinstance(d.get("end"), (int, float)) else 0, reverse=True)
     if not a.all:
         done = done[:10]
     if a.json:
@@ -399,15 +462,18 @@ def cmd_ls(a):
         return 0
     t = time.time()
     needs = lambda n: " ".join(f"{k}={','.join(v) if isinstance(v, list) else v}" for k, v in n.items()) or "-"
+    beats = {b["machine"]: b for b in s["hb"]}
+    when = lambda x: x if isinstance(x, (int, float)) else t
     table("排队", ["id", "优先级", "谁", "项目", "命令", "等了", "需求"],
-          [[r["id"], r["prio"], r["who"], r.get("project") or "-", cut(r.get("cmd"), 48), span(t - r["submitted"]),
-            needs(r.get("need", {}))] for r in queue])
-    table("在跑", ["id", "机器/槽位", "谁", "项目", "命令", "已跑", "executor 心跳"],
-          [[r["id"], f"{r['machine']}/{r['slot']}", r["who"], r.get("project") or "-", cut(r.get("cmd"), 48),
-            span(t - r["start"]), span(t - r["hb"]) + "前" + ("（停了？）" if t - r["hb"] > 200 else "")] for r in running])
+          [[r["id"], r.get("prio"), r.get("who"), r.get("project") or "-", cut(r.get("cmd"), 48),
+            span(t - when(r.get("submitted"))), needs(r["need"]) if isinstance(r.get("need"), dict) else "?"]
+           for r in queue])
+    table("在跑", ["id", "机器/槽位", "谁", "项目", "命令", "已跑", "机器心跳"],
+          [[r["id"], f"{r.get('machine')}/{r.get('slot')}", r.get("who"), r.get("project") or "-", cut(r.get("cmd"), 48),
+            span(t - when(r.get("start"))), beat_of(beats, r, t)] for r in running])
     table("最近完成", ["id", "结论", "退出码", "用时", "机器/槽位", "谁", "项目", "命令", "最后一行"],
-          [[d["id"], VERDICT.get(d.get("reason"), d.get("reason")), d.get("code"), span(d.get("secs", 0)),
-            f"{d['machine']}/{d['slot']}" if d.get("machine") else "-", d["who"], d.get("project") or "-",
+          [[d["id"], VERDICT.get(d.get("reason"), d.get("reason")), d.get("code"), span(d.get("secs") or 0),
+            f"{d['machine']}/{d['slot']}" if d.get("machine") else "-", d.get("who"), d.get("project") or "-",
             cut(d.get("cmd"), 40), cut(d.get("last"), 60)] for d in done])
     return 0
 
@@ -419,6 +485,7 @@ def cmd_wait(a):
 
 
 def main():
+    globals().update(json.loads(os.environ.get("CF_POOL_TUNE") or "{}"))
     argv = sys.argv[1:]
     command = []
     if "--" in argv:
