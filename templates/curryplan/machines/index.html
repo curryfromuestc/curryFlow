@@ -121,7 +121,11 @@ svg.sp line { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-s
     const users = (b.users || []).map((u) => `${esc(u.user)} <span class="mono dim">×${u.threads}</span>`).join(" · ");
     const used = b.mem.total - b.mem.avail;
     const ex = !c.executor ? "" : b.executor ? " · executor 在跑" : ' · <span class="stale">executor 没在跑</span>';
-    return `<section class="sec" data-c="m-${esc(m.name)}"><h2>${esc(m.name)} <small>${c.shared ? "共享机" : "独占机"} · ${b.threads} 线程 · 心跳 <span class="${stale ? "stale" : ""}">${ago(b.at)}</span>${ex}</small></h2>
+    const p = b.pull || {};
+    const pull = (p.head ? ` · 版本 <span class="mono">${esc(p.head.slice(0, 9))}</span>` : "") + (p.ok === false
+      ? ` · <span class="stale" title="${esc(p.error || "")}">git pull 失败（上次成功 ${ago(p.at)}）：${esc((p.error || "").slice(-120))}</span>`
+      : p.at && secs(p.at) > 3600 ? ` · <span class="stale">${ago(p.at)}拉过</span>` : "");
+    return `<section class="sec" data-c="m-${esc(m.name)}"><h2>${esc(m.name)} <small>${c.shared ? "共享机" : "独占机"} · ${b.threads} 线程 · 心跳 <span class="${stale ? "stale" : ""}">${ago(b.at)}</span>${ex}${pull}</small></h2>
       <div class="wall">
         <div class="card" data-c="m-${esc(m.name)}-load"><div class="nums">
           <div><b>${b.busy.toFixed(0)}<span class="dim" style="font-size:13px"> / ${b.threads}</span></b><span>忙线程</span></div>

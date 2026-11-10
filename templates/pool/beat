@@ -7,7 +7,8 @@ Run every minute by cron from a clone of the pool repository. machines.json name
 mounts to report; everything else is read from the machine: busy threads per NUMA node and per slot, memory,
 disks, GPUs, incus containers, who uses the CPUs, and from the machine's executor (its state.json): the job or
 hold in each slot, whether the executor would schedule the slot, and the ids of every request the executor holds
-(flow and the other executors take a run as alive while its machine's heartbeat moves and lists it).
+(flow and the other executors take a run as alive while its machine's heartbeat moves and lists it). Every ten minutes
+it pulls the clone; the heartbeat carries the clone's commit and how the last pull went (pull: ok, error, at).
 """
 import argparse
 import collections
@@ -19,6 +20,8 @@ import subprocess
 import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+PULLED = os.path.join(ROOT, ".git", "cf-pull.json")
+PULL = 600
 
 
 def run(cmd, timeout=20, shell=False):
@@ -185,6 +188,7 @@ def collect(name, conf):
                   for s, d in conf.get("slots", {}).items()],
         "users": [{"user": u, "threads": round(v, 1)} for u, v in users.most_common(6) if v >= 0.5],
         "executor": ex and {k: ex.get(k) for k in ("at", "poll", "queued", "memcap", "jobs")},
+        "pull": pulled(),
     }
     for s in beat["slots"]:
         e = ((ex or {}).get("slots") or {}).get(s["name"])
@@ -196,6 +200,38 @@ def collect(name, conf):
         if c.get("cpus") and c.get("state") == "Running":
             c["busy"] = total(c["cpus"])
     return beat
+
+
+def pulled():
+    try:
+        with open(PULLED) as f:
+            p = json.load(f)
+    except (OSError, ValueError):
+        p = {}
+    head = run(["git", "-C", ROOT, "rev-parse", "HEAD"]).strip()
+    return {"head": head[:12] or None, "ok": p.get("ok"), "at": p.get("at"), "error": p.get("error")}
+
+
+def pull(proxy):
+    """git pull every PULL seconds; how it went goes into the heartbeats, so a clone that falls behind shows."""
+    try:
+        with open(PULLED) as f:
+            last = json.load(f)
+    except (OSError, ValueError):
+        last = {}
+    if time.time() - last.get("tried", 0) < PULL:
+        return
+
+    def keep(st):
+        with open(PULLED + ".tmp", "w") as f:
+            json.dump(st, f, ensure_ascii=False)
+        os.replace(PULLED + ".tmp", PULLED)
+    keep({**last, "tried": time.time()})
+    try:
+        git("pull", "-q", "--ff-only", proxy=proxy)
+        keep({"tried": time.time(), "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "ok": True})
+    except (SystemExit, subprocess.TimeoutExpired) as e:
+        keep({"tried": time.time(), "at": last.get("at"), "ok": False, "error": str(e)[-300:]})
 
 
 def git(*args, input=None, proxy=None):
@@ -211,6 +247,7 @@ def git(*args, input=None, proxy=None):
 
 
 def main():
+    globals().update(json.loads(os.environ.get("CF_POOL_TUNE") or "{}"))
     ap = argparse.ArgumentParser()
     ap.add_argument("--machine", required=True)
     ap.add_argument("--print", action="store_true")
@@ -226,10 +263,8 @@ def main():
     proxy = conf.get("hub_proxy")
     blob = git("hash-object", "-w", "--stdin", input=text)
     git("push", "-q", "-f", "origin", f"{blob}:refs/hb/{a.machine}", proxy=proxy)
-    minute = time.localtime().tm_min
-    if minute % 10 == 0:
-        git("pull", "-q", "--ff-only", proxy=proxy)
-    if minute == 7:
+    pull(proxy)
+    if time.localtime().tm_min == 7:
         git("gc", "-q", "--prune=10.minutes.ago")      # not now: executor and flow push blobs they have just written
 
 

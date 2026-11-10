@@ -154,13 +154,19 @@ curryPlan             人看的状态页（每分钟读中枢）和方案页；�
 
 - `flow run --project <名> [--commit <提交或中枢分支> | --here] [--threads N] [--mem G] [--gpu] [--machine M] [--slot S]
   [--prio gate|normal|night] [--timeout 秒] [--tag synth] [--no-wait] -- <命令>`。不给 `--commit`、`--here` 就用中枢 main；
+  `--commit` 可以是提交、项目中枢上的分支 / tag / 任意 ref（`HEAD`、`refs/pull/7/head`、带中文或 `@`、`#` 的分支名都行），
+  或当前仓库解析得了的名字，flow 都先解析成 40 位提交再交上去；
   `--here` 用当前仓库的 HEAD，中枢上没有分支指着它时推到项目中枢的临时 ref `refs/cf/tmp/<id>`（不建分支，executor
   取到后删）。命令只有一个词时用 `bash -c` 跑（`-- "make -j && ctest"`）。默认超时 4 小时，最长 24 小时。退出码：作业
-  自己的；124 超时，143 被取消，99 executor 没能把它跑起来（取不到提交，或请求不合规），255 丢了（跑它的机器心跳停了、
-  executor 没在管它，或机器不在 `machines.json` 里了，十分钟后由别的 executor 判）；254 是 `flow wait` 不等了：认领它的
-  机器 20 分钟没有心跳（作业也许还在跑，结论回来后 `flow wait <id>` 能取到）。`--no-wait` 只打印 id，之后
-  `flow wait <id>`。
-- `flow ls`：排队、在跑、最近完成。`flow cancel <id>`：没开始的撤掉，在跑的结束它的全部进程。
+  自己的；124 超时，143 被取消，99 executor 没能把它跑起来（取不到提交，或请求不合规），255 丢了（跑它的机器心跳和
+  executor 自报的存活信号都停了，或它的 executor 没在管它，十分钟后由别的 executor 判；判的 executor 自己读不到中枢的
+  那段时间不算；不在判的那台机器 `machines.json` 里的机器也一样要心跳停了才判）。255 不是终局：作业也许还在跑，它自己
+  的结论回来后会替换掉 255，`flow wait <id>` 取到的就是替换后的。254 是 `flow wait` 不等了：认领它的机器 20 分钟没有
+  心跳也没有存活信号（flow 自己读不到中枢的时间不算；作业也许还在跑，结论回来后 `flow wait <id>` 能取到）。
+  `--no-wait` 只打印 id，之后 `flow wait <id>`。
+- `flow ls`：排队、在跑、最近完成。`flow cancel <id>`：没开始的撤掉（写 143 的结论，中枢上已经有结论时不盖它），在跑的
+  结束它的全部进程。排队时撤掉和 executor 认领撞上时，认领的 executor 看到中枢上已有的结论（取消、不合规）就结束作业、
+  不推自己的结论；只有已有的结论是"丢了"时才接着跑。
 - 作业的环境：工作目录是这个槽位里该项目的常驻工作树，checkout 到指定提交；`.gitignore` 里的东西（`.build`）留着做
   增量构建，别的未跟踪文件清掉。环境变量有 `CF_DEPS_CACHE`、`PYTHONDONTWRITEBYTECODE=1`、`TMPDIR=<工作树>/.build/tmp`、
   `CF_SLOT`、`CF_CPUS`、`CF_THREADS`（并行度用它）、`CF_JOB`；`HOME` 在容器里是 `<槽位目录>/.home`，不用容器时是真实的
@@ -183,9 +189,11 @@ curryPlan             人看的状态页（每分钟读中枢）和方案页；�
 - 状态全是 ref（JSON blob，格式见 `executor` 开头）：`refs/hb/<机器>` 心跳；`refs/q/<id>` 请求；`refs/run/<id>` 认领，用
   "该 ref 必须不存在"的 push 建，只写这一次，两个 executor 抢同一个请求只有一个成功；`refs/done/<id>` 结论（退出码、
   最后一行、用时、日志最后 40 行、完整日志在哪台机器的哪个路径），结束 7 天后清；`refs/cancel/<id>` 取消在跑的。作业
-  活着靠机器心跳：beat 把 executor 手上的请求 id 带进 `refs/hb/<机器>`，不按作业推心跳。不合规的请求（字段类型或取值
-  不对、半小时没有哪个槽位满足）由先看到的 executor 写一个 99 的结论并撤掉。项目仓库上只碰 `refs/cf/tmp/<id>`：flow 推，
-  executor 取到提交后删；flow 没交上请求（失败或 Ctrl-C）时自己删；剩下的 executor 每小时清一次（没有请求在用、推了
+  活着靠机器心跳：beat 把 executor 手上的请求 id 带进 `refs/hb/<机器>`，beat 停了时由 executor 推 `refs/alive/<机器>`
+  顶上，不按作业推心跳。不合规的请求（字段类型或取值不对、半小时没有哪个槽位满足）由先看到的 executor 写一个 99 的
+  结论并撤掉；`need` 里本机不认识的键或 tag 算"本机跑不了"，不算不合规；"半小时没有槽位满足"只由运行着本机 clone 里
+  那版 executor、并且 clone 里的 `machines.json` 和中枢 main 上一样的 executor 判（clone 落后的不判）。项目仓库上只碰
+  `refs/cf/tmp/<id>`：flow 推，executor 取到提交后删；flow 没交上请求（失败或 Ctrl-C）时自己删；剩下的 executor 每小时清一次（没有请求在用、推了
   一小时以上的）。
 - 每台机器两行 cron（装的时候保留已有的行；远端用脚本整段重写，不在 `set -e` 下 `crontab -l | grep -v`）：
   ```
@@ -193,8 +201,10 @@ curryPlan             人看的状态页（每分钟读中枢）和方案页；�
   * * * * * cd ~/curryflow/machines && flock -n .git/executor.lock python3 executor run --machine <名> >/dev/null 2>&1  # curryFlow executor
   ```
   beat 每分钟把本机状态推成心跳：各 NUMA 节点和各槽位的忙线程、内存、磁盘、显卡、incus 容器、谁在占 CPU、每个槽位里的
-  作业或占用；每 10 分钟自己 `git pull`。executor 每 15 秒经一条复用的 ssh 连接看一次队列（取项目的提交另开连接）；文件
-  变了且手上没有作业时自己换成新版本；被结束了一分钟内由 cron 拉起，接着等在跑的作业，不重跑。
+  作业或占用；每 10 分钟自己 `git pull`，心跳里带 clone 的版本和上次 pull 的结果（`pull`），机器页上显示版本，pull 失败
+  标红。executor 每 15 秒经一条复用的 ssh 连接看一次队列（取项目的提交另开连接）；文件变了且手上没有作业时自己换成新
+  版本；被结束了一分钟内由 cron 拉起，接着等在跑的作业，不重跑。beat 停了或卡在慢的探测（nvidia-smi、incus）里时，
+  手上有作业的 executor 每 2.5 分钟自己推一次 `refs/alive/<机器>`（它手上的请求 id），作业不会因为 beat 坏了被判丢。
 - 机器上的布局：`~/curryflow/mirror/<项目>.git` 每个项目一份 bare 镜像，只对中枢增量取；槽位目录是 `~/<容器名>`（有容器，
   容器里同路径）或 `~/curryflow/slots/<槽位>`，里面 `<项目>/` 是工作树，`.cf/<id>/` 是作业目录（`log` 是完整日志）；
   executor 自己的日志和状态在 `~/curryflow/exec/<机器>/`。

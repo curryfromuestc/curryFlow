@@ -14,10 +14,15 @@ Everything shared is a JSON blob behind a ref of the pool repository (machines.g
   refs/cancel/<id>  asks the executor that runs <id> to end it; a request whose q ref is gone is cancelled as well
   refs/hb/<machine> the machine's heartbeat (beat); it carries the ids the machine's executor holds, so a run is alive
                     while its machine's heartbeat moves and lists it
-A request that is not well formed, or that no slot of the pool fits for half an hour, gets an error conclusion from
-whichever executor sees it first. A run whose machine has no heartbeat, no executor that holds it, or is no longer in
-machines.json for ten minutes gets a lost conclusion (255); its executor's own conclusion, if it comes later, replaces
-it. A claim that this executor gave up on and that the hub took after all is deleted, so the request is queued again.
+  refs/alive/<m>    pushed by the executor itself while it holds requests and its machine's heartbeat stands still
+                    (beat stopped or stuck in a slow probe): the ids it holds, like the heartbeat
+A request that is not well formed gets an error conclusion from whichever executor sees it first; so does a request
+that no slot of the pool fits for half an hour, judged only by an executor that runs its clone's version and whose
+machines.json is the hub's (a need it does not know means it cannot run the request). A run whose machine has had
+neither heartbeat nor executor signal, or whose executor has not held it, for ten minutes of this executor reading the
+hub gets a lost conclusion (255); its executor's own conclusion, if it comes later, replaces it, while any other
+conclusion already there (cancelled in the queue, not well formed) ends the run instead. A claim that this executor
+gave up on and that the hub took after all is deleted, so the request is queued again.
 On the machine:
   ~/curryflow/exec/<machine>/        state.json (what beat reports), executor.log, served.json, abandoned.json
   ~/curryflow/mirror/<project>.git   the machine's bare mirror of a project; only incremental fetches from its hub
@@ -59,9 +64,9 @@ TICK, POLL, POLL_MAX, SWEEP, REAP = 3, 15, 120, 3600, 300
 BUSY_MAX = 0.20          # a slot whose measured busy share is at or above this is somebody else's
 WINDOW, MIN_WINDOW = 60, 6
 BURST, QUIET = 15, 300   # on a shared machine a slot somebody loaded stays theirs for QUIET seconds after the load stops
-LOST, RUN_GRACE, UNFIT = 600, 180, 1800
-TOUCH, ALIVE, SPAWN, CANCEL_KILL = 5, 60, 60, 90
-KEEP, TMP_KEEP, ABANDON_KEEP = 7 * 86400, 3600, 86400
+LOST, RUN_GRACE, UNFIT, SELF_BEAT = 600, 180, 1800, 150
+TOUCH, ALIVE, SPAWN, CANCEL_KILL, OVERRUN, LOCK_WAIT = 5, 60, 60, 90, 300, 60
+KEEP, TMP_KEEP, ABANDON_KEEP, TMPDIR_KEEP = 7 * 86400, 3600, 86400, 3 * 86400
 HOLD_MAX_HOURS = 8
 TIMEOUT_MAX = 86400
 LOG_MAX, LOG_HEAD, EXEC_LOG_MAX = 256 << 20, 1 << 20, 4 << 20
@@ -71,7 +76,7 @@ TAGS = {"synth"}
 ID = re.compile(r"\d{6}-\d{6}-[0-9a-f]{3,8}")
 SHA = re.compile(r"[0-9a-f]{40}")
 TMPREF = re.compile(r"refs/cf/tmp/\d{6}-\d{6}-[0-9a-f]{3,8}")
-REF = re.compile(r"refs/(heads|tags)/[A-Za-z0-9_+-][A-Za-z0-9._/+-]*")
+REF = re.compile(r"(?!.*(?:\.\.|@\{|//|/\.|/-|\.lock(?:/|$)))refs/[^\x00-\x20\x7f~^:?*\[\\]+(?<![./])")
 LOCKS = ("*.lock", "refs/**/*.lock", "logs/**/*.lock")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -224,7 +229,7 @@ def text(x, n=4096):
 
 NEEDS = {"threads": lambda v: isinstance(v, int) and num(v, 0, 4096), "mem_gb": lambda v: num(v, 0, 1 << 20),
          "gpu": lambda v: isinstance(v, bool), "machine": lambda v: text(v, 100), "slot": lambda v: text(v, 100),
-         "tags": lambda v: isinstance(v, list) and all(isinstance(t, str) and t in TAGS for t in v)}
+         "tags": lambda v: isinstance(v, list) and all(text(t, 100) for t in v)}
 
 
 def problem(r, rid):
@@ -245,9 +250,7 @@ def problem(r, rid):
     if not isinstance(need, dict):
         return "need 不是对象"
     for key, value in need.items():
-        if key not in NEEDS:
-            return f"need 里有不认识的 {key}"
-        if not NEEDS[key](value):
+        if key in NEEDS and not NEEDS[key](value):
             return f"need.{key} 的值不对：{value!r}"
     if r["kind"] == "hold":
         return None if num(r.get("hours"), 0, HOLD_MAX_HOURS) else f"hours 要在 0 到 {HOLD_MAX_HOURS} 之间：{r.get('hours')!r}"
@@ -272,34 +275,46 @@ def problem(r, rid):
     return None
 
 
-def git_busy(path):
-    """Whether a git process works in path (its arguments name it, or it runs there)."""
-    real = os.path.realpath(path)
+def git_busy(root):
+    """Whether a git process may work in the repository at root (the work tree's top, or a bare repository): its
+    arguments name it, it runs in it, or where it runs cannot be read (another user's, a container's)."""
+    real = os.path.realpath(root)
     for d in os.listdir("/proc"):
-        if not d.isdigit():
+        if not d.isdigit() or int(d) == os.getpid():
             continue
         try:
             with open(f"/proc/{d}/comm") as f:
-                if not f.read().startswith("git"):
-                    continue
+                comm = f.read().strip()
+            if comm != "git" and not comm.startswith("git-"):
+                continue
             with open(f"/proc/{d}/cmdline", "rb") as f:
                 args = f.read()
-            if real.encode() in args or path.encode() in args:
+            st = proc_stat(d)
+            if not st or st[0] == "Z":
+                continue
+            if real.encode() in args or root.encode() in args:
                 return True
-            if os.path.realpath(f"/proc/{d}/cwd").startswith(real):
-                return True
+            cwd = os.readlink(f"/proc/{d}/cwd")
+        except PermissionError:
+            return True
         except OSError:
-            pass
+            continue
+        if cwd == real or cwd.startswith(real + "/"):
+            return True
     return False
 
 
-def clear_locks(gitdir, say):
-    """Lock files a killed git left behind; only when no git process works in the repository."""
+def clear_locks(root, gitdir, say, check):
+    """Lock files a killed git left behind; only at a moment no git process may work in the repository."""
     locks = sorted({p for pat in LOCKS for p in glob.glob(os.path.join(gitdir, pat), recursive=True)})
     if not locks:
         return
-    if git_busy(gitdir):
-        return say(f"{gitdir} 里有锁文件，但还有 git 进程在用它，先不删")
+    t = time.time()
+    while git_busy(root):
+        if time.time() - t >= LOCK_WAIT:
+            return say(f"{gitdir} 里有锁文件，但 {LOCK_WAIT} 秒里一直有 git 进程可能在用它，不删")
+        check()
+        time.sleep(1)
     for p in locks:
         try:
             os.unlink(p)
@@ -486,8 +501,14 @@ def job_main(rundir):
     except Exception:
         say("准备失败：\n" + traceback.format_exc())
         return write_exit(rundir, CODE_ERROR, "error", "executor 内部错误，见日志")
-    rc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT).wait()
+    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
     exit_json, alive = os.path.join(rundir, "exit.json"), os.path.join(rundir, "alive")
+    deadline = time.time() + job["req"]["timeout"] + OVERRUN
+    while p.poll() is None:
+        if time.time() > deadline and not fresh(alive) and not os.path.exists(exit_json):
+            return overrun(job, rundir, p, say)
+        time.sleep(1)
+    rc = p.returncode
     waited = False
     while not os.path.exists(exit_json) and fresh(alive):
         if not waited:
@@ -499,6 +520,47 @@ def job_main(rundir):
             subprocess.run(["systemctl", "--user", "stop", job["unit"] + ".scope"], capture_output=True)
         say(f"监管进程没留下结论就退出了（rc={rc}）")
         write_exit(rundir, CODE_LOST, "lost", f"监管进程退出 rc={rc}")
+
+
+def overrun(job, rundir, p, say):
+    """The supervisor has neither concluded nor moved, OVERRUN seconds past the job's timeout (stopped, or its
+    container paused): what can be reached of the job goes, and the job is lost."""
+    if job.get("unit"):
+        subprocess.run(["systemctl", "--user", "kill", "--signal=SIGKILL", job["unit"] + ".scope"], capture_output=True)
+    elif not job.get("container"):
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            pass
+    p.kill()
+    p.wait()
+    say(f"超时 {OVERRUN} 秒后监管进程既没给结论也没有动静：结束它")
+    write_exit(rundir, CODE_LOST, "lost", f"超时 {OVERRUN} 秒后监管进程既没给结论也没有动静（被停住了，或容器被暂停）")
+
+
+def sweep_tmpdir(path, say):
+    """Files of earlier jobs in the work tree's TMPDIR untouched for TMPDIR_KEEP. It runs while the job is prepared,
+    when the slot has no other job, so no running job's file is among them."""
+    cutoff, n, emptied = time.time() - TMPDIR_KEEP, 0, set()
+    for top, dirs, files in os.walk(path, topdown=False):
+        for name in files + [d for d in dirs if os.path.islink(os.path.join(top, d))]:
+            try:
+                if os.lstat(os.path.join(top, name)).st_mtime < cutoff:
+                    os.unlink(os.path.join(top, name))
+                    n += 1
+                    emptied.add(top)
+            except OSError:
+                pass
+        for name in dirs:
+            sub = os.path.join(top, name)
+            try:
+                if not os.path.islink(sub) and (sub in emptied or os.lstat(sub).st_mtime < cutoff):
+                    os.rmdir(sub)
+                    emptied.add(top)
+            except OSError:
+                pass
+    if n:
+        say(f"清掉 {path} 里 {n} 个 {TMPDIR_KEEP // 86400} 天没动过的文件")
 
 
 def fresh(path):
@@ -537,7 +599,7 @@ def prepare(job, say, run, must, check):
                 must(["git", "init", "-q", "--bare", tmp], "git init 失败")
             must(["git", "-C", tmp, "config", "uploadpack.allowAnySHA1InWant", "true"], "git config 失败")
             os.rename(tmp, mirror)
-        clear_locks(mirror, say)
+        clear_locks(mirror, mirror, say, check)
         if not has(mirror):
             ref = req.get("ref")
             if ref:
@@ -560,12 +622,13 @@ def prepare(job, say, run, must, check):
         shutil.rmtree(tmp, ignore_errors=True)
         must(["git", "clone", "-q", "--no-checkout", mirror, tmp], "建工作树失败")
         os.rename(tmp, tree)
-    clear_locks(os.path.join(tree, ".git"), say)
+    clear_locks(tree, os.path.join(tree, ".git"), say, check)
     if not has(tree):
         must(["git", "-C", tree, "fetch", "-q", "--no-tags", mirror, sha], "工作树从镜像取提交失败")
     must(["git", "-C", tree, "-c", "advice.detachedHead=false", "checkout", "-q", "-f", "--detach", sha], "checkout 失败")
     must(["git", "-C", tree, "clean", "-fdq"], "git clean 失败")
     os.makedirs(os.path.join(tree, ".build", "tmp"), exist_ok=True)
+    sweep_tmpdir(os.path.join(tree, ".build", "tmp"), say)
     say(f"{req['project']}@{sha[:12]} 在 {job['machine']}/{job['slot']}：{req['cmd']}")
 
 
@@ -626,7 +689,8 @@ class Executor:
         self.load_conf()
         self.jobs, self.claiming, self.unreported, self.procs = {}, {}, {}, {}
         self.blobs, self.bad, self.unfit, self.runs, self.dead, self.ends = {}, set(), {}, {}, {}, {}
-        self.hb_seen, self.run_seen = {}, {}
+        self.seen, self.run_seen, self.dones = {}, {}, {}
+        self.main, self.alive_at, self.current_key, self.current_ok = None, 0, None, False
         self.abandoned = jload(os.path.join(self.dir, "abandoned.json"), {})
         self.samples = collections.deque()
         self.served = jload(os.path.join(self.dir, "served.json"), {})
@@ -759,7 +823,10 @@ class Executor:
               {"machine": self.machine, "at": int(time.time()), "pid": os.getpid(), "poll": int(self.last_poll),
                "queued": self.queued, "memcap": "container" if any(s.container for s in self.slots.values())
                else "systemd" if self.unit_ok else "none", "slots": slots,
-               "jobs": sorted(set(self.jobs) | set(self.claiming) | set(self.unreported))})
+               "jobs": self.held()})
+
+    def held(self):
+        return sorted(set(self.jobs) | set(self.claiming) | set(self.unreported) | set(self.abandoned))
 
     # -- the hub ---------------------------------------------------------------------------------------
 
@@ -789,7 +856,8 @@ class Executor:
 
     def fits(self, req, slot):
         need = req.get("need", {})
-        return (need.get("slot") in (None, slot.name) and need.get("threads", 0) <= len(slot.cpus)
+        return (set(need) <= set(NEEDS) and set(need.get("tags", [])) <= TAGS
+                and need.get("slot") in (None, slot.name) and need.get("threads", 0) <= len(slot.cpus)
                 and need.get("mem_gb", 0) * 2 ** 30 <= slot.mem and (not need.get("gpu") or slot.gpu))
 
     def eligible(self, req):
@@ -806,16 +874,46 @@ class Executor:
         machine = req.get("need", {}).get("machine")
         return any(machine in (None, m) and self.fits(req, s) for m, s in self.pool)
 
+    def current(self):
+        """Whether this executor may judge that the pool has no slot for a request: it runs its clone's version of
+        this file, and the clone's machines.json is the one on the hub's main (a clone behind does not know newer
+        machines and projects)."""
+        path = os.path.join(ROOT, "machines.json")
+        key = (self.main, os.stat(path).st_mtime_ns)
+        if key != self.current_key:
+            try:
+                ok = bool(self.main) and (self.git("rev-parse", "-q", "--verify", f"{self.main}:machines.json").strip()
+                                          == self.git("hash-object", path).strip())
+            except GitError:
+                ok = False
+            if not ok and self.current_ok is not None:
+                self.log("本机 clone 的 machines.json 和中枢 main 上的不一样（clone 落后？），先不判排不上的请求")
+            self.current_key, self.current_ok = key, ok
+        return self.current_ok and self.file_stamp() == self.stamp
+
+    def blind(self, secs):
+        """The time this executor could not read the hub is not time another machine was silent."""
+        self.seen = {k: (sha, s + secs) for k, (sha, s) in self.seen.items()}
+        self.run_seen = {rid: s + secs for rid, s in self.run_seen.items()}
+        self.dead = {rid: s + secs for rid, s in self.dead.items()}
+        if self.fails:
+            self.log(f"中枢回来了：{minutes(secs)}没读到它，这段时间不算进别的机器没有心跳的时长")
+
     def hub(self):
-        refs = self.ls("refs/q/*", "refs/run/*", "refs/cancel/*", "refs/hb/*")
+        refs = self.ls("refs/q/*", "refs/run/*", "refs/cancel/*", "refs/hb/*", "refs/alive/*", "refs/heads/main")
         q, run, cancel = refs["q"], refs["run"], refs["cancel"]
-        t = self.last_poll = time.time()
-        for m, sha in refs["hb"].items():
-            if self.hb_seen.get(m, (None,))[0] != sha:
-                self.hb_seen[m] = (sha, t)
+        t = time.time()
+        if self.last_poll and t - self.last_poll > 2 * POLL:
+            self.blind(t - self.last_poll - POLL)
+        self.last_poll, self.main = t, refs["heads"].get("main")
+        for kind in ("hb", "alive"):
+            for m, sha in refs[kind].items():
+                if self.seen.get((kind, m), (None,))[0] != sha:
+                    self.seen[(kind, m)] = (sha, t)
         self.run_seen = {rid: self.run_seen.get(rid, t) for rid in run}
         for step in (lambda: self.settle(run), lambda: self.follow(q, cancel), self.reports, lambda: self.reclaim(run),
-                     lambda: self.schedule(q, run, cancel), lambda: self.reap(q, run, cancel), self.sweep_due):
+                     lambda: self.schedule(q, run, cancel), lambda: self.reap(q, run, cancel), self.sweep_due,
+                     lambda: self.alive(t)):
             try:
                 step()
             except GitError as e:
@@ -837,15 +935,37 @@ class Executor:
                 shutil.rmtree(job["rundir"], ignore_errors=True)
 
     def follow(self, q, cancel):
+        """A request whose q ref is gone: cancelled in the queue, judged not well formed, or judged lost. Only a
+        lost conclusion is replaced by the run's own; otherwise the run ends and the conclusion there stays."""
         for rid, job in list(self.jobs.items()):
             if rid in cancel:
                 self.cancel(job)
             elif rid not in q and "keep" not in job:
-                job["keep"] = bool(self.ls(f"refs/done/{rid}")["done"])
+                sha = self.ls(f"refs/done/{rid}")["done"].get(rid)
+                d = self.conclusion(rid, sha) if sha else {}
+                job["keep"] = d.get("reason") == "lost"
                 if job["keep"]:
                     self.log(f"{rid}：中枢上已经有别人写的结论（判它丢了），作业接着跑完，结论到时候替换它")
                 else:
+                    if sha:
+                        self.log(f"{rid}：中枢上已经有结论（{d.get('reason')}，{d.get('code')}），结束它，那个结论不动")
                     self.cancel(job)
+
+    def conclusion(self, rid, sha):
+        if sha not in self.dones:
+            try:
+                text = self.git("cat-file", "blob", sha)
+            except GitError:
+                self.git("fetch", "-q", "--no-tags", "--no-write-fetch-head", "origin", f"+refs/done/{rid}:refs/cf/done/{rid}")
+                text = self.git("cat-file", "blob", sha)
+            try:
+                d = json.loads(text)
+            except ValueError:
+                d = None
+            if len(self.dones) > 1000:
+                self.dones.clear()
+            self.dones[sha] = d if isinstance(d, dict) else {}
+        return self.dones[sha]
 
     def reports(self):
         for job in list(self.unreported.values()):
@@ -860,7 +980,8 @@ class Executor:
                 continue
             try:
                 req, why = self.request(rid, sha)
-                if not why and not self.pool_fits(req) and t - self.unfit.setdefault(rid, t) >= UNFIT:
+                if (not why and not self.pool_fits(req) and t - self.unfit.setdefault(rid, t) >= UNFIT
+                        and self.current()):
                     why = "机器池里没有哪个槽位满足它（项目、机器、槽位、线程、内存、显卡）"
                 if why:
                     self.reject(rid, sha, req, why, cancel)
@@ -968,7 +1089,7 @@ class Executor:
             return
         self.last_reap = t
         self.git("fetch", "-q", "--no-tags", "--no-write-fetch-head", "--prune", "origin", "+refs/run/*:refs/run/*",
-                 "+refs/hb/*:refs/hb/*")
+                 "+refs/hb/*:refs/hb/*", "+refs/alive/*:refs/alive/*")
         beats = {}
         for rid in odd:
             r = self.runs.get(run[rid])
@@ -994,22 +1115,46 @@ class Executor:
         return "认领记录指向本机，本机没有这个作业", 0
 
     def gone(self, rid, m, t, beats):
-        """(why, since when) a run of another machine looks dead; None while it looks alive."""
-        if not isinstance(m, str) or m not in self.conf["machines"]:
-            return f"认领它的机器 {m} 不在 machines.json 里", self.run_seen[rid]
-        since = self.hb_seen.get(m, (None, self.started))[1]
+        """(why, since when) a run of another machine looks dead; None while it looks alive. The machine speaks
+        through its heartbeat and, while that stands still, its executor's own signal; a machine this clone's
+        machines.json does not know is judged the same way."""
+        m = m if isinstance(m, str) else "?"
+        name = m if m in self.conf["machines"] else f"{m}（本机的 machines.json 里没有）"
+        live = [(kind, s) for kind in ("hb", "alive") for sha, s in [self.seen.get((kind, m), (None, 0))] if sha]
+        since = max([s for _, s in live] + [self.run_seen[rid]])
         if t - since >= LOST:
-            return f"认领它的 {m} 已经 {minutes(t - since)}没有心跳", since
-        if m not in beats:
-            try:
-                beats[m] = json.loads(self.git("cat-file", "blob", f"refs/hb/{m}"))
-            except (GitError, ValueError):
-                beats[m] = None
-        ex = beats[m].get("executor") if isinstance(beats[m], dict) else None
-        if isinstance(ex, dict) and (not isinstance(ex.get("jobs"), list) or rid in ex["jobs"]):
-            return None
-        why = f"{m} 的 executor 没在跑" if not isinstance(ex, dict) else f"{m} 的 executor 没在管这个作业"
+            return f"认领它的 {name} 已经 {minutes(t - since)}没有心跳", since
+        running = False
+        for kind, s in live:
+            if t - s >= LOST:
+                continue
+            if (kind, m) not in beats:
+                try:
+                    beats[(kind, m)] = json.loads(self.git("cat-file", "blob", f"refs/{kind}/{m}"))
+                except (GitError, ValueError):
+                    beats[(kind, m)] = None
+            b = beats[(kind, m)]
+            ex = b.get("executor") if kind == "hb" and isinstance(b, dict) else b
+            if isinstance(ex, dict):
+                running = True
+                if not isinstance(ex.get("jobs"), list) or rid in ex["jobs"]:
+                    return None
+        why = f"{name} 的 executor 没在管这个作业" if running else f"{name} 的 executor 没在跑"
         return why, self.dead.setdefault(rid, t)
+
+    def alive(self, t):
+        """While this machine's heartbeat stands still, the executor tells the pool itself what it holds."""
+        held = self.held()
+        if not held or t - self.alive_at < SELF_BEAT:
+            return
+        hb = self.seen.get(("hb", self.machine), (None, self.started))[1]
+        if t - hb < SELF_BEAT:
+            return
+        sha = self.blob({"machine": self.machine, "at": int(t), "pid": os.getpid(), "jobs": held})
+        self.git("push", "-q", "-f", "origin", f"{sha}:refs/alive/{self.machine}")
+        if not self.alive_at or t - self.alive_at > 2 * SELF_BEAT:
+            self.log(f"本机的心跳 {minutes(t - hb)}没动（beat 停了或卡住）：executor 自己推存活信号")
+        self.alive_at = t
 
     def lost(self, rid, r, why, q, run, cancel):
         t = int(time.time())
@@ -1195,12 +1340,20 @@ class Executor:
         self.report(job)
 
     def report(self, job):
+        """The conclusion replaces nothing but a lost one; a conclusion already there otherwise stays."""
         rid, rundir = job["id"], job["rundir"]
         try:
-            refs = self.ls(f"refs/q/{rid}", f"refs/run/{rid}", f"refs/cancel/{rid}")
-            sha = self.blob(jload(os.path.join(rundir, "done.json")))
-            self.git("push", "-q", "--atomic", "origin", f"+{sha}:refs/done/{rid}",
-                     *[f":refs/{kind}/{rid}" for kind in ("q", "run", "cancel") if rid in refs[kind]])
+            refs = self.ls(f"refs/q/{rid}", f"refs/run/{rid}", f"refs/cancel/{rid}", f"refs/done/{rid}")
+            old = refs["done"].get(rid)
+            gone = [f":refs/{kind}/{rid}" for kind in ("q", "run", "cancel") if rid in refs[kind]]
+            if old and self.conclusion(rid, old).get("reason") != "lost":
+                if gone:
+                    self.git("push", "-q", "--atomic", "origin", *gone)
+                self.log(f"{rid}：中枢上已经有结论，留着它，不推自己的")
+            else:
+                sha = self.blob(jload(os.path.join(rundir, "done.json")))
+                self.git("push", "-q", "--atomic", f"--force-with-lease=refs/done/{rid}:{old or ''}", "origin",
+                         f"{sha}:refs/done/{rid}", *gone)
         except GitError as e:
             return self.log(f"{rid}：结论没推上去，下一轮再推（{e}）")
         open(os.path.join(rundir, "reported"), "w").close()
@@ -1259,11 +1412,13 @@ class Executor:
                     end = None
                 self.ends[refs["done"][rid]] = end if num(end, 0, 1e11) else id_time(rid) or 0
         self.ends = {sha: e for sha, e in self.ends.items() if sha in refs["done"].values()}
-        gone = []
+        gone, swept = [], set()
         for rid, sha in refs["done"].items():
             if (own[rid][1] if rid in own else self.ends.get(sha, t)) < old:
                 gone += [f"--force-with-lease=refs/done/{rid}:{sha}", f":refs/done/{rid}"]
-        gone += [f":refs/cancel/{rid}" for rid in refs["cancel"] if rid not in refs["q"] and rid not in refs["run"]]
+                swept.add(rid)
+        gone += [f":refs/cancel/{rid}" for rid in refs["cancel"]
+                 if rid not in refs["q"] and rid not in refs["run"] and (rid not in refs["done"] or rid in swept)]
         for i in range(0, len(gone), 100):
             try:
                 self.git("push", "-q", "origin", *gone[i:i + 100])
