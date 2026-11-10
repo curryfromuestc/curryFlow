@@ -1,0 +1,6 @@
+# The venv next to server.py (~/curry-site/venv; python 3.11 on x86_64, glibc >= 2.28):
+#   /usr/bin/python3.11 -m venv ~/curry-site/venv
+#   ~/curry-site/venv/bin/pip install --require-hashes -r requirements.txt     (any index: the hashes are pypi.org's)
+cryptography==46.0.3 --hash=sha256:a2c0cd47381a3229c403062f764160d57d4d175e022c1df84e168c6251a22eec
+cffi==2.1.1 --hash=sha256:34e261f78cb6ceaaa36f42f2613f4380d94d9c759a9c73c769ee6e0247364632
+pycparser==3.12 --hash=sha256:a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e

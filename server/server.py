@@ -14,17 +14,33 @@ POST /ask {page, title, context, question, history} -> streams the model's answe
      the conversation itself; when it is unreachable the model calls grep/read/ls on the snapshot under code/<project>/.
      Tool calls are streamed as {s}.
      (OpenAI-compatible endpoint; base, key and model come from llm.env next to this file)
+GET  /push/key -> {key}: the VAPID public key a page subscribes with (Web Push; the channel is in push.py)
+POST /push/subscribe {endpoint, keys} -> stores what PushSubscription.toJSON() gave the page; /push/unsubscribe {endpoint}
+POST /push/test {endpoint} -> sends one notification to that subscription
+POST /notify {title, body, url?, tag?} -> sends to every subscription; needs the X-Notify-Key header (notify.key next to
+     this file; nginx forwards /api/notify here like any other path, so only the key separates a local caller)
 """
 import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DATA_DIR = os.path.expanduser("~/curry-site")
+VENV = os.path.join(DATA_DIR, "venv")
+if __name__ == "__main__" and os.access(VENV + "/bin/python", os.X_OK) and sys.prefix != VENV and "CURRY_VENV" not in os.environ:
+    # the unit starts the system python; `cryptography`, which push.py needs, is only in the venv next to this file
+    os.environ["CURRY_VENV"] = "1"
+    os.execv(VENV + "/bin/python", [VENV + "/bin/python"] + sys.argv)
+try:
+    import push
+except Exception as e:  # without the venv everything except notifications still works
+    push, PUSH_ERROR = None, "%s: %s" % (type(e).__name__, e)
+PUSH_PATH = re.compile(r"/(push/[a-z]+|notify|api/notify)/?$")
 STATE = os.path.join(DATA_DIR, "choices.json")
 HISTORY = os.path.join(DATA_DIR, "choices-history.jsonl")
 DOCS = os.path.join(DATA_DIR, "docs")
@@ -334,6 +350,28 @@ class Handler(BaseHTTPRequestHandler):
             self.save_qa(page, {"q": question, "a": "".join(answer), "steps": steps, "model": model})
         return True
 
+    def push_api(self, method):
+        """/push/* and /notify: the notification channel."""
+        if push is None:
+            return self.send_json(503, {"error": "推送模块没起来（" + PUSH_ERROR + "）"})
+        body = {}
+        if method == "POST":
+            length = int(self.headers.get("Content-Length") or 0)
+            if length < 0 or length > 20000:
+                return self.send_json(400, {"error": "bad length"})
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except ValueError:
+                body = None
+            if not isinstance(body, dict):
+                return self.send_json(400, {"error": "bad json"})
+        try:
+            code, obj = push.api(method, self.path, body, self.headers)
+        except Exception as e:  # say what broke instead of dropping the connection
+            push.log("error %s %s: %r" % (method, self.path, e))
+            code, obj = 500, {"error": "%s: %s" % (type(e).__name__, e)}
+        self.send_json(code, obj)
+
     def c_file(self, page):
         return os.path.join(COMMENTS, page.strip("/").replace("/", "__") + ".json")
 
@@ -369,6 +407,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(200, items)
 
     def do_GET(self):
+        if PUSH_PATH.match(self.path):
+            return self.push_api("GET")
         m = C_PAGE.match(self.path)
         if m:
             with lock:
@@ -387,6 +427,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path.rstrip("/") == "/login":
             return self.login()
+        if PUSH_PATH.match(self.path):
+            return self.push_api("POST")
         if self.path.rstrip("/") == "/ask":
             return self.ask_post()
         m = ASK_PAGE.match(self.path)
@@ -442,4 +484,9 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     os.makedirs(DATA_DIR, exist_ok=True)
+    if push is not None:
+        try:
+            push.setup()
+        except Exception as e:  # the other routes must still come up; /push/* will report the same error
+            push.log("setup failed: %r" % e)
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
