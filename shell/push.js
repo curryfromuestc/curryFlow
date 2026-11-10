@@ -23,8 +23,16 @@
   const bytes = (b64u) => Uint8Array.from(atob(b64u.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
   const b64u = (buf) => btoa(String.fromCharCode.apply(null, new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
+  // 出错时抛的 Error 一律带 e.data（服务器的回答，没有就是 {}）
   async function api(method, path, body) {
-    const r = await fetch(path, { method, cache: "no-store", headers: body ? { "Content-Type": "application/json" } : {}, body: body ? JSON.stringify(body) : undefined });
+    let r;
+    try {
+      r = await fetch(path, { method, cache: "no-store", headers: body ? { "Content-Type": "application/json" } : {}, body: body ? JSON.stringify(body) : undefined });
+    } catch (err) {
+      const e = new Error("连不上服务器，检查网络后再试（" + (err && err.message ? err.message : err) + "）");
+      e.data = {};
+      throw e;
+    }
     let d = null;
     try { d = await r.json(); } catch (_) { /* 登录过期时拿到的是登录页 */ }
     if (r.ok && d) return d;
@@ -43,6 +51,21 @@
     return null;
   }
 
+  const subscribe = () => timeout(reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: bytes(key) }), 30000,
+    "浏览器向推送服务登记超时" + (/Android/.test(ua) ? "：Android 的 Chrome 走谷歌推送，手机要能连上谷歌" : ""));
+
+  // 把浏览器手里的订阅交给服务器。推送服务说过它已失效（服务器记着，回 gone）：退订，重新订阅拿新端点，再交一次。
+  // 返回服务器的回答；sub 换成服务器收下的那个。重新订阅失败就抛出，sub 为 null（这台设备此时没有订阅）。
+  async function register() {
+    try { return await api("POST", "/api/push/subscribe", sub.toJSON()); }
+    catch (e) {
+      if (!e.data.gone) throw e;
+      await sub.unsubscribe().catch(() => {}); sub = null;
+      sub = await subscribe();
+      return await api("POST", "/api/push/subscribe", sub.toJSON());
+    }
+  }
+
   async function init() {
     const no = blocked();
     if (no) return paint("no", no[0], no[1]);
@@ -56,8 +79,13 @@
         await sub.unsubscribe(); sub = null;   // 服务器换过密钥，旧订阅已经收不到
       }
       if (!sub) return paint("off");
-      // 每次打开都交一遍：服务器那边丢了也能补上；顺便拿到上次发送的结果
-      const r = await api("POST", "/api/push/subscribe", sub.toJSON());
+      // 每次打开都交一遍：服务器那边丢了也能补上；推送服务注销了的换一个新的；顺便拿到上次发送的结果
+      let r;
+      try { r = await register(); }
+      catch (e) {
+        if (!sub) return paint("off", "这台设备原来的订阅已被推送服务注销，重新订阅没成（" + e.message + "），点“开启通知”再来一次。");
+        throw e;
+      }
       paint("on", r.last && !r.last.ok ? "已开启，但上次没发出去：" + r.last.reason : "");
     } catch (e) { paint("no", "现在查不了通知状态：" + e.message); }
   }
@@ -68,9 +96,8 @@
       // 申请权限必须是点击之后的第一步，iOS 只认用户手势里的申请
       const perm = await Notification.requestPermission();
       if (perm !== "granted") { const no = blocked(); return no ? paint("no", no[0], no[1]) : paint("off", "没有拿到通知权限，再点一次开启并选“允许”。"); }
-      sub = await timeout(reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: bytes(key) }), 30000,
-        "浏览器向推送服务登记超时" + (/Android/.test(ua) ? "：Android 的 Chrome 走谷歌推送，手机要能连上谷歌" : ""));
-      await api("POST", "/api/push/subscribe", sub.toJSON());
+      sub = await subscribe();   // 浏览器已有订阅时给的是那个旧的；它若已失效，register 会换新的
+      await register();
       paint("on", "已开启。点“发一条测试”确认能收到。");
     } catch (e) {
       if (sub) { await sub.unsubscribe().catch(() => {}); sub = null; }
@@ -84,7 +111,7 @@
       const r = await api("POST", "/api/push/test", { endpoint: sub.endpoint });
       paint("on", "已交给" + r.service + "推送（返回 " + r.status + "），几秒内应该弹出来；没弹就看系统里这个应用的通知开关。");
     } catch (e) {
-      if (e.data.removed) { await sub.unsubscribe().catch(() => {}); sub = null; paint("off", "没发出去：" + e.message); }
+      if (e.data && e.data.removed) { await sub.unsubscribe().catch(() => {}); sub = null; paint("off", "没发出去：" + e.message); }
       else paint("on", "没发出去：" + e.message);
     } finally { busy(false); }
   };

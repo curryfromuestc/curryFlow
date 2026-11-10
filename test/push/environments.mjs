@@ -45,7 +45,10 @@ const clear = () => p.ev(`const r = await navigator.serviceWorker.ready; for (co
 for (const [name, data, want] of [["a payload that is not JSON", "纯文本告警", { title: "curryPlan", body: "纯文本告警", tag: "", url: "/" }], ["an empty payload", "", { title: "curryPlan", body: "", tag: "", url: "/" }], ["JSON that is not an object (null)", "null", { title: "curryPlan", body: "", tag: "", url: "/" }],
   ["JSON that is a bare string", JSON.stringify("磁盘满了"), { title: "curryPlan", body: "磁盘满了", tag: "", url: "/" }],
   ["JSON with only a title", JSON.stringify({ title: "只有标题" }), { title: "只有标题", body: "", tag: "", url: "/" }],
-  ["title, body, url, tag", JSON.stringify({ title: "作业完成", body: "rtl-core 通过", url: "/t/p/", tag: "job-1" }), { title: "作业完成", body: "rtl-core 通过", tag: "job-1", url: "/t/p/" }]]) {
+  ["title, body, url, tag", JSON.stringify({ title: "作业完成", body: "rtl-core 通过", url: "/t/p/", tag: "job-1" }), { title: "作业完成", body: "rtl-core 通过", tag: "job-1", url: "/t/p/" }],
+  ["a url on another site (refused: the click opens /)", JSON.stringify({ title: "外链", body: "看这里", url: "https://evil.example/x" }), { title: "外链", body: "看这里\n（附带的链接不是本站地址，已忽略）", tag: "", url: "/" }],
+  ["a protocol-relative url on another site", JSON.stringify({ title: "外链", url: "//evil.example/x" }), { title: "外链", body: "（附带的链接不是本站地址，已忽略）", tag: "", url: "/" }],
+  ["a javascript: url", JSON.stringify({ title: "外链", url: "javascript:alert(1)" }), { title: "外链", body: "（附带的链接不是本站地址，已忽略）", tag: "", url: "/" }]]) {
   await clear();
   await p.send("ServiceWorker.deliverPushMessage", { origin: O, registrationId: reg.registrationId, data });
   const n = await until(async () => { const x = await shown(); return x.length ? x : null; }, 5000, name).catch(() => []);
@@ -56,7 +59,24 @@ for (const [name, data, want] of [["a payload that is not JSON", "纯文本告�
 const swt = (await c.send("Target.getTargets")).targetInfos.find((t) => t.type === "service_worker" && t.url.startsWith(O));
 const { sessionId } = await c.send("Target.attachToTarget", { targetId: swt.targetId, flatten: true });
 const r = await c.send("Runtime.evaluate", { awaitPromise: true, returnByValue: true, expression: `(async () => { const n = (await self.registration.getNotifications())[0]; let res = "handler did not call waitUntil"; const ev = new NotificationEvent("notificationclick", { notification: n }); const w = ev.waitUntil.bind(ev); ev.waitUntil = (pr) => { res = pr.then(() => "opened", (e) => e.message); w(pr); }; self.dispatchEvent(ev); return { handler: await res, left: (await self.registration.getNotifications()).length }; })()` }, sessionId);
-must(r.result.value.left === 0 && /opened|Not allowed to open a window/.test(r.result.value.handler), "notificationclick closes the notification and goes on to open its url", r.result.value);
+must(r.result.value.left === 0 && /opened|focused|Not allowed to (open|focus) a window/.test(r.result.value.handler), "notificationclick closes the notification and goes on to open its url", r.result.value);
+// what the click opens, with openWindow stubbed inside the worker: a url on this site as given, one elsewhere (a
+// notification an older sw.js put up) the home page instead
+const opens = async (url) => (await c.send("Runtime.evaluate", { awaitPromise: true, returnByValue: true, expression: `(async () => {
+  for (const n of await self.registration.getNotifications()) n.close();
+  await self.registration.showNotification("点我", { data: { url: ${JSON.stringify(url)} } });
+  const n = (await self.registration.getNotifications())[0]; let got = null;
+  const ow = self.clients.openWindow, ma = self.clients.matchAll;
+  self.clients.openWindow = (u) => { got = u; return Promise.resolve(null); }; self.clients.matchAll = () => Promise.resolve([]);
+  const ev = new NotificationEvent("notificationclick", { notification: n }); let p = Promise.resolve(); const w = ev.waitUntil.bind(ev); ev.waitUntil = (x) => { p = x; w(x); };
+  self.dispatchEvent(ev); await p.catch(() => null); self.clients.openWindow = ow; self.clients.matchAll = ma; return got; })()` }, sessionId)).result.value;
+for (const [url, want] of [["/t/p/", O + "/t/p/"], ["https://evil.example/x", O + "/"], ["//evil.example/x", O + "/"], ["javascript:alert(1)", O + "/"]])
+  { const got = await opens(url); must(got === want, "a click on a notification with url " + url + " opens " + want.replace(O, ""), got); }
+// Android draws the badge as a one-colour mask, so the colour icon became a white square: no badge
+await clear();
+await p.send("ServiceWorker.deliverPushMessage", { origin: O, registrationId: reg.registrationId, data: JSON.stringify({ title: "徽标" }) });
+const badge = await until(async () => { const x = await p.ev(`const r = await navigator.serviceWorker.ready; return (await r.getNotifications()).map((n) => ({ badge: n.badge, icon: n.icon }))`); return x.length ? x[0] : null; }, 5000, "a notification").catch(() => ({}));
+must(badge.badge === "" && badge.icon === O + "/icon-192.png", "notifications carry the icon and no badge", badge);
 // the site goes away: the shell and a prefetched page still open from the cache
 execSync(`kill ${process.env.NGINX_PID}`); await sleep(500);
 await p.go(O + "/"); await sleep(1500);

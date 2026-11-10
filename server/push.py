@@ -10,7 +10,10 @@ Files, all under ~/curry-site/:
   notify.key      shared secret for POST /notify, made once, mode 600: nginx forwards /api/* from 127.0.0.1
                   as well, so the peer address cannot tell a local caller from one on the internet
   push-subs.json  the subscriptions, mode 600 (an endpoint URL is a capability); one the push service calls gone
-                  (404/410) is dropped, unless it was made in the last ten minutes
+                  (404/410) is dropped, unless it was made in the last ten minutes; one whose stored data is not a
+                  valid subscription (made by an older version, or damaged) is dropped at the next send
+  push-gone.json  the endpoints the push service called gone, as SHA-256 hashes only (never the URL), the newest
+                  GONE_MAX for GONE_DAYS: a page that hands one of them in again is told to make a new subscription
   push.env        optional.  FCM_PROXY_CMD=<command with %h and %p>: its stdin/stdout become the TCP stream to
                   fcm.googleapis.com:443, like ssh's ProxyCommand (TLS still ends at Google).  This server
                   cannot reach Google directly.
@@ -22,6 +25,8 @@ import hmac
 import http.client
 import json
 import os
+import re
+import signal
 import secrets
 import shlex
 import socket
@@ -31,7 +36,7 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
@@ -50,9 +55,13 @@ RS = 4096                             # record size in the aes128gcm header
 MAX_PLAINTEXT = 3993                  # RFC 8291 section 4: 4096 - 86 (header) - 1 (padding delimiter) - 16 (tag)
 TOKEN_LIFE = 12 * 3600                # RFC 8292: "exp" at most 24 hours ahead
 TTL = 86400                           # the push service drops a notification it could not deliver within a day
-TIMEOUT = 10
+TIMEOUT = 10                          # seconds for each network step (connect, TLS, send, response)
+LIMIT = 60                            # seconds for a whole deliver(): what is left after it is reported as 超时
 FRESH = 600                           # a subscription this young is not dropped on 404/410, see send()
 MAX_SUBS = 50
+GONE = os.path.join(DATA_DIR, "push-gone.json")
+GONE_MAX, GONE_DAYS = 1000, 60
+MIN_KEY = 16                          # notify.key shorter than this (an empty file above all) opens /notify to anyone
 FCM_HOST = "fcm.googleapis.com"
 # endpoints are only accepted on these hosts: the server POSTs to whatever a subscription names
 SERVICES = (("web.push.apple.com", "苹果"), (".push.apple.com", "苹果"), (FCM_HOST, "谷歌"),
@@ -132,17 +141,34 @@ def decrypt(body, ua_private, auth_secret):
 # ---- RFC 8292: VAPID ------------------------------------------------------------------------------------------
 
 def _secret_file(name, make):
-    """Reads ~/curry-site/NAME; the first call creates it with mode 600.  Callers hold _lock."""
+    """Reads ~/curry-site/NAME; the first call creates it with mode 600.  Callers hold _lock.  The new content is
+    written to a temporary file that is then linked in place, so NAME never exists half-written (a crash between
+    creating and writing it used to leave an empty notify.key), and an existing NAME is never replaced."""
     path = os.path.join(DATA_DIR, name)
     try:
         with open(path, "rb") as f:
             return f.read()
     except FileNotFoundError:
-        data = make()
-        os.makedirs(DATA_DIR, exist_ok=True)
-        with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as f:
+        pass
+    data = make()
+    os.makedirs(DATA_DIR, exist_ok=True)
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    try:
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
             f.write(data)
-        return data
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.link(tmp, path)
+        except FileExistsError:   # somebody else made it meanwhile: theirs counts
+            with open(path, "rb") as f:
+                return f.read()
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+    return data
 
 
 def vapid_key():
@@ -156,14 +182,21 @@ def vapid_key():
 
 
 def notify_key():
+    """The key /notify wants, or None when notify.key is too short to be one (then /notify refuses everybody)."""
     with _lock:
-        return _secret_file("notify.key", lambda: secrets.token_urlsafe(32).encode() + b"\n").strip()
+        key = _secret_file("notify.key", lambda: secrets.token_urlsafe(32).encode() + b"\n").strip()
+    if len(key) < MIN_KEY:
+        log("notify.key has %d bytes, at least %d are needed: /notify refuses every caller until the file is deleted "
+            "and the service restarted (it then makes a new key)" % (len(key), MIN_KEY))
+        return None
+    return key
 
 
 def setup():
     """Makes the two secrets at service start, so the `notify` command finds its key before the first request."""
     vapid_key()
-    notify_key()
+    if notify_key() is None:
+        raise ValueError("notify.key is shorter than %d bytes" % MIN_KEY)
 
 
 def origin(url):
@@ -215,8 +248,17 @@ def vapid_check(header, endpoint, now=None):
 # ---- subscriptions --------------------------------------------------------------------------------------------
 
 def log(text):
-    with open(LOG, "a", encoding="utf-8") as f:
-        f.write(datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S ") + text + "\n")
+    """Appends one line to push.log.  Never raises: a log that cannot be written (the data directory read-only, the
+    disk full) must not take the request or the service down with it; the line goes to stderr (the journal) instead."""
+    line = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S ") + text
+    try:
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as e:
+        try:
+            print("push.log not writable (%s: %s): %s" % (type(e).__name__, e, line), file=sys.stderr, flush=True)
+        except Exception:
+            pass
 
 
 def service(host):
@@ -255,14 +297,22 @@ def save_subs(subs):
     os.replace(tmp, SUBS)
 
 
+BAD_CHARS = re.compile(r"[\x00-\x20\x7f]")
+
+
 def parse_sub(obj):
-    """Validates what PushSubscription.toJSON() gave the page; returns (endpoint, p256dh, auth) or raises ValueError."""
+    """Validates what PushSubscription.toJSON() gave the page; returns (endpoint, p256dh, auth) or raises ValueError.
+    deliver() puts every stored subscription through it again before sending."""
     endpoint, keys = obj.get("endpoint"), obj.get("keys") or {}
     if not isinstance(endpoint, str) or not 0 < len(endpoint) <= 2000 or not isinstance(keys, dict):
         raise ValueError("订阅格式不对")
     u = urlsplit(endpoint)
     if u.scheme != "https" or u.username or u.port not in (None, 443) or not service(u.hostname):
         raise ValueError("不认识的推送服务：%s" % (u.hostname or endpoint[:40]))
+    # a space or control character in the path or query cannot go on the request line (http.client refuses it with
+    # InvalidURL); no push service issues one, so the subscription is not real.  The text is not echoed back.
+    if BAD_CHARS.search(endpoint) or u.fragment:
+        raise ValueError("订阅的端点地址里有空格、控制字符或 #，不是推送服务给的地址")
     try:
         p256dh, auth = unb64u(keys.get("p256dh") or ""), unb64u(keys.get("auth") or "")
         from_point(p256dh)
@@ -271,6 +321,49 @@ def parse_sub(obj):
     if len(p256dh) != 65 or len(auth) != 16:
         raise ValueError("订阅里的密钥长度不对")
     return endpoint, b64u(p256dh), b64u(auth)
+
+
+def stored(sub):
+    """parse_sub for a subscription as push-subs.json holds it."""
+    if not isinstance(sub, dict):
+        raise ValueError("订阅格式不对")
+    return parse_sub({"endpoint": sub.get("endpoint"), "keys": {"p256dh": sub.get("p256dh"), "auth": sub.get("auth")}})
+
+
+def sub_key(sub):
+    """What identifies a stored subscription, even a damaged one: the hash of its endpoint, else of the whole entry."""
+    if isinstance(sub, dict) and isinstance(sub.get("endpoint"), str):
+        return hashlib.sha256(sub["endpoint"].encode()).hexdigest()
+    return hashlib.sha256(json.dumps(sub, sort_keys=True, default=str).encode()).hexdigest()
+
+
+# ---- endpoints the push service called gone (hashes only) ----------------------------------------------------
+
+def _gone_load(now):
+    try:
+        with open(GONE, encoding="utf-8") as f:
+            gone = json.load(f)
+        gone = {k: v for k, v in gone.items() if isinstance(k, str) and isinstance(v, (int, float)) and now - v < GONE_DAYS * 86400}
+    except (FileNotFoundError, ValueError, AttributeError):
+        gone = {}
+    return gone
+
+
+def gone_add(endpoints):
+    """Remembers endpoints the push service called gone.  Callers hold _lock."""
+    now = time.time()
+    gone = _gone_load(now)
+    for e in endpoints:
+        gone[hashlib.sha256(e.encode()).hexdigest()] = int(now)
+    gone = dict(sorted(gone.items(), key=lambda kv: kv[1])[-GONE_MAX:])
+    tmp = GONE + ".tmp"
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
+        json.dump(gone, f)
+    os.replace(tmp, GONE)
+
+
+def is_gone(endpoint):
+    return hashlib.sha256(endpoint.encode()).hexdigest() in _gone_load(time.time())
 
 
 # ---- sending --------------------------------------------------------------------------------------------------
@@ -349,14 +442,28 @@ class Conn(http.client.HTTPSConnection):
 
     @staticmethod
     def reap(proc):
-        if proc.poll() is None:
-            proc.terminate()
-        try:
-            err = proc.communicate(timeout=3)[1]
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            err = proc.communicate()[1]
-        lines = [x.strip() for x in err.decode("utf-8", "replace").splitlines() if x.strip()]
+        """Stops the command and everything it started (it leads its own session) and returns the end of its stderr.
+        Bounded: a grandchild that keeps stderr open must not hold the request (it used to, for as long as it lived)."""
+        err = b""
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(proc.pid, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                err = proc.communicate(timeout=3)[1]
+                break
+            except subprocess.TimeoutExpired:
+                continue
+            except ValueError:   # the pipe was closed by an earlier communicate that timed out
+                break
+        else:
+            proc.stderr.close()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+        lines = [x.strip() for x in (err or b"").decode("utf-8", "replace").splitlines() if x.strip()]
         return "；".join(lines[-2:])[:300]
 
     def finish(self):
@@ -367,30 +474,90 @@ class Conn(http.client.HTTPSConnection):
         self.procs = []
 
 
-def send(conn, sub, payload):
-    """POSTs one message to one subscription over conn.  Returns the outcome; `fatal` means the service was not reached."""
-    u = urlsplit(sub["endpoint"])
+def scrub(text, endpoint):
+    """An error text with the endpoint (or any piece of its path and query) taken out: it goes into the reason, which
+    the page shows and push-subs.json keeps, and into push.log."""
+    u = urlsplit(endpoint)
+    for piece in sorted({endpoint, u.path, u.query} | set(u.path.split("/")) - {"", "/", "fcm", "send", "wpush", "v2"}, key=len, reverse=True):
+        if len(piece) >= 4:
+            text = text.replace(piece, "…")
+    return " ".join(text.split())[:200]
+
+
+def damaged(sub, error):
+    """The outcome for a stored subscription that is not one (see stored()): it is reported and dropped."""
+    return {"id": sub_key(sub)[:8], "service": None, "device": device(sub.get("ua") if isinstance(sub, dict) else None),
+            "ok": False, "status": None, "removed": True,
+            "reason": "服务器上存的这个订阅不能用（%s），已删除；那台设备下次打开 curryPlan 时会重新登记" % error}
+
+
+def late(sub, why=None):
+    """The outcome for a subscription deliver() did not get to within LIMIT."""
+    endpoint = sub["endpoint"]
+    return {"id": sub_key(sub)[:8], "service": service(urlsplit(endpoint).hostname), "device": device(sub.get("ua")),
+            "ok": False, "status": None, "removed": False,
+            "reason": why or "超时：这次发送限时 %d 秒，到时还没轮到它（没有发出）" % LIMIT}
+
+
+def send(conn, sub, payload, deadline=None):
+    """POSTs one message to one subscription over conn.  Returns the outcome and never raises: whatever goes wrong
+    with one subscription is reported for that subscription alone.  Only a failure to connect (TCP, the forwarding
+    command, TLS) is about the push service as a whole; that outcome carries `fatal`, and deliver() gives the same
+    answer to the rest of the subscriptions on that service.  A connection the service closed before answering
+    (a kept-alive connection it had dropped) is opened again once."""
+    deadline = deadline or time.monotonic() + LIMIT
+    try:
+        endpoint, p256dh, auth = stored(sub)
+    except ValueError as e:
+        return damaged(sub, e)
+    u = urlsplit(endpoint)
     label = service(u.hostname)
-    out = {"id": sub_id(sub["endpoint"]), "service": label, "device": device(sub.get("ua")), "ok": False, "status": None,
+    out = {"id": sub_key(sub)[:8], "service": label, "device": device(sub.get("ua")), "ok": False, "status": None,
            "reason": "", "removed": False}
     try:
-        conn.request("POST", u.path + ("?" + u.query if u.query else ""),
-                     encrypt(payload, unb64u(sub["p256dh"]), unb64u(sub["auth"])),
-                     {"TTL": str(TTL), "Urgency": "high", "Content-Encoding": "aes128gcm",
-                      "Content-Type": "application/octet-stream", "Authorization": vapid_header(sub["endpoint"])})
-        r = conn.getresponse()
-        text = " ".join(r.read().decode("utf-8", "replace").split())[:300]
-    except TunnelError as e:
+        body = encrypt(payload, unb64u(p256dh), unb64u(auth))
+        headers = {"TTL": str(TTL), "Urgency": "high", "Content-Encoding": "aes128gcm",
+                   "Content-Type": "application/octet-stream", "Authorization": vapid_header(endpoint)}
+        target = u.path + ("?" + u.query if u.query else "")
+        for attempt in (1, 2):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return late(sub)
+            conn.timeout = min(TIMEOUT, left)
+            if conn.sock is None:
+                try:
+                    conn.connect()
+                except TunnelError as e:
+                    conn.close()
+                    out.update(reason="服务器连不上%s推送：到 %s 的转发起不来（%s）" % (label, u.hostname, e), fatal=True)
+                    return out
+                except ssl.SSLCertVerificationError as e:
+                    conn.close()
+                    out.update(reason="%s 的 TLS 证书校验没过（%s）" % (u.hostname, e.verify_message or e), fatal=True)
+                    return out
+                except (OSError, http.client.HTTPException) as e:
+                    conn.close()
+                    out.update(reason="服务器连不上%s推送（%s：%s）" % (label, u.hostname, str(e) or type(e).__name__), fatal=True)
+                    return out
+            else:
+                conn.sock.settimeout(conn.timeout)
+            try:
+                conn.request("POST", target, body, headers)
+                r = conn.getresponse()
+                text = " ".join(r.read().decode("utf-8", "replace").split())[:300]
+                break
+            except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError, ssl.SSLEOFError, ssl.SSLZeroReturnError) as e:
+                conn.close()
+                if attempt == 2:
+                    out["reason"] = "%s推送没有回应就断开了连接，重连再发一次还是这样（%s）" % (label, type(e).__name__)
+                    return out
+            except socket.timeout:
+                conn.close()
+                out["reason"] = "超时：%s推送 %d 秒没有回应" % (label, round(conn.timeout))
+                return out
+    except Exception as e:   # anything else is about this subscription only
         conn.close()
-        out.update(reason="服务器连不上%s推送：到 %s 的转发起不来（%s）" % (label, u.hostname, e), fatal=True)
-        return out
-    except ssl.SSLCertVerificationError as e:
-        conn.close()
-        out.update(reason="%s 的 TLS 证书校验没过（%s）" % (u.hostname, e.verify_message or e), fatal=True)
-        return out
-    except (OSError, http.client.HTTPException) as e:
-        conn.close()
-        out.update(reason="服务器连不上%s推送（%s：%s）" % (label, u.hostname, str(e) or type(e).__name__), fatal=True)
+        out["reason"] = "发给这个订阅时出错（%s：%s）" % (type(e).__name__, scrub(str(e), endpoint))
         return out
     out["status"] = r.status
     if 200 <= r.status < 300:
@@ -401,60 +568,96 @@ def send(conn, sub, payload):
         # would be silent, keeping a dead subscription for ten minutes costs nothing.
         try:
             age = time.time() - datetime.strptime(sub["at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=CST).timestamp()
-        except (KeyError, ValueError):
+        except (KeyError, ValueError, TypeError):
             age = FRESH
         if age < FRESH:
             out["reason"] = "%s推送不认这个订阅（%d：%s），但它是 %d 秒前刚建的，先留着：过几秒再发一次，一直这样就关闭通知再开启" % (
-                label, r.status, text, age)
+                label, r.status, scrub(text, endpoint), age)
         else:
-            out.update(removed=True, reason="订阅已失效，已删除（%s推送返回 %d：%s）" % (label, r.status, text))
+            out.update(removed=True, gone=True, reason="订阅已失效，已删除（%s推送返回 %d：%s）" % (label, r.status, scrub(text, endpoint)))
     else:
-        out["reason"] = "%s推送拒绝了（%d：%s）" % (label, r.status, text)
+        out["reason"] = "%s推送拒绝了（%d：%s）" % (label, r.status, scrub(text, endpoint))
     return out
 
 
 def deliver(subs, payload, what):
-    """Sends payload to subs: one connection per push service, the services in parallel.  Records each outcome in
-    the log and in the subscription file (dead subscriptions are dropped) and returns the outcomes."""
-    groups = {}
-    for sub in subs:
-        groups.setdefault(urlsplit(sub["endpoint"]).hostname, []).append(sub)
-
-    def one_service(item):
-        host, members = item
-        conn = Conn(host, env().get("FCM_PROXY_CMD") if host == FCM_HOST else None)
-        outs, dead = [], None
+    """Sends payload to subs: one connection per push service, the services in parallel, LIMIT seconds in all.
+    Records each outcome in the log and in the subscription file (dead and damaged subscriptions are dropped, the
+    dead ones remembered in push-gone.json) and returns the outcomes, one per subscription, in the order given."""
+    deadline = time.monotonic() + LIMIT
+    found, groups = {}, {}            # index in subs -> outcome; host -> [(index, sub)]
+    for i, sub in enumerate(subs):
         try:
-            for sub in members:
+            groups.setdefault(urlsplit(stored(sub)[0]).hostname, []).append((i, sub))
+        except ValueError as e:
+            found[i] = damaged(sub, e)
+    plock, closed = threading.Lock(), threading.Event()
+
+    def one_service(host, members):
+        conn = Conn(host, env().get("FCM_PROXY_CMD") if host == FCM_HOST else None)
+        dead = None
+        try:
+            for i, sub in members:
                 # once the service itself is unreachable the rest get the same answer without another wait
-                out = dict(dead, id=sub_id(sub["endpoint"]), device=device(sub.get("ua"))) if dead else send(conn, sub, payload)
+                out = dict(dead, id=sub_key(sub)[:8], device=device(sub.get("ua"))) if dead else send(conn, sub, payload, deadline)
                 dead = out if out.get("fatal") else dead
-                outs.append(out)
+                with plock:
+                    if closed.is_set():   # deliver() has given up waiting and reported the rest as late
+                        return
+                    found[i] = out
         finally:
             conn.finish()
-        return outs
 
-    outs = []
     if groups:
-        with ThreadPoolExecutor(max_workers=len(groups)) as pool:
-            for part in pool.map(one_service, groups.items()):
-                outs += part
+        pool = ThreadPoolExecutor(max_workers=len(groups))
+        futures = {pool.submit(one_service, host, members): members for host, members in groups.items()}
+        # each network step is bounded by what is left of LIMIT; the two seconds are for the step under way
+        wait(futures, timeout=max(0, deadline - time.monotonic()) + 2)
+        pool.shutdown(wait=False)     # a worker still running finishes on its own; its outcomes are no longer read
+        with plock:
+            closed.set()
+            for future, members in futures.items():
+                failed = future.done() and future.exception()
+                for i, sub in members:
+                    if i not in found:
+                        found[i] = late(sub, failed and "没有发出：%s推送的发送线程出错（%s：%s）" % (
+                            service(urlsplit(sub["endpoint"]).hostname), type(failed).__name__, scrub(str(failed), sub["endpoint"])))
+    outs = [found[i] for i in range(len(subs))]
+    keys = [sub_key(s) for s in subs]
     at = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
-    by_id = {o["id"]: o for o in outs}
+    by_key = dict(zip(keys, outs))
     with _lock:
         kept = []
         for sub in load_subs():
-            o = by_id.get(sub_id(sub["endpoint"]))
-            if o:
+            o = by_key.get(sub_key(sub))
+            if o and isinstance(sub, dict):
                 sub["last"] = {"at": at, "ok": o["ok"], "reason": o["reason"]}
             if not (o and o["removed"]):
                 kept.append(sub)
         save_subs(kept)
+        dead = [s["endpoint"] for s, o in zip(subs, outs) if o.get("gone")]
+        if dead:
+            try:
+                gone_add(dead)
+            except OSError as e:
+                log("push-gone.json not written: %r" % e)
         for o in outs:
             o.pop("fatal", None)
-            log("%s id=%s %s %s status=%s %s" % (what, o["id"], o["service"], o["device"], o["status"],
+            o.pop("gone", None)
+            log("%s id=%s %s %s status=%s %s" % (what, o["id"], o["service"] or "?", o["device"], o["status"],
                                                  "ok" if o["ok"] else "FAILED " + o["reason"]))
     return outs
+
+
+def on_site(url):
+    """A path on this site, or an absolute URL whose origin is SITE.  No backslash (browsers read "/\\x" as "//x"), no
+    space or control character, no "//" at the start (a URL on another host)."""
+    if not isinstance(url, str) or not 0 < len(url) <= 500 or "\\" in url or BAD_CHARS.search(url):
+        return False
+    if url.startswith("/"):
+        return not url.startswith("//")
+    u = urlsplit(url)
+    return u.scheme == "https" and not u.username and not u.password and "%s://%s" % (u.scheme, u.netloc.lower()) == SITE
 
 
 def message(title, body="", url=None, tag=None):
@@ -463,9 +666,8 @@ def message(title, body="", url=None, tag=None):
         raise ValueError("title 要 1 到 200 个字")
     if not isinstance(body, str):
         raise ValueError("body 要是字符串")
-    if url is not None and not (isinstance(url, str) and len(url) <= 500 and
-                                (url.startswith(("https://", "http://")) or (url.startswith("/") and not url.startswith("//")))):
-        raise ValueError("url 要是 / 开头的站内路径或 http(s) 地址，最长 500")
+    if url is not None and not on_site(url):
+        raise ValueError("url 只能是本站的地址：/ 开头的路径，或 %s 开头，最长 500（点通知会打开它，外站地址不收）" % (SITE + "/"))
     if tag is not None and not (isinstance(tag, str) and 0 < len(tag) <= 64):
         raise ValueError("tag 要是 1 到 64 个字的字符串")
     msg = {"title": title.strip(), "body": body, "url": url or "/"}
@@ -499,8 +701,13 @@ def api(method, path, body, headers):
             return 400, {"error": str(e)}
         ua = str(headers.get("User-Agent") or "")[:200]
         with _lock:
+            if is_gone(endpoint):
+                # the push service said this subscription is gone; the browser still holds it and hands it in on every
+                # visit.  Taking it would read "已开启" on a device that receives nothing; the page makes a new one.
+                log("subscribe id=%s %s %s refused: the push service called it gone" % (sub_id(endpoint), service(urlsplit(endpoint).hostname), device(ua)))
+                return 410, {"error": "这个订阅已被推送服务注销，要重新订阅", "gone": True}
             subs = load_subs()
-            old = next((s for s in subs if s["endpoint"] == endpoint), None)
+            old = next((s for s in subs if isinstance(s, dict) and s.get("endpoint") == endpoint), None)
             if old is None and len(subs) >= MAX_SUBS:
                 return 400, {"error": "订阅已经有 %d 个，先关掉不用的" % MAX_SUBS}
             new = dict(old or {"at": datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")}, endpoint=endpoint, p256dh=p256dh, auth=auth, ua=ua)
@@ -513,15 +720,15 @@ def api(method, path, body, headers):
         endpoint = body.get("endpoint")
         with _lock:
             subs = load_subs()
-            kept = [s for s in subs if s["endpoint"] != endpoint]
+            kept = [s for s in subs if not (isinstance(s, dict) and s.get("endpoint") == endpoint)]
             if len(kept) != len(subs):
                 save_subs(kept)
-                log("unsubscribe id=%s" % sub_id(endpoint))
+                log("unsubscribe id=%s" % sub_id(str(endpoint)))
         return 200, {"ok": True, "removed": len(kept) != len(subs)}
 
     if path == "/push/test":
         with _lock:
-            sub = next((s for s in load_subs() if s["endpoint"] == body.get("endpoint")), None)
+            sub = next((s for s in load_subs() if isinstance(s, dict) and s.get("endpoint") == body.get("endpoint")), None)
         if sub is None:
             return 404, {"ok": False, "error": "服务器上没有这个订阅，重新开启一次", "removed": True}
         payload, _ = message("curryPlan 测试通知", "通道是通的 · " + datetime.now(CST).strftime("%H:%M:%S"), "/", "push-test")
@@ -531,7 +738,10 @@ def api(method, path, body, headers):
         return 502, dict(out, error=out["reason"])
 
     if path in ("/notify", "/api/notify"):
-        if not hmac.compare_digest(str(headers.get("X-Notify-Key") or "").encode(), notify_key()):
+        key = notify_key()
+        if key is None:
+            return 503, {"error": "notify.key 不到 %d 字节，/notify 谁都不收：删掉 ~/curry-site/notify.key 再重启 curry-choices 服务，会生成新的" % MIN_KEY}
+        if not hmac.compare_digest(str(headers.get("X-Notify-Key") or "").encode(), key):
             return 403, {"error": "notify 只给服务器本机用：要带 ~/curry-site/notify.key 里的密钥（用 ~/curry-site/notify 发）"}
         try:
             payload, truncated = message(body.get("title"), body.get("body") or "", body.get("url"), body.get("tag"))

@@ -2,7 +2,7 @@
 // send with the notify command, reload, turn off.  env: SITE, DATA (the server's ~/curry-site), HOME_FOR_NOTIFY.
 import { connect, sleep, until, must } from "./cdp.mjs";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, rmSync } from "node:fs";
 const O = process.env.SITE, DATA = process.env.DATA;
 const subs = () => { try { return JSON.parse(readFileSync(DATA + "/push-subs.json", "utf8")); } catch (_) { return []; } };
 const c = await connect(9333);
@@ -37,6 +37,40 @@ n = await until(async () => { const x = await shown(); return x.some((k) => k.ta
 must(n.some((k) => k.title === "box-b 磁盘 97%" && k.body === "/data 只剩 12 GB，rtlsim 回归可能写不下" && k.url === "/t/p/"), "its title, body, url and tag arrive intact", n);
 await p.go(O + "/"); await until(async () => (await ui()).state !== "wait", 15000, "the switch settles");
 must((await ui()).state === "on" && subs().length === 1, "after a reload the switch still reads 已开启");
+
+// the network fails under 发一条测试: the panel must say so, not stay at 发送中…
+await p.ev(`window.__fetch = window.fetch; window.fetch = (u, o) => String(u).includes("/api/push/test") ? Promise.reject(new TypeError("Failed to fetch")) : window.__fetch(u, o)`);
+await click("test");
+u = await until(async () => { const x = await ui(); return x.msg !== "发送中…" ? x : null; }, 5000, "the test send to fail").catch(() => ui());
+must(u.state === "on" && u.msg.startsWith("没发出去：连不上服务器") && await p.ev(`return !document.querySelector('#push [data-a="test"]').disabled`),
+  "发一条测试 with the network down: says so, buttons usable again", u.msg);
+await p.ev(`window.fetch = window.__fetch`);
+
+// the push service calls the subscription gone (the stand-in answers 410 for it): the server drops it and remembers it;
+// the next visit hands the old one in, is told it is gone, and the page makes a new subscription
+const endpoint = () => p.ev(`const r = await navigator.serviceWorker.ready; const s = await r.pushManager.getSubscription(); return s && s.endpoint`);
+const before = await endpoint();
+const env = readFileSync(DATA + "/push.env", "utf8");
+writeFileSync(DATA + "/push.env", `FCM_PROXY_CMD=python3 ${process.cwd()}/relay.py ${process.env.FAKE_PORT}\n`);
+writeFileSync(process.env.FAKE + "/mode", "gone");
+writeFileSync(DATA + "/push-subs.json", JSON.stringify(subs().map((x) => ({ ...x, at: "2026-01-01 00:00:00" }))));
+const g = spawnSync(DATA + "/notify", ["失效测试"], { env: { ...process.env, HOME: process.env.HOME_FOR_NOTIFY }, encoding: "utf8" });
+writeFileSync(DATA + "/push.env", env); rmSync(process.env.FAKE + "/mode");
+must(g.status === 1 && g.stderr.includes("订阅已失效，已删除") && subs().length === 0, "410 for the browser's subscription: the server drops it", g.stderr.trim().split("：").slice(-2).join("："));
+await p.go(O + "/"); await until(async () => (await ui()).state !== "wait", 40000, "the switch settles");
+u = await ui();
+const after = await endpoint(), held = subs();
+must(u.state === "on" && after && after !== before && held.length === 1 && held[0].endpoint === after,
+  "the next visit: the page made a new subscription, the server holds that one, the switch reads 已开启", { state: u.state, msg: u.msg, renewed: !!after && after !== before, server: held.length, same: !!held[0] && held[0].endpoint === after });
+const shot = async (what) => {
+  await click("test");
+  let x = await until(async () => { const y = await ui(); return y.msg.startsWith("已交给") || y.msg.startsWith("没发出去") ? y : null; }, 45000, what);
+  if (x.msg.includes("刚建的")) { console.log("note  " + x.msg); await sleep(3000); await click("test"); await sleep(300);
+    x = await until(async () => { const y = await ui(); return y.msg.startsWith("已交给") || y.msg.startsWith("没发出去") ? y : null; }, 45000, what + " (again)"); }
+  return x;
+};
+u = await shot("the test send on the new subscription");
+must(u.msg.startsWith("已交给"), "发一条测试 on the new subscription: the push service took it", u.msg);
 await p.ev(`document.getElementById("bell").click()`);
 await click("off");
 u = await until(async () => { const x = await ui(); return x.state === "off" ? x : null; }, 20000, "turning off");

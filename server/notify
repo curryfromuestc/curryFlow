@@ -39,7 +39,8 @@ def main(argv):
     req = urllib.request.Request(URL, data=json.dumps(msg).encode(), headers={"Content-Type": "application/json", "X-Notify-Key": key})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # always the local service, never a proxy
     try:
-        with opener.open(req, timeout=120) as r:
+        # the service gives up on the push services after 60 s (push.LIMIT) and answers; 90 s leaves room for that
+        with opener.open(req, timeout=90) as r:
             res = json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         try:
