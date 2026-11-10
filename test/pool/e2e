@@ -1,0 +1,1002 @@
+#!/usr/bin/env python3
+"""End-to-end test of the machine pool (templates/pool executor, flow, beat) on this machine.
+
+usage: test/pool/e2e --work DIR [--pool DIR] [--only NAME,...] [--baseline]
+       test/pool/e2e --work DIR --measure SECONDS [--pool DIR] [--baseline]
+
+A local bare repository is the hub (machines.git), another one the project hub (demo). Two fake machines run an
+executor each in a HOME of their own under DIR: t1 with bare slots a0 and a1, t2 with b0, on the last six CPUs of
+this machine; a loop runs beat for each. The intervals of executor and flow are shortened through CF_POOL_TUNE.
+Hooks of the two hubs and a git wrapper on PATH delay or refuse pushes, slow a fetch down, fail one machine's
+reads of the hub and record what the preparation of a job saw (CPU affinity, ssh command, signals); marker files in
+DIR/marks switch them on.
+
+Every case sets up a situation, says what should happen and records what did. DIR/results.tsv has one row per case
+(name, situation, expected, actual, PASS/FAIL); the last line of the output is RESULT. Exit 0 when every case passes.
+--baseline runs an older executor and flow from --pool: it adds the line that reads CF_POOL_TUNE to them.
+--measure counts, per fake machine, the hub operations of executor and beat in SECONDS with the real intervals:
+first idle, then with one long job on each machine (DIR/ops.tsv).
+"""
+import argparse
+import json
+import os
+import random
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+REPO = os.path.dirname(os.path.dirname(HERE))
+GIT = shutil.which("git")
+PY = sys.executable
+TUNE = {"TICK": 0.5, "POLL": 1.5, "POLL_MAX": 6, "SWEEP": 8, "REAP": 2, "LOST": 12, "RUN_GRACE": 2, "UNFIT": 6,
+        "TOUCH": 1, "ALIVE": 6, "SPAWN": 5, "CANCEL_KILL": 10, "TMP_KEEP": 4, "LOG_MAX": 262144, "LOG_HEAD": 16384,
+        "EXEC_LOG_MAX": 8192, "GIT_TIMEOUT": 5, "BUSY_MAX": 2, "WINDOW": 5, "MIN_WINDOW": 1, "BURST": 2, "QUIET": 0,
+        "HEARTBEAT": 2, "HB_LOST": 15, "WAIT_STEP": 1, "HB_CHECK": 3}
+INJECT = '    globals().update(json.loads(os.environ.get("CF_POOL_TUNE") or "{}"))\n'
+ENV = {"GIT_AUTHOR_NAME": "e2e", "GIT_AUTHOR_EMAIL": "e2e@localhost", "GIT_COMMITTER_NAME": "e2e",
+       "GIT_COMMITTER_EMAIL": "e2e@localhost"}
+
+
+class Fail(Exception):
+    pass
+
+
+def sh(*cmd, cwd=None, env=None, input=None, check=True, timeout=120):
+    r = subprocess.run(cmd, cwd=cwd, env=env, input=input, capture_output=True, text=True, timeout=timeout)
+    if check and r.returncode:
+        raise Fail(f"{' '.join(cmd)}: {r.returncode} {r.stderr.strip()[-300:]}")
+    return r.stdout.strip()
+
+
+def put(path, text, mode=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(text)
+    if mode:
+        os.chmod(path, mode)
+
+
+def lines(path):
+    try:
+        with open(path) as f:
+            return [x for x in f.read().splitlines() if x]
+    except OSError:
+        return []
+
+
+def until(fn, secs, step=0.5):
+    t = time.time() + secs
+    while True:
+        v = fn()
+        if v or time.time() > t:
+            return v
+        time.sleep(step)
+
+
+class Rig:
+    def __init__(self, work, pool, baseline, tune):
+        self.w, self.pool, self.baseline, self.tune = work, pool, baseline, tune
+        self.marks = os.path.join(work, "marks")
+        self.out = os.path.join(work, "out")
+        self.procs = {}
+        self.n = random.randrange(1 << 12)
+        top = os.cpu_count()
+        c = lambda i: f"{top - 6 + i}-{top - 5 + i}"
+        self.cpus = {"a0": c(0), "a1": c(2), "b0": c(4)}
+        self.homes = {m: os.path.join(work, "h" + m[1]) for m in ("t1", "t2")}
+
+    # -- the rig --------------------------------------------------------------------------------------
+
+    def clone(self, m):
+        return os.path.join(self.homes[m], "curryflow", "machines")
+
+    def slotdir(self, m, slot):
+        return os.path.join(self.homes[m], "curryflow", "slots", slot)
+
+    def rundir(self, rid):
+        for m, slots in (("t1", ("a0", "a1")), ("t2", ("b0",))):
+            for s in slots:
+                d = os.path.join(self.slotdir(m, s), ".cf", rid)
+                if os.path.isdir(d):
+                    return d
+        return None
+
+    def env(self, m, **kw):
+        e = {k: v for k, v in os.environ.items() if not k.startswith("CF_")}
+        e.update(ENV, HOME=self.homes[m], PATH=os.path.join(self.w, "bin") + ":" + os.environ["PATH"],
+                 CF_POOL_TUNE=json.dumps(self.tune), CF_WHO="e2e")
+        e.update(kw)
+        return e
+
+    def hub(self, *args, input=None, check=True):
+        return sh(GIT, "--git-dir", os.path.join(self.w, "hub.git"), *args, input=input, check=check)
+
+    def proj(self, *args, check=True):
+        return sh(GIT, "--git-dir", os.path.join(self.w, "proj.git"), *args, check=check)
+
+    def setup(self):
+        shutil.rmtree(self.w, ignore_errors=True)
+        for d in (self.marks, self.out, os.path.join(self.w, "bin")):
+            os.makedirs(d)
+        w, mk = self.w, self.marks
+        put(f"{w}/bin/git", f"""#!/bin/sh
+case " $* " in *" {w}/proj.git"*|*"{w}/proj.git "*)
+  case " $* " in *" fetch "*)
+    if [ -e {mk}/cpus ]; then grep Cpus_allowed_list /proc/$$/status > {mk}/fetch.cpus; printf '%s\\n' "$GIT_SSH_COMMAND" > {mk}/fetch.ssh; fi
+    if [ -e {mk}/slowfetch ]; then
+      rm -f {mk}/slowfetch; echo $$ > {mk}/fetch.pid
+      trap 'echo TERM >> {mk}/fetch.sig; kill $! 2>/dev/null; exit 143' TERM
+      sleep 40 & wait; exit 1
+    fi;;
+  esac;;
+esac
+exec {GIT} "$@"
+""", 0o755)
+        for m in ("t1", "t2"):
+            put(f"{w}/bin/up-{m}", f"""#!/bin/sh
+echo "$(date +%s.%N) {m} read" >> {w}/ops.log
+[ -e {mk}/lsfail-{m} ] && {{ echo "e2e: no hub for {m}" >&2; exit 1; }}
+exec {GIT} upload-pack "$@"
+""", 0o755)
+            put(f"{w}/bin/rp-{m}", f"""#!/bin/sh
+echo "$(date +%s.%N) {m} push" >> {w}/ops.log
+exec {GIT} receive-pack "$@"
+""", 0o755)
+        sh(GIT, "init", "-q", "-b", "main", "--bare", f"{w}/hub.git")
+        sh(GIT, "--git-dir", f"{w}/hub.git", "config", "receive.keepAlive", "0")
+        put(f"{w}/hub.git/hooks/pre-receive", f"""#!/bin/sh
+while read old new ref; do
+  if [ -e {mk}/delay-run ] && [ "$ref" = "refs/run/$(cat {mk}/delay-run)" ]; then
+    rm -f {mk}/delay-run; [ -e {mk}/delay-lsfail ] && touch {mk}/lsfail-t1
+    sleep $(cat {mk}/delay-secs); rm -f {mk}/lsfail-t1
+  fi
+  case "$ref" in refs/q/*)
+    [ -e {mk}/reject-q ] && {{ echo "e2e: q refused" >&2; exit 1; }}
+    [ -e {mk}/slow-q ] && {{ sleep 20; exit 1; }};;
+  esac
+done
+exit 0
+""", 0o755)
+        put(f"{w}/hub.git/hooks/reference-transaction", f"""#!/bin/sh
+[ "$1" = committed ] || exit 0
+while read old new ref; do echo "$(date +%s.%N) $ref $new" >> {w}/reflog.txt; done
+""", 0o755)
+        sh(GIT, "init", "-q", "-b", "main", "--bare", f"{w}/proj.git")
+        put(f"{w}/proj.git/hooks/pre-receive", f"""#!/bin/sh
+while read old new ref; do
+  case "$ref" in refs/cf/tmp/*) [ "$new" = 0000000000000000000000000000000000000000 ] && [ -e {mk}/keep-tmp ] && exit 1;; esac
+done
+exit 0
+""", 0o755)
+        pw = f"{w}/projwork"
+        sh(GIT, "clone", "-q", f"{w}/proj.git", pw)
+        put(f"{pw}/README", "demo\n")
+        put(f"{pw}/.gitignore", ".build/\n")
+        sh(GIT, "-C", pw, "add", "-A", env={**os.environ, **ENV})
+        sh(GIT, "-C", pw, "commit", "-qm", "demo", env={**os.environ, **ENV})
+        sh(GIT, "-C", pw, "push", "-q", "origin", "HEAD:refs/heads/main")
+        self.main = sh(GIT, "-C", pw, "rev-parse", "HEAD")
+        conf = {"hub": f"{w}/hub.git", "projects": {"demo": {"hub": f"{w}/proj.git"}}, "machines": {
+            "t1": {"executor": True, "shared": False, "slots": {"a0": {"cpus": self.cpus["a0"], "mem": "4GiB"},
+                                                                "a1": {"cpus": self.cpus["a1"], "mem": "4GiB"}}},
+            "t2": {"executor": True, "shared": False, "slots": {"b0": {"cpus": self.cpus["b0"], "mem": "4GiB"}}}}}
+        seed = f"{w}/seed"
+        sh(GIT, "clone", "-q", f"{w}/hub.git", seed)
+        put(f"{seed}/machines.json", json.dumps(conf, indent=1))
+        for name in ("executor", "flow", "beat", "status"):
+            with open(os.path.join(self.pool, name)) as f:
+                text = f.read()
+            if self.baseline and name in ("executor", "flow") and INJECT not in text:
+                text = text.replace("def main():\n", "def main():\n" + INJECT, 1)
+            put(f"{seed}/{name}", text, 0o755)
+        sh(GIT, "-C", seed, "add", "-A", env={**os.environ, **ENV})
+        sh(GIT, "-C", seed, "commit", "-qm", "pool", env={**os.environ, **ENV})
+        sh(GIT, "-C", seed, "push", "-q", "origin", "HEAD:refs/heads/main")
+        for m in ("t1", "t2"):
+            os.makedirs(self.homes[m])
+            sh(GIT, "clone", "-q", f"{w}/hub.git", self.clone(m))
+            sh(GIT, "-C", self.clone(m), "config", "remote.origin.uploadpack", f"{w}/bin/up-{m}")
+            sh(GIT, "-C", self.clone(m), "config", "remote.origin.receivepack", f"{w}/bin/rp-{m}")
+
+    def start(self, m):
+        self.procs[m] = subprocess.Popen([PY, "executor", "run", "--machine", m], cwd=self.clone(m), env=self.env(m),
+                                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def stop(self, m, sig=signal.SIGKILL):
+        p = self.procs.pop(m, None)
+        if p and p.poll() is None:
+            p.send_signal(sig)
+            p.wait()
+
+    def beat_on(self, m, every=1):
+        self.procs["beat-" + m] = subprocess.Popen(
+            ["sh", "-c", f"while :; do {PY} beat --machine {m}; sleep {every}; done"], cwd=self.clone(m), env=self.env(m),
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+    def beat_off(self, m):
+        p = self.procs.pop("beat-" + m, None)
+        if p and p.poll() is None:
+            os.killpg(p.pid, signal.SIGKILL)
+            p.wait()
+
+    def shutdown(self):
+        for name in list(self.procs):
+            if name.startswith("beat-"):
+                self.beat_off(name[5:])
+            else:
+                self.stop(name)
+
+    def exec_log(self, m):
+        return os.path.join(self.homes[m], "curryflow", "exec", m, "executor.log")
+
+    def flow(self, *args, m="t1", cwd=None, timeout=180, **env):
+        r = subprocess.run([PY, os.path.join(self.clone(m), "flow"), *args], cwd=cwd or self.w, env=self.env(m, **env),
+                           capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout + r.stderr).strip()
+
+    def flow_bg(self, *args, m="t1", cwd=None, **env):
+        return subprocess.Popen([PY, os.path.join(self.clone(m), "flow"), *args], cwd=cwd or self.w, env=self.env(m, **env),
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+
+    def submit(self, *args, **kw):
+        rc, out = self.flow("run", "--project", "demo", "--no-wait", *args, **kw)
+        if rc:
+            raise Fail(f"flow run: {out[-300:]}")
+        return out.splitlines()[-1].strip()
+
+    def rid(self):
+        self.n += 1
+        return time.strftime("%y%m%d-%H%M%S", time.gmtime()) + f"-{self.n & 0xfff:03x}"
+
+    def old_rid(self, days):
+        self.n += 1
+        return time.strftime("%y%m%d-%H%M%S", time.gmtime(time.time() - days * 86400)) + f"-{self.n & 0xfff:03x}"
+
+    def job(self, rid, cmd, **kw):
+        req = {"id": rid, "kind": "job", "submitted": round(time.time(), 3), "who": "e2e", "project": "demo",
+               "commit": self.main, "argv": [cmd], "cmd": cmd, "need": {}, "prio": "normal", "timeout": 120}
+        req.update(kw)
+        return req
+
+    def queue(self, rid, req):
+        text = req if isinstance(req, str) else json.dumps(req)
+        self.hub("update-ref", f"refs/q/{rid}", self.hub("hash-object", "-w", "--stdin", input=text))
+
+    def refs(self, kind):
+        out = {}
+        for line in self.hub("for-each-ref", "--format=%(objectname) %(refname)", f"refs/{kind}/").splitlines():
+            sha, ref = line.split()
+            out[ref.split("/", 2)[2]] = sha
+        return out
+
+    def blob(self, sha):
+        return json.loads(self.hub("cat-file", "blob", sha))
+
+    def done(self, rid, secs=60):
+        sha = until(lambda: self.refs("done").get(rid), secs)
+        return self.blob(sha) if sha else None
+
+    def commit(self, branch, push=True):
+        pw = f"{self.w}/projwork"
+        e = {**os.environ, **ENV}
+        sh(GIT, "-C", pw, "checkout", "-q", "--detach", self.main, env=e)
+        put(f"{pw}/{branch}.txt", f"{branch} {time.time()}\n")
+        sh(GIT, "-C", pw, "add", "-A", env=e)
+        sh(GIT, "-C", pw, "commit", "-qm", branch, env=e)
+        sha = sh(GIT, "-C", pw, "rev-parse", "HEAD")
+        if push:
+            sh(GIT, "-C", pw, "push", "-q", "-f", "origin", f"HEAD:refs/heads/{branch}")
+        return sha
+
+    def mark(self, name, text=""):
+        put(os.path.join(self.marks, name), text)
+
+    def unmark(self, *names):
+        for n in names:
+            try:
+                os.unlink(os.path.join(self.marks, n))
+            except FileNotFoundError:
+                pass
+
+    def quiesce(self):
+        for rid in self.refs("q"):
+            self.hub("update-ref", "-d", f"refs/q/{rid}")
+        until(lambda: not self.refs("run"), 40)
+        for kind in ("run", "cancel"):
+            for rid in self.refs(kind):
+                self.hub("update-ref", "-d", f"refs/{kind}/{rid}")
+        for m in ("t1", "t2"):
+            st = os.path.join(self.homes[m], "curryflow", "exec", m, "state.json")
+            until(lambda: all(s.get("state") in ("free", "warming") for s in
+                              (json.load(open(st)) if os.path.exists(st) else {"slots": {}})["slots"].values()), 20)
+        for n in os.listdir(self.marks):
+            self.unmark(n)
+
+    def tracebacks(self):
+        n = 0
+        for m in ("t1", "t2"):
+            for p in (self.exec_log(m), self.exec_log(m) + ".1"):
+                n += sum("Traceback" in x for x in lines(p))
+        return n
+
+
+def pid_gone(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] == "Z"
+    except OSError:
+        return True
+
+
+def interval(d):
+    return d["start"], d["end"]
+
+
+# ---- the cases ---------------------------------------------------------------------------------------
+
+CASES = []
+
+
+def case(name, situation, expected):
+    def reg(fn):
+        CASES.append((name, situation, expected, fn))
+        return fn
+    return reg
+
+
+@case("A-claim", "两台机器的 executor 都在，连续提交 6 个短作业", "每个作业恰好跑一次，6 个结论都是 0")
+def c_claim(r):
+    log = f"{r.out}/A.log"
+    ids = [r.submit("--", f"echo $CF_JOB >> {log}; sleep 1") for _ in range(6)]
+    ds = [r.done(i, 90) for i in ids]
+    runs = lines(log)
+    counts = [runs.count(i) for i in ids]
+    codes = [d and d["code"] for d in ds]
+    where = sorted({f"{d['machine']}/{d['slot']}" for d in ds if d})
+    return f"每个作业跑的次数 {counts}，退出码 {codes}，用到的槽位 {where}", counts == [1] * 6 and codes == [0] * 6
+
+
+@case("B-restart", "作业在 t1 上跑着时 kill -9 t1 的 executor，再拉起", "作业不重跑，结论 0 照常报上去")
+def c_restart(r):
+    log = f"{r.out}/B.log"
+    rid = r.submit("--machine", "t1", "--", f"echo x >> {log}; sleep 6")
+    until(lambda: lines(log), 30)
+    r.stop("t1")
+    time.sleep(1)
+    r.start("t1")
+    d = r.done(rid, 60)
+    return f"跑了 {len(lines(log))} 次，结论 {d and (d['reason'], d['code'])}", len(lines(log)) == 1 and d and d["code"] == 0
+
+
+@case("B-window", "executor 起了启动进程、还没写下启动记录就被 kill -9（按各版本自己写在 Popen 之后的文件构造），再拉起",
+      "不再起第二个启动进程：作业只跑一次，结论 0")
+def c_window(r):
+    log = f"{r.out}/B8.log"
+    rid = r.submit("--machine", "t1", "--slot", "a0", "--", f"echo x >> {log}; sleep 4")
+    until(lambda: lines(log), 30)
+    r.stop("t1")
+    rd = r.rundir(rid)
+    if rd and not os.path.exists(os.path.join(rd, "spawn")):
+        os.unlink(os.path.join(rd, "launch.json"))
+    r.start("t1")
+    d = r.done(rid, 60)
+    time.sleep(3)
+    return (f"跑了 {len(lines(log))} 次，结论 {d and (d['reason'], d['code'])}",
+            len(lines(log)) == 1 and bool(d) and d["code"] == 0)
+
+
+@case("C-leftover", "命令起了一个 setsid、忽略 SIGTERM 的后台进程后以 3 退出", "flow 退出码 3，后台进程被清掉")
+def c_leftover(r):
+    pf = f"{r.out}/C1.pid"
+    rc, out = r.flow("run", "--project", "demo", "--machine", "t1", "--",
+                     f"(setsid sh -c 'trap \"\" TERM; echo $$ > {pf}; exec sleep 300' &); sleep 1; exit 3")
+    pid = (lines(pf) or ["0"])[0]
+    gone = until(lambda: pid_gone(pid), 10)
+    return f"flow 退出码 {rc}，后台进程 {pid} {'不在了' if gone else '还在'}", rc == 3 and gone
+
+
+@case("C-cancel", "在跑的作业有一个 setsid nohup 起的孙进程，flow cancel", "结论 143（已取消），孙进程被清掉")
+def c_cancel(r):
+    pf = f"{r.out}/C2.pid"
+    rid = r.submit("--machine", "t2", "--", f"setsid nohup sleep 300 >/dev/null 2>&1 & echo $! > {pf}; sleep 300")
+    until(lambda: lines(pf), 30)
+    rc, out = r.flow("cancel", rid)
+    d = r.done(rid, 30)
+    pid = lines(pf)[0]
+    gone = until(lambda: pid_gone(pid), 10)
+    return f"flow cancel 退出码 {rc}，结论 {d and (d['reason'], d['code'])}，孙进程{'不在了' if gone else '还在'}", (
+        bool(d) and d["code"] == 143 and gone)
+
+
+@case("C-timeout", "--timeout 3 的 sleep 60", "flow 退出码 124")
+def c_timeout(r):
+    rc, out = r.flow("run", "--project", "demo", "--timeout", "3", "--", "sleep 60")
+    return f"flow 退出码 {rc}", rc == 124
+
+
+@case("H-codes", "作业以 3 退出；提交一个中枢上没有的提交", "flow 分别以 3 和 99 退出")
+def c_codes(r):
+    rc1, _ = r.flow("run", "--project", "demo", "--", "exit 3")
+    rc2, out = r.flow("run", "--project", "demo", "--commit", "%040x" % random.getrandbits(160), "--", "true")
+    return f"退出码 {rc1}、{rc2}", rc1 == 3 and rc2 == 99
+
+
+@case("H-lost", "作业在跑时它的启动进程和监管进程都被 kill -9（作业的进程也结束）", "结论 255（丢了），flow wait 以 255 退出")
+def c_lost(r):
+    pf = f"{r.out}/lost.pid"
+    rid = r.submit("--machine", "t1", "--", f"echo $$ > {pf}; exec sleep 300")
+    until(lambda: lines(pf), 30)
+    rd = r.rundir(rid)
+    until(lambda: os.path.exists(os.path.join(rd, "sup.json")) and os.path.exists(os.path.join(rd, "launch.json")), 10)
+    for name in ("launch.json", "sup.json"):
+        try:
+            os.kill(json.load(open(os.path.join(rd, name)))["pid"], signal.SIGKILL)
+        except (OSError, KeyError, ValueError):
+            pass
+    os.kill(int(lines(pf)[0]), signal.SIGKILL)
+    rc, out = r.flow("wait", rid, timeout=120)
+    return f"flow wait 退出码 {rc}：{out.splitlines()[-1] if out else ''}", rc == 255
+
+
+@case("D-prio", "t2 唯一的槽位被占着时，依次提交 night、normal、gate 三个作业", "槽位空出来后按 gate、normal、night 的顺序跑")
+def c_prio(r):
+    log = f"{r.out}/D.log"
+    first = r.submit("--machine", "t2", "--", "sleep 6")
+    until(lambda: first in r.refs("run"), 30)
+    ids = {p: r.submit("--machine", "t2", "--prio", p, "--", f"echo {p} >> {log}") for p in ("night", "normal", "gate")}
+    for i in ids.values():
+        r.done(i, 60)
+    return f"顺序 {lines(log)}", lines(log) == ["gate", "normal", "night"]
+
+
+@case("D-who", "槽位被占着时，X 提交两个、Y 提交一个（X 的先提交）", "按提交人轮转：X、Y、X")
+def c_who(r):
+    log = f"{r.out}/D2.log"
+    first = r.submit("--machine", "t2", "--", "sleep 6")
+    until(lambda: first in r.refs("run"), 30)
+    ids = [r.submit("--machine", "t2", "--", f"echo {label} >> {log}", CF_WHO=w)
+           for label, w in (("X1", "X"), ("X2", "X"), ("Y", "Y"))]
+    for i in ids:
+        r.done(i, 60)
+    return f"顺序 {lines(log)}", lines(log) == ["X1", "Y", "X2"]
+
+
+@case("D-hold", "flow hold 占住 t1/a1，再提交一个只要 a1 的作业，然后 flow release", "占用期间作业不跑；放了以后作业跑，结论 0")
+def c_hold(r):
+    rc, out = r.flow("hold", "--hours", "0.05", "--machine", "t1", "--slot", "a1", timeout=60)
+    hid = next((x.split()[1] for x in out.splitlines() if x.startswith("占用 ")), None)
+    rid = r.submit("--slot", "a1", "--", "true")
+    time.sleep(6)
+    waited = rid not in r.refs("run") and rid not in r.refs("done")
+    rc2, out2 = r.flow("release", hid or "-")
+    d = r.done(rid, 60)
+    return (f"hold 退出码 {rc}（{hid}），占用期间作业{'没' if waited else '已经'}开始，release 退出码 {rc2}，结论 "
+            f"{d and d['code']}"), rc == 0 and waited and rc2 == 0 and bool(d) and d["code"] == 0
+
+
+@case("D-synth", "t1 两个槽位都空，提交两个 --tag synth 的作业", "两个作业的运行时间不重叠")
+def c_synth(r):
+    ids = [r.submit("--machine", "t1", "--tag", "synth", "--", "sleep 3") for _ in range(2)]
+    ds = [r.done(i, 60) for i in ids]
+    if not all(ds):
+        return "没等到结论", False
+    (s1, e1), (s2, e2) = sorted(interval(d) for d in ds)
+    return f"区间 {s1}-{e1}、{s2}-{e2}", e1 <= s2
+
+
+@case("J1-poison", "队列里有一串字段类型或取值不对的请求（threads 是字符串、null，timeout 是 Infinity、0、负数、1e9，submitted "
+      "是字符串，need 不是对象，hold 9 小时，prio 不认识，项目不存在），之后提交一个正常作业",
+      "每个坏请求都得到 error 结论并离开队列；正常作业照常跑完（0）；executor 日志里没有 Traceback")
+def c_poison(r):
+    tb = r.tracebacks()
+    bad = {}
+    for label, kw in (("threads=\"4\"", {"need": {"threads": "4"}}), ("threads=null", {"need": {"threads": None}}),
+                      ("timeout=0", {"timeout": 0}), ("timeout=-5", {"timeout": -5}), ("timeout=1e9", {"timeout": 1e9}),
+                      ("submitted=\"x\"", {"submitted": "x"}), ("need=[]", {"need": []}), ("prio", {"prio": "urgent"}),
+                      ("project", {"project": "nope"})):
+        rid = r.rid()
+        r.queue(rid, r.job(rid, "true", **kw))
+        bad[label] = rid
+    rid = r.rid()
+    r.queue(rid, json.dumps(r.job(rid, "true")).replace('"timeout": 120', '"timeout": Infinity'))
+    bad["timeout=Infinity"] = rid
+    rid = r.rid()
+    r.queue(rid, {"id": rid, "kind": "hold", "submitted": time.time(), "who": "e2e", "hours": 9, "need": {},
+                  "prio": "normal"})
+    bad["hold 9h"] = rid
+    rc, out = r.flow("run", "--project", "demo", "--", "true", timeout=60)
+    got = {k: r.done(v, 25) for k, v in bad.items()}
+    left = [k for k, v in bad.items() if v in r.refs("q")]
+    wrong = [k for k, d in got.items() if not d or d["reason"] != "error"]
+    tb = r.tracebacks() - tb
+    return (f"正常作业 flow 退出码 {rc}；没得到 error 结论的：{wrong or '无'}；还在队列里的：{left or '无'}；新增 Traceback {tb}",
+            rc == 0 and not wrong and not left and tb == 0)
+
+
+@case("J1-flow", "flow run --timeout 0 / --timeout 100000 / --threads 0 / --mem -1，flow hold --hours nan",
+      "flow 都拒绝提交（非 0 退出），队列里没有新请求")
+def c_flowcheck(r):
+    before = set(r.refs("q"))
+    rcs = [r.flow("run", "--project", "demo", *a, "--", "true", timeout=60)[0] for a in
+           (["--timeout", "0"], ["--timeout", "100000"], ["--threads", "0"], ["--mem", "-1"])]
+    rcs.append(r.flow("hold", "--hours", "nan", timeout=60)[0])
+    new = set(r.refs("q")) - before
+    return f"退出码 {rcs}，新请求 {len(new)}", all(rcs) and not new
+
+
+@case("J2-late", "认领的 push 在中枢上卡住，executor 等不到回音判没抢到，之后中枢才落下 refs/run/<id>",
+      "这个 ref 被回收、请求回到队列，最后作业只跑一次，结论 0")
+def c_late(r):
+    log = f"{r.out}/J2a.log"
+    rid = r.rid()
+    delay = r.tune["GIT_TIMEOUT"] + 4 if not r.baseline else 64
+    r.mark("delay-secs", str(delay))
+    r.mark("delay-run", rid)
+    r.queue(rid, r.job(rid, f"echo x >> {log}", need={"machine": "t1"}))
+    d = r.done(rid, delay + 40)
+    time.sleep(delay)
+    left = until(lambda: rid not in r.refs("run"), 30)
+    return (f"结论 {d and (d['reason'], d['code'])}，跑了 {len(lines(log))} 次，迟到的 run ref {'回收了' if left else '还在'}",
+            bool(d) and d["code"] == 0 and len(lines(log)) == 1 and bool(left))
+
+
+@case("J2-hblost", "t2 在跑作业时 t2 的 executor 和心跳都停了（机器下线）；flow wait 在等",
+      "t1 判它丢了：结论 255、说明心跳停了；flow wait 以 255 退出")
+def c_hblost(r):
+    rid = r.submit("--machine", "t2", "--", "sleep 300")
+    until(lambda: rid in r.refs("run"), 30)
+    time.sleep(2)
+    w = r.flow_bg("wait", rid)
+    r.stop("t2")
+    r.beat_off("t2")
+    d = r.done(rid, 90)
+    try:
+        out, _ = w.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        os.killpg(w.pid, signal.SIGKILL)
+        out, _ = w.communicate()
+    rd = r.rundir(rid)
+    if rd:
+        open(os.path.join(rd, "cancel"), "w").close()
+        until(lambda: os.path.exists(os.path.join(rd, "exit.json")), 30)
+    r.start("t2")
+    r.beat_on("t2")
+    return (f"结论 {d and (d['reason'], d['code'], d.get('note'))}；flow wait 退出码 {w.returncode}",
+            bool(d) and d["code"] == 255 and w.returncode == 255)
+
+
+@case("J2-gone", "一个 refs/run/<id> 指向 machines.json 里没有的机器 t9", "有人写下 255 的结论，q 和 run 都清掉")
+def c_gone(r):
+    rid = r.rid()
+    req = r.job(rid, "true", need={"machine": "t1"})
+    r.queue(rid, req)
+    run = {k: req.get(k) for k in ("id", "kind", "who", "project", "commit", "cmd", "prio", "submitted")}
+    run.update(machine="t9", slot="z0", cpus="0", start=int(time.time()), hb=int(time.time()))
+    r.hub("update-ref", f"refs/run/{rid}", r.hub("hash-object", "-w", "--stdin", input=json.dumps(run)))
+    d = r.done(rid, 60)
+    return (f"结论 {d and (d['reason'], d['code'], d.get('note'))}，q {rid in r.refs('q')}，run {rid in r.refs('run')}",
+            bool(d) and d["code"] == 255 and rid not in r.refs("q") and rid not in r.refs("run"))
+
+
+@case("J2-wait", "t2 在跑作业时 t2 的 executor 和心跳都停了，t1 的 executor 也停了（没有谁能回收）；flow wait 在等",
+      "flow wait 在心跳停了约 15 秒后以 254 退出，说明认领机器心跳没了")
+def c_wait254(r):
+    rid = r.submit("--machine", "t2", "--", "sleep 300")
+    until(lambda: rid in r.refs("run"), 30)
+    r.stop("t1")
+    r.stop("t2")
+    r.beat_off("t2")
+    t = time.time()
+    rc, out = r.flow("wait", rid, timeout=75)
+    secs = int(time.time() - t)
+    rd = r.rundir(rid)
+    if rd:
+        open(os.path.join(rd, "cancel"), "w").close()
+        until(lambda: os.path.exists(os.path.join(rd, "exit.json")), 30)
+    r.start("t1")
+    r.start("t2")
+    r.beat_on("t2")
+    r.done(rid, 30)
+    return f"flow wait 退出码 {rc}，{secs} 秒；{out.splitlines()[-1] if out else ''}", rc == 254
+
+
+@case("J2-missing", "flow wait 一个中枢上没有的 id", "连续三次查不到就退出（非 0），不永远等")
+def c_missing(r):
+    rc, out = r.flow("wait", r.rid(), timeout=60)
+    return f"退出码 {rc}：{out.splitlines()[-1] if out else ''}", rc not in (0, None)
+
+
+@case("J4-ref", "请求里 tmp=true、ref=refs/heads/keep（项目中枢上的一个分支）", "executor 不删这个分支；请求得到 error 结论")
+def c_ref(r):
+    r.proj("update-ref", "refs/heads/keep", r.main)
+    rid = r.rid()
+    r.queue(rid, r.job(rid, "true", ref="refs/heads/keep", tmp=True))
+    d = r.done(rid, 40)
+    time.sleep(2)
+    kept = bool(r.proj("for-each-ref", "refs/heads/keep"))
+    return f"分支{'还在' if kept else '被删了'}，结论 {d and (d['reason'], d['code'])}", kept and bool(d) and d["reason"] == "error"
+
+
+def here_clone(r, name):
+    d = f"{r.w}/{name}"
+    if not os.path.isdir(d):
+        sh(GIT, "clone", "-q", f"{r.w}/proj.git", d)
+    e = {**os.environ, **ENV}
+    put(f"{d}/{name}.txt", f"{time.time()}\n")
+    sh(GIT, "-C", d, "add", "-A", env=e)
+    sh(GIT, "-C", d, "commit", "-qm", name, env=e)
+    return d
+
+
+def tmprefs(r):
+    return r.proj("for-each-ref", "--format=%(refname)", "refs/cf/tmp/").split()
+
+
+@case("J4-submit", "flow run --here 推了临时 ref，随后往 machines.git 推请求被拒", "flow 失败退出，项目中枢上不留 refs/cf/tmp/*")
+def c_submitfail(r):
+    before = set(tmprefs(r))
+    d = here_clone(r, "here1")
+    r.mark("reject-q")
+    rc, out = r.flow("run", "--project", "demo", "--here", "--", "true", cwd=d, timeout=120)
+    left = set(tmprefs(r)) - before
+    return f"flow 退出码 {rc}，留下的临时 ref {sorted(left) or '无'}", rc != 0 and not left
+
+
+@case("J4-ctrlc", "flow run --here 推了临时 ref，推请求时卡住，用户 Ctrl-C", "项目中枢上不留 refs/cf/tmp/*")
+def c_ctrlc(r):
+    before = set(tmprefs(r))
+    d = here_clone(r, "here2")
+    r.mark("slow-q")
+    p = r.flow_bg("run", "--project", "demo", "--here", "--", "true", cwd=d)
+    until(lambda: set(tmprefs(r)) - before, 30)
+    time.sleep(1)
+    os.killpg(p.pid, signal.SIGINT)
+    try:
+        p.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL)
+    time.sleep(1)
+    left = set(tmprefs(r)) - before
+    return f"flow 退出码 {p.returncode}，留下的临时 ref {sorted(left) or '无'}", not left
+
+
+@case("J4-sweep", "项目中枢上有一个过期的 refs/cf/tmp/<id>，没有请求用它", "executor 的清理把它删掉")
+def c_tmpsweep(r):
+    ref = f"refs/cf/tmp/{r.old_rid(1)}"
+    r.proj("update-ref", ref, r.main)
+    gone = until(lambda: ref not in tmprefs(r), 40)
+    return f"{ref} {'删了' if gone else '还在'}", bool(gone)
+
+
+@case("J4-keep", "t1 的两个槽位都被 hold 占着，一个 --here 的请求在排队（它的临时 ref 过了清理的时限）",
+      "排队期间临时 ref 不被清理；放开后作业跑完（0），临时 ref 被删")
+def c_tmpkeep(r):
+    hs = []
+    for s in ("a0", "a1"):
+        rc, out = r.flow("hold", "--hours", "0.1", "--machine", "t1", "--slot", s, timeout=60)
+        hs.append(next((x.split()[1] for x in out.splitlines() if x.startswith("占用 ")), "-"))
+    before = set(tmprefs(r))
+    d = here_clone(r, "here3")
+    rc, rid = r.flow("run", "--project", "demo", "--here", "--machine", "t1", "--no-wait", "--", "true", cwd=d)
+    rid = rid.splitlines()[-1]
+    mine = set(tmprefs(r)) - before
+    time.sleep(r.tune["SWEEP"] * 2 + r.tune["TMP_KEEP"])
+    kept = mine <= set(tmprefs(r))
+    for h in hs:
+        r.flow("release", h)
+    dd = r.done(rid, 60)
+    time.sleep(2)
+    after = mine & set(tmprefs(r))
+    return (f"排队时临时 ref {'还在' if kept else '被删了'}，结论 {dd and dd['code']}，跑完后临时 ref {'还在' if after else '删了'}",
+            bool(mine) and kept and bool(dd) and dd["code"] == 0 and not after)
+
+
+@case("J4-retry", "executor 删临时 ref 时被项目中枢拒绝", "作业照常跑完（0），作业日志里写明删除失败；中枢恢复后清理把它删掉")
+def c_tmpretry(r):
+    before = set(tmprefs(r))
+    d = here_clone(r, "here4")
+    r.mark("keep-tmp")
+    rc, out = r.flow("run", "--project", "demo", "--here", "--", "true", cwd=d, timeout=120)
+    mine = set(tmprefs(r)) - before
+    rid = next((x.split()[1] for x in out.splitlines() if x.startswith("[flow] ") and " 结束" in x), "")
+    rd = r.rundir(rid)
+    said = any("临时 ref" in x for x in lines(os.path.join(rd, "log"))) if rd else False
+    r.unmark("keep-tmp")
+    gone = until(lambda: not (mine & set(tmprefs(r))), 40)
+    return (f"flow 退出码 {rc}，删除失败后留下 {sorted(mine) or '无'}，日志{'写了' if said else '没写'}，之后{'删掉了' if gone else '还在'}",
+            rc == 0 and bool(mine) and said and bool(gone))
+
+
+@case("J6-locks", "t1/a0 的工作树里留着 index.lock，镜像里留着 refs/cf/slot/a0.lock（上次被 SIGKILL 的 git 留下的）",
+      "准备阶段清掉遗留的锁，作业照常跑完（0）")
+def c_locks(r):
+    r.flow("run", "--project", "demo", "--machine", "t1", "--slot", "a0", "--", "true")
+    tree = os.path.join(r.slotdir("t1", "a0"), "demo", ".git")
+    mirror = os.path.join(r.homes["t1"], "curryflow", "mirror", "demo.git")
+    put(os.path.join(tree, "index.lock"), "")
+    put(os.path.join(mirror, "refs", "cf", "slot", "a0.lock"), "")
+    rc, out = r.flow("run", "--project", "demo", "--machine", "t1", "--slot", "a0", "--", "true")
+    return f"flow 退出码 {rc}：{out.splitlines()[-1] if out else ''}", rc == 0
+
+
+@case("J6-term", "准备阶段的 git fetch 很慢时取消", "git 先收到 SIGTERM；结论 143")
+def c_term(r):
+    sha = r.commit("e2e-j6")
+    r.mark("slowfetch")
+    rid = r.submit("--machine", "t1", "--slot", "a1", "--commit", "e2e-j6", "--", "true")
+    until(lambda: os.path.exists(f"{r.marks}/fetch.pid"), 40)
+    rc, out = r.flow("cancel", rid)
+    d = r.done(rid, 60)
+    sig = lines(f"{r.marks}/fetch.sig")
+    return f"fetch 收到的信号 {sig or '无（SIGKILL）'}，结论 {d and (d['reason'], d['code'])}", sig == ["TERM"] and bool(d) and d["code"] == 143
+
+
+@case("J7-lockwait", "镜像锁被别人拿着，作业的启动进程在等锁时被取消", "结论 143（已取消），不是 255")
+def c_lockwait(r):
+    import fcntl
+    os.makedirs(os.path.join(r.homes["t1"], "curryflow", "mirror"), exist_ok=True)
+    f = open(os.path.join(r.homes["t1"], "curryflow", "mirror", "demo.git.lock"), "w")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    try:
+        rid = r.submit("--machine", "t1", "--slot", "a0", "--", "true")
+        until(lambda: rid in r.refs("run"), 30)
+        time.sleep(2)
+        t = time.time()
+        r.flow("cancel", "--no-wait", rid)
+        d = r.done(rid, 130)
+        secs = int(time.time() - t)
+    finally:
+        f.close()
+    return f"结论 {d and (d['reason'], d['code'])}，取消后 {secs} 秒", bool(d) and d["code"] == 143
+
+
+@case("J8-copy", "t1 的 executor 文件被写到一半（beat 正在 git pull）时来了一个作业", "作业拿到完整的 executor，结论 0")
+def c_copy(r):
+    path = os.path.join(r.clone("t1"), "executor")
+    with open(path) as f:
+        text = f.read()
+    with open(path, "w") as f:
+        f.write(text[:len(text) // 2])
+    p = r.flow_bg("run", "--project", "demo", "--machine", "t1", "--", "true")
+    try:
+        t = time.time() + 120
+        while p.poll() is None and time.time() < t:
+            os.utime(path)
+            time.sleep(1)
+        if p.poll() is None:
+            os.killpg(p.pid, signal.SIGKILL)
+            p.wait()
+        out = p.stdout.read().strip()
+    finally:
+        with open(path, "w") as f:
+            f.write(text)
+    rc = p.returncode
+    return f"flow 退出码 {rc}：{out.splitlines()[-1] if out else ''}", rc == 0
+
+
+@case("J9-pin", "准备阶段要从项目中枢取提交（t1/a1）", "准备阶段的 git 钉在 a1 的核上；连中枢的 ssh 带 ServerAliveInterval")
+def c_pin(r):
+    r.commit("e2e-j9")
+    r.mark("cpus")
+    rc, out = r.flow("run", "--project", "demo", "--machine", "t1", "--slot", "a1", "--commit", "e2e-j9", "--", "true")
+    cpus = (lines(f"{r.marks}/fetch.cpus") or [""])[0].split(":")[-1].strip()
+    ssh = (lines(f"{r.marks}/fetch.ssh") or [""])[0]
+    return (f"flow 退出码 {rc}，git 的核 {cpus or '?'}（a1 是 {r.cpus['a1']}），ssh 带 ServerAlive：{'ServerAliveInterval' in ssh}",
+            rc == 0 and cpus == r.cpus["a1"] and "ServerAliveInterval" in ssh)
+
+
+@case("J9-synth", "t1 认领一个 synth 作业时 push 没有回音、紧接着查也查不到（记进认领中），同时还有一个 synth 作业在排",
+      "认领中的 synth 也算：两个 synth 作业的运行时间不重叠；认领中时 state.json 里该槽位是 claiming")
+def c_synthclaim(r):
+    s1, s2 = r.rid(), r.rid()
+    r.mark("delay-secs", str(r.tune["GIT_TIMEOUT"] + 5 if not r.baseline else 64))
+    r.mark("delay-lsfail")
+    r.mark("delay-run", s1)
+    st = os.path.join(r.homes["t1"], "curryflow", "exec", "t1", "state.json")
+    r.queue(s1, r.job(s1, "sleep 4", need={"machine": "t1", "tags": ["synth"]}))
+    r.queue(s2, r.job(s2, "sleep 4", need={"machine": "t1", "tags": ["synth"]}, submitted=time.time() + 1))
+    seen = set()
+    t = time.time() + 25
+    while time.time() < t and s1 not in r.refs("done"):
+        try:
+            seen |= {s["state"] for s in json.load(open(st))["slots"].values()}
+        except (OSError, ValueError, KeyError):
+            pass
+        time.sleep(0.3)
+    d1, d2 = r.done(s1, 90), r.done(s2, 90)
+    if not (d1 and d2):
+        return f"没等到结论（{bool(d1)}, {bool(d2)}）", False
+    (a, b), (c, e) = sorted([interval(d1), interval(d2)])
+    return f"区间 {a}-{b}、{c}-{e}；见过的槽位状态 {sorted(seen)}", b <= c and "claiming" in seen
+
+
+@case("F-joblog", "作业往日志里写 2 MB（上限调成 256 KB）", "日志不超过上限，结论里注明截断，最后一行还在")
+def c_joblog(r):
+    rc, out = r.flow("run", "--project", "demo", "--machine", "t2", "--",
+                     "yes 0123456789abcdef | head -c 2000000; echo; echo END")
+    rid = next((x.split()[1] for x in out.splitlines() if x.startswith("[flow] ") and " 结束" in x), "")
+    rd = r.rundir(rid)
+    size = os.path.getsize(os.path.join(rd, "log")) if rd else -1
+    d = r.done(rid, 5) or {}
+    return (f"日志 {size} 字节，结论说明「{d.get('note')}」，最后一行 {d.get('last')}",
+            0 < size <= r.tune["LOG_MAX"] + 65536 and "截" in (d.get("note") or "") and d.get("last") == "END")
+
+
+@case("F-execlog", "executor.log 超过上限（调成 8 KB）", "运行中就轮转：有 executor.log.1，当前文件不超过上限加一行")
+def c_execlog(r):
+    for _ in range(4):
+        r.flow("run", "--project", "demo", "--", "true")
+    p = r.exec_log("t1")
+    size = os.path.getsize(p)
+    return f"executor.log {size} 字节，executor.log.1 {'有' if os.path.exists(p + '.1') else '没有'}", (
+        os.path.exists(p + ".1") and size <= r.tune["EXEC_LOG_MAX"] + 4096)
+
+
+@case("F-prune", "镜像从中枢取过分支 e2e-prune，之后中枢删了这个分支，再来一个要取全部分支的作业", "镜像里的 refs/hub/e2e-prune 被删掉")
+def c_prune(r):
+    c1 = r.commit("e2e-prune")
+    rid = r.rid()
+    r.queue(rid, r.job(rid, "true", commit=c1, need={"machine": "t2"}))
+    d1 = r.done(rid, 60)
+    r.proj("update-ref", "-d", "refs/heads/e2e-prune")
+    c2 = r.commit("e2e-prune2")
+    rid = r.rid()
+    r.queue(rid, r.job(rid, "true", commit=c2, need={"machine": "t2"}))
+    d2 = r.done(rid, 60)
+    mirror = os.path.join(r.homes["t2"], "curryflow", "mirror", "demo.git")
+    left = sh(GIT, "--git-dir", mirror, "for-each-ref", "refs/hub/e2e-prune")
+    return f"结论 {d1 and d1['code']}、{d2 and d2['code']}，镜像里 refs/hub/e2e-prune {'还在' if left else '删了'}", (
+        bool(d1) and bool(d2) and d2["code"] == 0 and not left)
+
+
+@case("F-backoff", "t1 读不到中枢 20 秒（作业在这期间结束）", "轮询指数退避（20 秒里读中枢不超过 7 次）；中枢回来后结论照常报上去（0）")
+def c_backoff(r):
+    rid = r.submit("--machine", "t1", "--", "sleep 2")
+    until(lambda: rid in r.refs("run"), 30)
+    r.mark("lsfail-t1")
+    t0 = time.time()
+    time.sleep(20)
+    r.unmark("lsfail-t1")
+    n = sum(1 for x in lines(f"{r.w}/ops.log") if " t1 read" in x and t0 <= float(x.split()[0]) <= t0 + 20)
+    d = r.done(rid, 60)
+    return f"20 秒里读了 {n} 次，结论 {d and d['code']}", n <= 7 and bool(d) and d["code"] == 0
+
+
+@case("F-hbpush", "一个跑 12 秒的作业", "refs/run/<id> 只在认领时写一次、结束时删一次，没有按作业的心跳 push")
+def c_hbpush(r):
+    rid = r.submit("--machine", "t2", "--", "sleep 12")
+    d = r.done(rid, 60)
+    n = sum(1 for x in lines(f"{r.w}/reflog.txt") if f" refs/run/{rid} " in x)
+    return f"refs/run/{rid} 被更新 {n} 次，结论 {d and d['code']}", n <= 2 and bool(d) and d["code"] == 0
+
+
+@case("I-sweep", "两个 8 天前提交的请求的结论：一个刚刚才结束，一个 8 天前就结束了", "清理只删 8 天前结束的那个（按结束时间算 7 天）")
+def c_sweep(r):
+    ids = []
+    for end in (time.time(), time.time() - 8 * 86400):
+        rid = r.old_rid(8)
+        d = {"id": rid, "kind": "job", "who": "e2e", "project": "demo", "cmd": "true", "prio": "normal", "machine": "t1",
+             "slot": "a0", "start": int(end) - 5, "end": int(end), "secs": 5, "code": 0, "reason": "exit", "note": "",
+             "last": "", "tail": [], "log": None}
+        r.hub("update-ref", f"refs/done/{rid}", r.hub("hash-object", "-w", "--stdin", input=json.dumps(d)))
+        ids.append(rid)
+    until(lambda: ids[1] not in r.refs("done"), 40)
+    time.sleep(r.tune["SWEEP"] + 2)
+    have = r.refs("done")
+    return f"刚结束的{'还在' if ids[0] in have else '被删了'}，8 天前结束的{'还在' if ids[1] in have else '删了'}", (
+        ids[0] in have and ids[1] not in have)
+
+
+@case("J10-page", "机器页对 warming（测量中）和 claiming（认领中）的槽位", "不显示成空闲")
+def c_page(r):
+    with open(os.path.join(REPO, "templates", "curryplan", "machines", "index.html")) as f:
+        page = f.read()
+    ok = "warming" in page and "claiming" in page and "测量中" in page and "认领中" in page
+    return f"页面里{'有' if ok else '没有'} warming / claiming 的显示", ok
+
+
+@case("I-doc", "SKILL.md 的机器池一节", "写明会往项目中枢推 refs/cf/tmp/<id>、7 天按结束时间、容器里 HOME 的位置、hold 期间改工作树会被清掉")
+def c_doc(r):
+    with open(os.path.join(REPO, "SKILL.md")) as f:
+        text = f.read()
+    sec = text[text.index("## 机器池"):text.index("## curryPlan")]
+    want = {"refs/cf/tmp": "refs/cf/tmp/" in sec, "结束": "结束 7 天" in sec or "结束后 7 天" in sec,
+            "HOME": ".home" in sec, "hold": "checkout" in sec and "clean" in sec}
+    return f"{want}", all(want.values()) and "不碰项目仓库的 ref" not in sec
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--work", required=True)
+    ap.add_argument("--pool", default=os.path.join(REPO, "templates", "pool"))
+    ap.add_argument("--only")
+    ap.add_argument("--baseline", action="store_true")
+    ap.add_argument("--measure", type=int)
+    a = ap.parse_args()
+    if a.measure:
+        return measure(a)
+    rig = Rig(os.path.abspath(a.work), os.path.abspath(a.pool), a.baseline, TUNE)
+    rig.setup()
+    for m in ("t1", "t2"):
+        rig.start(m)
+        rig.beat_on(m)
+    rows = []
+    only = set(a.only.split(",")) if a.only else None
+    try:
+        time.sleep(4)
+        for name, situation, expected, fn in CASES:
+            if only and name not in only:
+                continue
+            t = time.time()
+            try:
+                actual, ok = fn(rig)
+            except Exception as e:
+                actual, ok = f"出错：{type(e).__name__}: {e}", False
+            row = [name, situation, expected, actual, "PASS" if ok else "FAIL"]
+            rows.append(row)
+            print(f"{row[4]} {name} ({int(time.time() - t)} s): {actual}", flush=True)
+            try:
+                rig.quiesce()
+            except Exception as e:
+                print(f"  quiesce: {e}", flush=True)
+            for m in ("t1", "t2"):
+                if m not in rig.procs:
+                    rig.start(m)
+                if "beat-" + m not in rig.procs:
+                    rig.beat_on(m)
+    finally:
+        rig.shutdown()
+    with open(os.path.join(rig.w, "results.tsv"), "w") as f:
+        f.write("名称\t情形\t期望\t实际\t结论\n")
+        for row in rows:
+            f.write("\t".join(x.replace("\t", " ").replace("\n", " ") for x in row) + "\n")
+    bad = [r[0] for r in rows if r[4] != "PASS"]
+    print(f"{len(rows) - len(bad)}/{len(rows)} 通过；结果 {rig.w}/results.tsv")
+    print(f"RESULT {'PASS' if not bad else 'FAIL'}: {', '.join(bad) or 'all cases'}")
+    return 1 if bad else 0
+
+
+def measure(a):
+    tune = {"BUSY_MAX": 2, "MIN_WINDOW": 1, "QUIET": 0}
+    rig = Rig(os.path.abspath(a.work), os.path.abspath(a.pool), a.baseline, tune)
+    rig.setup()
+    for m in ("t1", "t2"):
+        rig.start(m)
+        rig.beat_on(m, every=60)
+    rows = []
+    try:
+        time.sleep(20)
+
+        def window(label):
+            t0 = time.time()
+            time.sleep(a.measure)
+            ops = [x.split() for x in lines(f"{rig.w}/ops.log") if t0 <= float(x.split()[0]) < t0 + a.measure]
+            for m in ("t1", "t2"):
+                for kind in ("read", "push"):
+                    n = sum(1 for x in ops if x[1] == m and x[2] == kind)
+                    rows.append([label, m, kind, n, round(n * 60 / a.measure, 2)])
+        window("idle")
+        ids = [rig.submit("--machine", m, "--", f"sleep {a.measure + 120}") for m in ("t1", "t2")]
+        until(lambda: all(i in rig.refs("run") for i in ids), 60)
+        time.sleep(10)
+        window("2 jobs")
+        for i in ids:
+            rig.flow("cancel", "--no-wait", i)
+        for i in ids:
+            rig.done(i, 60)
+    finally:
+        rig.shutdown()
+    with open(os.path.join(rig.w, "ops.tsv"), "w") as f:
+        f.write("窗口\t机器\t操作\t次数\t每分钟\n")
+        for row in rows:
+            f.write("\t".join(map(str, row)) + "\n")
+    for row in rows:
+        print(*row)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
