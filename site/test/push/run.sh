@@ -3,8 +3,8 @@
 # real Chrome that subscribes at Google's push service and shows what the server sends.
 #   test/push/run.sh WORKDIR        logs and screenshots land in WORKDIR (created; nothing is written elsewhere)
 #   PROXY=127.0.0.1:7890            an HTTP proxy towards Google, when this machine has no direct route
-#   OLD=e41974c                     the revision whose shell/ plays the old client (the one deployed before this one;
-#                                   4ba20be is the one before notifications)
+#   OLD=e65bb52                     the revision whose shell/ plays the old client (the one deployed before this one;
+#                                   c44cb10 is the one before notifications)
 # Needs google-chrome, node >= 20.10, python3 with `cryptography`, curl, nc, and ports 8765, 18443, 18444, 9333 free.
 # A stand-in push service (fake_service.py, port 18444, trusted by the server through SSL_CERT_FILE) plays the faults
 # a real one cannot be made to show on demand: a dropped connection, a 410 for a live subscription, no answer at all.
@@ -12,7 +12,7 @@
 HERE=$(cd "$(dirname "$0")" && pwd); REPO=$(cd "$HERE/../.." && pwd)
 [ -n "$1" ] || { echo "usage: $0 WORKDIR"; exit 2; }
 mkdir -p "$1" && W=$(cd "$1" && pwd) || exit 2
-SITE=http://localhost:18443; PUSH_SITE=https://plan.example:8443; OLD=${OLD:-e41974c}; DATA=$W/home/curry-site; FAKE=$W/fake; FAKE_PORT=18444; failed=""
+SITE=http://localhost:18443; PUSH_SITE=https://plan.example:8443; OLD=${OLD:-e65bb52}; DATA=$W/home/curry-site; FAKE=$W/fake; FAKE_PORT=18444; failed=""
 lack() { echo "RESULT env: $1"; exit 99; }
 python3 -c "import cryptography" 2>/dev/null || lack "python3 has no cryptography"
 node --experimental-websocket -e "WebSocket" 2>/dev/null || lack "node cannot do --experimental-websocket"
