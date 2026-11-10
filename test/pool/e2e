@@ -827,9 +827,11 @@ def c_joblog(r):
 
 @case("F-execlog", "executor.log 超过上限（调成 8 KB）", "运行中就轮转：有 executor.log.1，当前文件不超过上限加一行")
 def c_execlog(r):
-    for _ in range(4):
-        r.flow("run", "--project", "demo", "--", "true")
     p = r.exec_log("t1")
+    for _ in range(12):
+        if os.path.exists(p + ".1"):
+            break
+        r.flow("run", "--project", "demo", "--machine", "t1", "--", "true " + "x" * 1500)
     size = os.path.getsize(p)
     return f"executor.log {size} 字节，executor.log.1 {'有' if os.path.exists(p + '.1') else '没有'}", (
         os.path.exists(p + ".1") and size <= r.tune["EXEC_LOG_MAX"] + 4096)
