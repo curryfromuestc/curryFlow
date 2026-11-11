@@ -302,7 +302,7 @@ def cmd_merge(a):
             die("main 在排队之后动过，候选不能快进；重新 queue")
         if not HUB.push("refs/heads/main", cand, main):
             die("推 main 时 main 又动了；重新 queue")
-        print(f"中枢 main = {cand[:10]}（{a.cid}）；GitHub 只收 main，由人推")
+        print(f"中枢 main = {cand[:10]}（{a.cid}）；接着推 GitHub 的 main")
     for s, v in c.items():
         HUB.push(f"refs/ci/queue/{a.cid}.{s}", None, v["queued"])
         if "claim" in v:

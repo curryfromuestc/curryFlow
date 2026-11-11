@@ -36,8 +36,28 @@ def now():
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+LOCAL_ENV = Path.home() / ".config/curryflow/local.env"
+
+
+def local_env():
+    """Addresses kept out of the repository: KEY=VALUE lines of ~/.config/curryflow/local.env, the environment over them."""
+    env = {}
+    if LOCAL_ENV.exists():
+        for line in LOCAL_ENV.read_text().splitlines():
+            k, sep, v = line.partition("=")
+            if sep and not line.lstrip().startswith("#"):
+                env[k.strip()] = v.strip().strip('"')
+    env.update(os.environ)
+    return env
+
+
 def load_machines():
-    return json.loads((CI / "machines").read_text())
+    """ci/machines with each ${NAME} replaced from local_env(); a NAME that is not set is an error."""
+    text, env = (CI / "machines").read_text(), local_env()
+    missing = sorted({m for m in re.findall(r"\$\{(\w+)\}", text) if m not in env})
+    if missing:
+        raise SystemExit(f"ci/machines: {', '.join(missing)} not set (in {LOCAL_ENV} or the environment)")
+    return json.loads(re.sub(r"\$\{(\w+)\}", lambda m: env[m.group(1)], text))
 
 
 def die(msg, code=1):

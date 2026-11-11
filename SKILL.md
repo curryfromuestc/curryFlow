@@ -24,7 +24,7 @@ executor（每台机器）  ci/executor run；只往外连中枢；领任务开 
 curryPlan             人看的状态页（每分钟读中枢）和方案页；讨论和拍板在会话里，不上页面
 ```
 
-机器之间只走 git，不挂共享盘；协调器从不登录执行机；token 只放执行机，不过中枢；GitHub 只收 main，只由人推。
+机器之间只走 git，不挂共享盘；协调器从不登录执行机；token 只放执行机，不过中枢；GitHub 只收 main，协调器推完中枢 main 接着推。
 
 ## 引导
 
@@ -77,7 +77,7 @@ curryPlan             人看的状态页（每分钟读中枢）和方案页；�
 `ci/machines`（JSON）：
 
 ```json
-{"project": "toy", "hubs": ["ci@<主中枢>:toy.git", "ci@<备用中枢>:toy.git"],
+{"project": "toy", "hubs": ["ci@${CF_HUB1}:toy.git", "ci@${CF_HUB2}:toy.git"],
  "curryPlan": {"host": "<用户>@<curryPlan 机>", "page": "/var/www/plan/toy/status", "clone": "~/curryflow/toy-status"},
  "machines": {
   "box-c": {"ssh": "box-c", "dir": "~/curryflow/toy", "backend": "incus", "shared": false, "hub_proxy": "127.0.0.1:7890",
@@ -124,7 +124,7 @@ curryPlan             人看的状态页（每分钟读中枢）和方案页；�
 5. **验收、合并。** `ci/coord queue <id>` 合成候选（main 合上 `wip/<id>`），按 `TIERS` 每个阶段一个作业；executor
    在钉核的槽位里跑候选自己的 `ci/accept --stage`。`wait` 出 PASS 就 `ci/coord merge <cid>`（只做快进，main 动过
    就重新 queue）；FAIL 看结论和 `reports/`，再 msg 或自己修；不要了就 `ci/coord drop <cid>`。
-6. **收尾。** `ci/coord task close <id>`，executor 删掉容器和它的构建。告诉人中枢 main 到了哪个提交——推 GitHub 是人的事。
+6. **收尾。** `ci/coord task close <id>`，executor 删掉容器和它的构建。中枢 main 推完接着推 GitHub 的 main，告诉人到了哪个提交。
 
 规矩：
 
