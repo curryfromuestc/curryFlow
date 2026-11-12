@@ -148,6 +148,18 @@ def cpu_list(spec):
     return out
 
 
+def physical_cores(cpus):
+    top = "/sys/devices/system/cpu/cpu%d/topology/"
+    seen = set()
+    for c in cpus:
+        try:
+            seen.add((open(top % c + "physical_package_id").read().strip(),
+                      open(top % c + "core_id").read().strip()))
+        except OSError:
+            pass
+    return len(seen) or len(cpus)
+
+
 def mem_bytes(text):
     m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([KMGT]?)(?:i?B)?\s*", str(text), re.I)
     return int(float(m.group(1)) * 1024 ** " KMGT".index(m.group(2).upper() or " ")) if m else None
@@ -268,6 +280,8 @@ def problem(r, rid):
     ref, tmp = r.get("ref"), r.get("tmp", False)
     if not isinstance(tmp, bool):
         return "tmp 不是 true/false"
+    if "clean" in r and not isinstance(r["clean"], bool):
+        return "clean 不是 true/false"
     if ref is not None and not (isinstance(ref, str) and (TMPREF.fullmatch(ref) or REF.fullmatch(ref) and ".." not in ref)):
         return f"ref 不对：{ref!r}"
     if tmp and not (ref and TMPREF.fullmatch(ref)):
@@ -627,7 +641,19 @@ def prepare(job, say, run, must, check):
         must(["git", "-C", tree, "fetch", "-q", "--no-tags", mirror, sha], "工作树从镜像取提交失败")
     must(["git", "-C", tree, "-c", "advice.detachedHead=false", "checkout", "-q", "-f", "--detach", sha], "checkout 失败")
     must(["git", "-C", tree, "clean", "-fdq"], "git clean 失败")
+    stamp_path = os.path.join(tree, ".build", ".cf-env.json")
+    deps_path = os.path.join(tree, "deps.json")
+    cur_env = {"deps": open(deps_path).read() if os.path.isfile(deps_path) else "",
+               "cache": job["env"].get("CF_DEPS_CACHE", ""), "container": job.get("container") or ""}
+    old_env = jload(stamp_path)
+    if req.get("clean") or (old_env is not None and old_env != cur_env):
+        say("清空 .build（--clean）" if req.get("clean") else "清空 .build（deps.json 或槽位环境变了）")
+        shutil.rmtree(os.path.join(tree, ".build"), ignore_errors=True)
+    else:
+        for sub in ("accept", "synth", "release", "downstream"):
+            shutil.rmtree(os.path.join(tree, ".build", sub), ignore_errors=True)
     os.makedirs(os.path.join(tree, ".build", "tmp"), exist_ok=True)
+    jdump(stamp_path, cur_env)
     sweep_tmpdir(os.path.join(tree, ".build", "tmp"), say)
     say(f"{req['project']}@{sha[:12]} 在 {job['machine']}/{job['slot']}：{req['cmd']}")
 
@@ -667,6 +693,7 @@ class Slot:
     def __init__(self, name, conf):
         self.name, self.spec = name, conf["cpus"]
         self.cpus = cpu_list(conf["cpus"])
+        self.cores = physical_cores(self.cpus)
         self.mem = mem_bytes(conf.get("mem", "")) or 0
         self.container = conf.get("container")
         self.gpu = bool(conf.get("gpu"))
@@ -1188,7 +1215,10 @@ class Executor:
             env = {"HOME": home, "USER": self.user, "LOGNAME": self.user, "SHELL": "/bin/bash", "LANG": "C.UTF-8",
                    "PATH": PATH, "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": os.path.join(tree, ".build", "tmp"),
                    "CF_JOB": rid, "CF_MACHINE": self.machine, "CF_SLOT": slot.name, "CF_CPUS": slot.spec,
-                   "CF_THREADS": str(len(slot.cpus)), "CF_PROJECT": req["project"], "CF_COMMIT": req["commit"]}
+                   "CF_THREADS": str(len(slot.cpus)), "CF_CORES": str(slot.cores),
+                   "CF_PROJECT": req["project"], "CF_COMMIT": req["commit"]}
+            if slot.mem:
+                env["CF_MEM_GB"] = str(slot.mem // 2 ** 30)
             if self.mconf.get("deps_cache"):
                 env["CF_DEPS_CACHE"] = os.path.expanduser(self.mconf["deps_cache"])
             env.update({k: str(v).replace("~/", os.path.expanduser("~/")) for k, v in self.mconf.get("env", {}).items()})

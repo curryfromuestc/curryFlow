@@ -1314,6 +1314,21 @@ def c_doc(r):
     return f"{want}", all(want.values()) and "不碰项目仓库的 ref" not in sec
 
 
+@case("T-buildclean", "作业环境带 CF_CORES 和 CF_MEM_GB；每次必清 .build/synth 和 .build/accept，保留 .build/obj；--clean 清空整个 .build",
+      "CF_CORES>=1 且 CF_MEM_GB=4；普通作业清掉 synth/accept 但保留 obj；--clean 清掉 obj")
+def c_buildclean(r):
+    rc1, o1 = r.flow("run", "--project", "demo", "--machine", "t1", "--slot", "a0", "--",
+                     'mkdir -p .build/synth .build/accept .build/obj && touch .build/synth/x .build/accept/x .build/obj/keep && echo "ENV:$CF_CORES:$CF_MEM_GB"')
+    env_line = next((x for x in o1.splitlines() if x.startswith("ENV:")), "")
+    rc2, o2 = r.flow("run", "--project", "demo", "--machine", "t1", "--slot", "a0", "--",
+                     'test ! -e .build/synth && test ! -e .build/accept && test -e .build/obj/keep')
+    rc3, o3 = r.flow("run", "--project", "demo", "--machine", "t1", "--slot", "a0", "--clean", "--",
+                     'test ! -e .build/obj/keep')
+    parts = env_line.split(":")
+    ok_env = len(parts) == 3 and parts[1].isdigit() and int(parts[1]) >= 1 and parts[2] == "4"
+    return f"{env_line}，普通跑 rc={rc2}，--clean rc={rc3}", rc1 == 0 and ok_env and rc2 == 0 and rc3 == 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", required=True)

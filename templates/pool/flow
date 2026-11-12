@@ -2,7 +2,7 @@
 """A slot of the machine pool in two commands: run a job and wait for its conclusion, or hold a slot for some hours.
 
 usage: flow run --project P [--commit REV | --here] [--threads N] [--mem G] [--gpu] [--machine M] [--slot S]
-                [--prio gate|normal|night] [--timeout SECONDS] [--tag synth] [--no-wait] -- COMMAND...
+                [--prio gate|normal|night] [--timeout SECONDS] [--tag synth] [--clean] [--no-wait] -- COMMAND...
        flow hold --hours N [--machine M] [--slot S] [--threads N] [--mem G] [--gpu] [--no-wait]
        flow release ID | flow cancel ID [--no-wait]
        flow ls [--all] [--json]
@@ -325,6 +325,8 @@ def cmd_run(a):
         if ref:
             req["ref"] = ref
             req["tmp"] = tmp
+        if a.clean:
+            req["clean"] = True
         rid = submit(req)
     except (SystemExit, KeyboardInterrupt):
         for ref in pushed:
@@ -572,6 +574,7 @@ def main():
     g.add_argument("--here", action="store_true")
     r.add_argument("--timeout", type=int, default=14400, help="秒，默认 4 小时")
     r.add_argument("--tag", action="append", choices=["synth"], help="synth：同一台机器同时只跑一个")
+    r.add_argument("--clean", action="store_true", help="跑之前清空槽位工作树的 .build/")
     needs(r)
     h = sub.add_parser("hold")
     h.add_argument("--hours", type=float, required=True)

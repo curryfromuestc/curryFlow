@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""The pages of docs/ on curryPlan: each docs/<dir>/<name>.html of docs/pages.json is a page, published as it is in git.
+
+  tools/publish-docs [--rev REV] [--root DIR] [--no-catalog]
+      Publishes every page of docs/pages.json ({"pages": [{"source", "project", "page"}]}) as it is at REV (default
+      HEAD; read from git, not from the work tree): the HTML, as index.html, and the files of its directory with a web
+      extension (images, video, PDF, CSS, JS, JSON; not the other pages) go to ROOT/<project>/<page>/ (ROOT default
+      /var/www/plan), with meta.json from the page's <meta name="cp-title|cp-say|cp-kind"> and "updated" = the time of
+      the last commit of the page at REV. A page whose files and meta.json are already there is left alone;
+      otherwise each file is written to a temporary name and renamed, meta.json last, files that are no longer the
+      page's are removed, and ROOT/gen_catalog.py rewrites the home page's catalog (unless --no-catalog). Run from a
+      clone of the repository (curryPlan's cron: a sparse clone of docs/ and this file, on the hub's main).
+  tools/publish-docs --check
+      Checks the work tree's pages (ci/stage.sh style): every docs/**/*.html is in docs/pages.json and every source
+      there exists; each page parses (every element closed in order), has its title and cp-* metas with <title> =
+      cp-title and the .oneline = cp-say, has no external src/href (no scheme, no //, no url() or @import to another
+      host), has unique ids and data-c, nothing editable (contenteditable, data-doc, .draft); its relative links reach
+      files that are published with it or other pages of the manifest at their curryPlan paths, its links to
+      /<project>/<page>/ of a manifest page reach it, and the #fragments of both exist; the relative links of
+      docs/**/*.md exist; every mention of docs/<dir>/<file>[#id] in the repository (git grep) names a file that
+      exists and an id that the page has.
+Exit 0 when it published or found nothing to do (or the check passed), 1 with the reasons on stderr otherwise.
+"""
+import argparse
+import json
+import os
+import posixpath
+import re
+import socket
+import subprocess
+import sys
+import time
+from html.parser import HTMLParser
+
+MANIFEST = "docs/pages.json"
+KINDS = {"方案", "笔记", "学习", "状态"}
+ASSET_EXT = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".avif", ".mp4", ".webm", ".pdf", ".css", ".js",
+             ".json", ".woff2"}
+VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
+URL_ATTRS = {"src", "href", "xlink:href", "poster", "data", "action", "srcset", "formaction"}
+
+
+class Page(HTMLParser):
+    """One pass over a page: its structure errors, metas, ids, data-c, URLs and the .oneline's text."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack, self.errors, self.meta, self.ids, self.datac, self.urls = [], [], {}, [], [], []
+        self.title, self.oneline, self.editable = None, None, []
+        self._title, self._one = None, None
+
+    def where(self):
+        return "line %d" % self.getpos()[0]
+
+    def handle_starttag(self, tag, attrs):
+        self._attrs(tag, attrs)
+        if tag not in VOID:
+            self.stack.append((tag, self.where()))
+        if tag == "title":
+            self._title = ""
+        if "oneline" in (dict(attrs).get("class") or "").split() and self._one is None and self.oneline is None:
+            self._one = (len(self.stack), "")
+
+    def handle_startendtag(self, tag, attrs):
+        self._attrs(tag, attrs)
+
+    def handle_endtag(self, tag):
+        if tag in VOID:
+            return
+        if not self.stack or self.stack[-1][0] != tag:
+            open_ = self.stack[-1] if self.stack else None
+            self.errors.append("%s: </%s> but %s" % (self.where(), tag, "<%s> from %s is open" % open_ if open_ else "nothing is open"))
+            for i in range(len(self.stack) - 1, -1, -1):
+                if self.stack[i][0] == tag:
+                    del self.stack[i:]
+                    break
+            return
+        if tag == "title" and self._title is not None:
+            self.title, self._title = self._title.strip(), None
+        if self._one is not None and self._one[0] == len(self.stack):
+            self.oneline, self._one = " ".join(self._one[1].split()), None
+        self.stack.pop()
+
+    def handle_data(self, data):
+        if self._title is not None:
+            self._title += data
+        if self._one is not None:
+            self._one = (self._one[0], self._one[1] + data)
+
+    def _attrs(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "meta" and a.get("name", "").startswith("cp-"):
+            self.meta[a["name"]] = (a.get("content") or "").strip()
+        if "id" in a:
+            self.ids.append(a["id"])
+        if "data-c" in a:
+            self.datac.append(a["data-c"])
+        if "contenteditable" in a or "data-doc" in a or "draft" in (a.get("class") or "").split():
+            self.editable.append("%s: <%s> is editable (contenteditable, data-doc or .draft)" % (self.where(), tag))
+        for k, v in attrs:
+            if k in URL_ATTRS and v is not None:
+                for u in ([x.strip().split()[0] for x in v.split(",") if x.strip()] if k == "srcset" else [v.strip()]):
+                    self.urls.append((k, u, self.where()))
+            if k == "style" and v and re.search(r"url\(\s*['\"]?\s*([a-z][a-z0-9+.-]*:|//)", v, re.I):
+                self.errors.append("%s: style attribute with an external url()" % self.where())
+
+
+def parse(text):
+    p = Page()
+    p.feed(text)
+    p.close()
+    for tag, where in p.stack:
+        p.errors.append("<%s> from %s is never closed" % (tag, where))
+    return p
+
+
+def page_errors(p, text):
+    """What is wrong with one page by itself (not its links)."""
+    errs = list(p.errors) + list(p.editable)
+    if not re.match(r"\s*<!doctype html>", text, re.I):
+        errs.append("no <!doctype html> at the start")
+    for k in ("cp-title", "cp-say", "cp-kind"):
+        if not p.meta.get(k):
+            errs.append('no <meta name="%s" content="..."> (or it is empty)' % k)
+    if p.meta.get("cp-kind") and p.meta["cp-kind"] not in KINDS:
+        errs.append("cp-kind %r is none of %s" % (p.meta["cp-kind"], "/".join(sorted(KINDS))))
+    if p.title is None or p.title != p.meta.get("cp-title"):
+        errs.append("<title> %r is not cp-title %r" % (p.title, p.meta.get("cp-title")))
+    if p.oneline is None:
+        errs.append('no element of class "oneline" (the page\'s one-line conclusion, = cp-say)')
+    elif p.meta.get("cp-say") is not None and p.oneline != " ".join(p.meta["cp-say"].split()):
+        errs.append("the .oneline is not cp-say:\n    .oneline %s\n    cp-say   %s" % (p.oneline, p.meta["cp-say"]))
+    for kind, values in (("id", p.ids), ("data-c", p.datac)):
+        dup = sorted({v for v in values if values.count(v) > 1})
+        if dup:
+            errs.append("%s used more than once: %s" % (kind, ", ".join(dup)))
+    for k, u, where in p.urls:
+        if re.match(r"[a-z][a-z0-9+.-]*:", u, re.I) or u.startswith("//"):
+            errs.append("%s: external %s %s" % (where, k, u))
+    for m in re.finditer(r"<style[^>]*>(.*?)</style>", text, re.S | re.I):
+        if re.search(r"@import|url\(\s*['\"]?\s*([a-z][a-z0-9+.-]*:|//)", m.group(1), re.I):
+            errs.append("a <style> block imports or loads from another host")
+    return errs
+
+
+def git(*args, repo=".", text=True):
+    r = subprocess.run(["git", "-C", repo] + list(args), capture_output=True, text=text)
+    if r.returncode != 0:
+        raise SystemExit("publish-docs: git %s: %s" % (" ".join(args), (r.stderr if text else r.stderr.decode()).strip()))
+    return r.stdout
+
+
+def load_manifest(raw, where):
+    try:
+        pages = json.loads(raw)["pages"]
+        assert isinstance(pages, list) and all(isinstance(x, dict) for x in pages)
+        for x in pages:
+            for k in ("source", "project", "page"):
+                assert isinstance(x.get(k), str) and x[k], k
+            assert re.fullmatch(r"docs/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.html", x["source"]), x["source"]
+            assert re.fullmatch(r"[a-z0-9_-]+", x["project"]) and re.fullmatch(r"[a-z0-9_-]+", x["page"]), x
+    except (ValueError, KeyError, AssertionError) as e:
+        raise SystemExit("publish-docs: %s is not {\"pages\": [{\"source\": \"docs/<dir>/<page>.html\", \"project\", \"page\"}]}: %s" % (where, e))
+    targets = [(x["project"], x["page"]) for x in pages]
+    if len(set(targets)) != len(targets) or len({x["source"] for x in pages}) != len(pages):
+        raise SystemExit("publish-docs: %s names a source or a project/page twice" % where)
+    return pages
+
+
+def asset_names(names, source):
+    d = posixpath.dirname(source)
+    return sorted(n for n in names if posixpath.dirname(n) == d and n != source
+                  and posixpath.splitext(n)[1].lower() in ASSET_EXT)
+
+
+# ---------------------------------------------------------------- publish
+
+def publish(args):
+    repo = git("rev-parse", "--show-toplevel").strip()
+    rev = git("rev-parse", "--verify", args.rev + "^{commit}", repo=repo).strip()
+    pages = load_manifest(git("show", "%s:%s" % (rev, MANIFEST), repo=repo), "%s at %s" % (MANIFEST, rev[:12]))
+    projects = json.load(open(os.path.join(args.root, "projects.json"), encoding="utf-8"))
+    known = {p["id"] for p in projects}
+    changed, failed = [], []
+    for x in pages:
+        src, slug = x["source"], x["page"]
+        if x["project"] not in known:
+            failed.append("%s: project %s is not in %s/projects.json" % (src, x["project"], args.root))
+            continue
+        names = git("ls-tree", "-r", "--name-only", rev, "--", posixpath.dirname(src) + "/", repo=repo).split("\n")
+        if src not in names:
+            failed.append("%s: not in %s" % (src, rev[:12]))
+            continue
+        html = git("cat-file", "blob", "%s:%s" % (rev, src), repo=repo, text=False)
+        text = html.decode("utf-8")
+        p = parse(text)
+        errs = page_errors(p, text)
+        if errs:
+            failed.append("%s at %s:\n  %s" % (src, rev[:12], "\n  ".join(errs)))
+            continue
+        files = {posixpath.basename(n): git("cat-file", "blob", "%s:%s" % (rev, n), repo=repo, text=False)
+                 for n in asset_names(names, src)}
+        if {"index.html", "meta.json"} & set(files):
+            failed.append("%s: its directory has a file named index.html or meta.json besides the page" % src)
+            continue
+        ct, sha = git("log", "-1", "--format=%ct %H", rev, "--", src, repo=repo).split()
+        meta = {"title": p.meta["cp-title"], "say": p.meta["cp-say"], "kind": p.meta["cp-kind"],
+                "updated": time.strftime("%Y-%m-%d %H:%M", time.localtime(int(ct))), "machine": socket.gethostname(),
+                "source": "curryGPU " + src, "commit": sha[:12]}
+        files["index.html"] = html
+        files["meta.json"] = (json.dumps(meta, ensure_ascii=False) + "\n").encode("utf-8")
+        out = os.path.join(args.root, x["project"], slug)
+        have = {}
+        if os.path.isdir(out):
+            for n in os.listdir(out):
+                f = os.path.join(out, n)
+                if os.path.isfile(f):
+                    have[n] = open(f, "rb").read()
+        if have == files:
+            continue
+        os.makedirs(out, exist_ok=True)
+        for n in sorted(files, key=lambda n: (n == "meta.json", n == "index.html", n)):
+            if have.get(n) == files[n]:
+                continue
+            tmp = os.path.join(out, ".%s.tmp-%d" % (n, os.getpid()))
+            with open(tmp, "wb") as f:
+                f.write(files[n])
+            os.chmod(tmp, 0o664)
+            os.replace(tmp, os.path.join(out, n))
+        for n in have:
+            if n not in files:
+                os.remove(os.path.join(out, n))
+        changed.append("%s/%s" % (x["project"], slug))
+        print("publish-docs: %s -> %s/%s/ (%s, %s)" % (src, x["project"], slug, sha[:12], meta["updated"]))
+    if changed and not args.no_catalog:
+        r = subprocess.run([sys.executable, os.path.join(args.root, "gen_catalog.py")], cwd=args.root)
+        if r.returncode != 0:
+            failed.append("%s/gen_catalog.py exited %d" % (args.root, r.returncode))
+    for f in failed:
+        print("publish-docs: " + f, file=sys.stderr)
+    return 1 if failed else 0
+
+
+# ---------------------------------------------------------------- check
+
+def md_links(text):
+    text = re.sub(r"```.*?```", "", text, flags=re.S)
+    text = re.sub(r"`[^`\n]*`", "", text)
+    return re.findall(r"\]\(([^)\s]+)\)", text)
+
+
+def check(args):
+    repo = git("rev-parse", "--show-toplevel").strip()
+    os.chdir(repo)
+    errs = []
+    if not os.path.isfile(MANIFEST):
+        print("publish-docs --check: no %s" % MANIFEST, file=sys.stderr)
+        return 1
+    pages = load_manifest(open(MANIFEST, encoding="utf-8").read(), MANIFEST)
+    by_src = {x["source"]: x for x in pages}
+    on_disk = sorted(posixpath.join(dp, n) for dp, _, ns in os.walk("docs") for n in ns if n.endswith(".html"))
+    for s in on_disk:
+        if s not in by_src:
+            errs.append("%s is not in %s (every docs/**/*.html is a curryPlan page)" % (s, MANIFEST))
+    parsed = {}
+    for s in by_src:
+        if not os.path.isfile(s):
+            errs.append("%s: %s names it, but it does not exist" % (s, MANIFEST))
+            continue
+        text = open(s, encoding="utf-8").read()
+        parsed[s] = parse(text)
+        errs += ["%s: %s" % (s, e) for e in page_errors(parsed[s], text)]
+
+    def site(src):
+        x = by_src[src]
+        return "/%s/%s/" % (x["project"], x["page"])
+
+    at_site = {}   # /<project>/<page>/, /<project>/<page>, /<project>/<page>/index.html -> its source
+    for src in by_src:
+        for v in (site(src), site(src).rstrip("/"), site(src) + "index.html"):
+            at_site[v] = src
+
+    for s, p in parsed.items():
+        d = posixpath.dirname(s)
+        published = {posixpath.basename(n) for n in asset_names([posixpath.join(d, f) for f in os.listdir(d)], s)}
+        for k, u, where in p.urls:
+            if re.match(r"[a-z][a-z0-9+.-]*:", u, re.I) or u.startswith("//"):
+                continue   # external, reported above
+            path, _, frag = u.partition("#")
+            path = path.split("?")[0]
+            if path.startswith("/"):
+                # a path of the site: checked only when it is a page of the manifest
+                target = at_site.get(path)
+                if target and frag and target in parsed and frag not in parsed[target].ids:
+                    errs.append("%s: %s %s: %s (%s) has no id %s" % (s, where, u, path, target, frag))
+                continue
+            if not path:
+                if frag and frag not in p.ids:
+                    errs.append("%s: %s %s: no id %s in this page" % (s, where, u, frag))
+                continue
+            target = posixpath.normpath(posixpath.join(d, path))
+            if os.path.isdir(target) and posixpath.join(target, "index.html") in by_src:
+                target = posixpath.join(target, "index.html")
+            if not target.startswith("docs/") or not os.path.isfile(target):
+                errs.append("%s: %s %s %s: %s is outside docs/ or does not exist" % (s, where, k, u, target))
+                continue
+            if target in by_src:
+                want = posixpath.normpath(posixpath.join(site(s), path))
+                if at_site.get(want) != target:
+                    errs.append("%s: %s %s: on curryPlan it reaches %s, but %s is published at %s" % (s, where, u, want, target, site(target)))
+                if frag and target in parsed and frag not in parsed[target].ids:
+                    errs.append("%s: %s %s: %s has no id %s" % (s, where, u, target, frag))
+            elif posixpath.dirname(target) != d or posixpath.basename(target) not in published:
+                errs.append("%s: %s %s: %s is not published with the page (only files of its directory with a web "
+                            "extension are, and the pages of %s)" % (s, where, u, target, MANIFEST))
+    for dirpath, _, names in os.walk("docs"):
+        for n in names:
+            if not n.endswith(".md"):
+                continue
+            f = posixpath.join(dirpath, n)
+            for u in md_links(open(f, encoding="utf-8").read()):
+                if re.match(r"[a-z][a-z0-9+.-]*:", u, re.I) or u.startswith("#"):
+                    continue
+                path, _, frag = u.partition("#")
+                target = posixpath.normpath(posixpath.join(dirpath, path))
+                if not os.path.exists(target):
+                    errs.append("%s: link %s: %s does not exist" % (f, u, target))
+                elif frag and target in parsed and frag not in parsed[target].ids:
+                    errs.append("%s: link %s: %s has no id %s" % (f, u, target, frag))
+    dirs = sorted(d for d in os.listdir("docs") if os.path.isdir(os.path.join("docs", d)))
+    if dirs:
+        pat = r"(^|[^A-Za-z0-9_./-])(docs/(%s)/[A-Za-z0-9_.-]*[A-Za-z0-9_-])(#[A-Za-z0-9_-]+)?" % "|".join(map(re.escape, dirs))
+        r = subprocess.run(["git", "grep", "-I", "-n", "--untracked", "-E", pat], capture_output=True, text=True)
+        if r.returncode not in (0, 1):
+            errs.append("git grep: " + r.stderr.strip())
+        for line in r.stdout.splitlines():
+            where, _, rest = line.partition(":")
+            lno, _, content = rest.partition(":")
+            for m in re.finditer(pat, content):
+                ref, frag = m.group(2), (m.group(4) or "")[1:]
+                if not os.path.exists(ref):
+                    errs.append("%s:%s mentions %s, which does not exist" % (where, lno, ref))
+                elif frag and ref in parsed and frag not in parsed[ref].ids:
+                    errs.append("%s:%s mentions %s#%s, but %s has no id %s" % (where, lno, ref, frag, ref, frag))
+    for e in errs:
+        print("publish-docs --check: " + e, file=sys.stderr)
+    n = len(parsed)
+    print("DOCS %s: %d pages, %d problems" % ("FAIL" if errs else "PASS", n, len(errs)))
+    return 1 if errs else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--check", action="store_true", help="check the work tree's pages instead of publishing")
+    ap.add_argument("--rev", default="HEAD", help="the commit whose pages are published (default HEAD)")
+    ap.add_argument("--root", default="/var/www/plan", help="curryPlan's site root (default /var/www/plan)")
+    ap.add_argument("--no-catalog", action="store_true", help="do not run ROOT/gen_catalog.py")
+    args = ap.parse_args()
+    return check(args) if args.check else publish(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

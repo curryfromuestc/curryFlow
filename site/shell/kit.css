@@ -108,3 +108,30 @@ svg.chart { max-width: 720px; margin: 0 auto; }
 .draft-bar button.hist { background: var(--surface); color: var(--ink-2); border-color: var(--line); }
 .draft-bar button.hist { margin-right: -6px; }
 .draft-bar button.hist:disabled { opacity: .55; cursor: default; }
+
+/* 状态标签、指标带、下一步与折叠明细（避免大段散文） */
+.ev, .badge { display: inline-block; padding: 0 7px; border-radius: 999px; font-size: 11.5px; font-weight: 600; line-height: 1.6; white-space: nowrap; vertical-align: baseline; }
+.ev.nv, .badge.acc { background: var(--accent-soft); color: var(--accent); }
+.ev.pub, .badge.muted { background: var(--sunk); color: var(--ink-2); }
+.ev.rtl, .badge.ok { background: var(--sunk); color: var(--c3); box-shadow: inset 0 0 0 1px var(--c3); }
+.ev.inf, .badge.warn { background: var(--sunk); color: var(--warn); box-shadow: inset 0 0 0 1px var(--warn); }
+.ev.usr { background: var(--sunk); color: var(--ink); box-shadow: inset 0 0 0 1px var(--c2); }
+.metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; margin: 8px 0; }
+.metric { padding: 6px 10px; background: var(--sunk); border-radius: 4px; }
+.metric b { display: block; font: 700 16px/1.25 var(--mono); color: var(--ink); }
+.metric span { font-size: 11.5px; color: var(--ink-3); }
+.next { margin-top: 8px; padding: 6px 10px; background: var(--accent-soft); border-left: 3px solid var(--accent); border-radius: 0 4px 4px 0; font-size: 12.5px; color: var(--ink); }
+details.fold { margin-top: 8px; border-top: 1px dashed var(--line); padding-top: 6px; font-size: 12.5px; color: var(--ink-2); }
+details.fold > summary { cursor: pointer; color: var(--ink-3); font-size: 12px; font-weight: 600; user-select: none; }
+details.fold > summary:hover { color: var(--accent); }
+details.fold[open] > summary { margin-bottom: 6px; color: var(--ink-2); }
+.dg { display: block; width: 100%; height: auto; max-width: 900px; margin: 4px auto; font-family: var(--sans); }
+.dg .box { fill: var(--surface); stroke: var(--line); stroke-width: 1.5; }
+.dg .box.hl { stroke: var(--accent); }
+.dg .box.ref { fill: var(--sunk); stroke: var(--c3); }
+.dg .box.off { fill: var(--sunk); stroke-dasharray: 5 4; }
+.dg .t { fill: var(--ink); font-size: 14px; font-weight: 700; }
+.dg .s { fill: var(--ink-3); font-size: 11.5px; }
+.dg .lb { fill: var(--ink-2); font-size: 11px; }
+.dg .w { stroke: var(--accent); stroke-width: 1.8; fill: none; }
+.dg .w.ref { stroke: var(--c3); stroke-dasharray: 5 4; }

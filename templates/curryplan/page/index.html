@@ -4,14 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>__标题__</title>
+<meta name="cp-title" content="__标题__">
+<meta name="cp-say" content="__一句话结论，与正文 .oneline 完全一致__">
+<meta name="cp-kind" content="方案">
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="apple-touch-icon" href="/icon-180.png">
 <meta name="theme-color" content="#2747B0">
 <link rel="stylesheet" href="/kit.css">
 <link rel="stylesheet" href="/ui.css">
-<style>
-/* 页面自己的少量样式；颜色只用 kit.css 的变量（--ink、--accent、--c3、--warn……），深色模式自动跟上 */
-</style>
 </head>
 <body>
 <div class="wrap">
@@ -19,14 +19,28 @@
   <a class="back" href="/">← 全部</a>
   <div class="top"><h1>__标题__</h1><span class="sub">__副标题__</span></div>
 </header>
-<p class="oneline" data-c="say">__一句话结论，和 meta.json 的 say 一致__</p>
+<p class="oneline" data-c="say">__一句话结论，与正文 .oneline 完全一致__</p>
 
 <section class="sec" id="s1">
   <h2>__小节__ <small>__注__</small></h2>
   <div class="wall">
-    <div class="card" data-c="c1"><h3>__卡片__</h3><p class="say">__一句话__</p><!-- 图、表、SVG --></div>
-    <div class="card" data-c="c2"><h3>__卡片__</h3><p class="say">__一句话__</p></div>
-    <div class="card wide scroll" data-c="t1">
+    <div class="card" id="c1" data-c="c1">
+      <h3><span class="badge warn">缺口</span> __卡片标题__</h3>
+      <p class="say">__一句话结论（不超过两行）__</p>
+      <div class="metrics">
+        <div class="metric"><b>1.0</b><span>__当前__</span></div>
+        <div class="metric"><b>0.5</b><span>__目标__</span></div>
+      </div>
+      <div class="next">下一步：__具体动作__</div>
+      <details class="fold">
+        <summary>排查记录与明细</summary>
+        <table class="t">
+          <tr><th>__项__</th><th class="n">__数值__</th></tr>
+          <tr><td>__行__</td><td class="n">1.0</td></tr>
+        </table>
+      </details>
+    </div>
+    <div class="card wide scroll" id="t1" data-c="t1">
       <table class="t">
         <tr><th>__列__</th><th class="n">__数字列__</th></tr>
         <tr><td>__行__</td><td class="n">1.0</td></tr>

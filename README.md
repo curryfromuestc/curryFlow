@@ -1,31 +1,26 @@
 # curryFlow
 
-给一个项目引导出多机开发流程的 Claude Code / codex skill。curryFlow 只做引导：探测机器、和人定验收阶段，
-从 `templates/` 生成项目自己的 `ci/`（`accept`、`machines`、`coord`、`executor`、`cflib.py`）、`AGENTS.md`
-和 `.gitignore`，建中枢 git 仓库和镜像，在每台机器装 executor，开 curryPlan 项目。生成之后流程跟着项目仓库走，
-和 curryFlow 无关。全部约定见 [SKILL.md](SKILL.md)。
+多机开发流程、机器池调度与 curryPlan 文档的统一 skill。全部约定见 [SKILL.md](SKILL.md) 与 [curryplan.md](curryplan.md)。
 
 ```
 templates/
-  ci/accept            分阶段验收的骨架（项目填 STAGES、TIERS）
-  ci/coord             协调器 CLI：租约、任务、审查、排队、合并、状态、等待
-  ci/executor          每台机器的常驻进程：probe、install、start、stop、run
-  ci/cflib.py          两者共用：读 ci/machines，和中枢之间读写 ref
-  hub/post-receive     主中枢镜像到备用中枢
-  project/AGENTS.md    项目规则骨架；project/gitignore
-  curryplan/plan/      方案页骨架；curryplan/status/ 读中枢数据的状态页
-  curryplan/page/      通用页面骨架；curryplan/machines/ 机器页
-  pool/beat            每台机器每分钟一份心跳；pool/status 把心跳、队列和结论汇成机器页的 status.json
-  pool/executor        机器级 executor：每台机器一个，管这台机器的槽位，服务所有项目
-  pool/flow            拿槽位的命令：flow run（提交作业并等结论）、flow hold（占用槽位）、ls、cancel、release
-bin/planpub            把一个页面目录发布到 curryPlan
-test/pool/e2e          机器池的端到端测试：本机上的假中枢、两台假机器，跑完写出 results.tsv
-curryplan.md           curryPlan 的页面约定、发布、注册项目、状态页
-site/                  curryPlan 站点本身：shell/（页面目录和公共文件）、server/（评论、提问、通知）、test/push/（通知的端到端测试）
+  ci/accept              分阶段验收骨架（项目填 STAGES、TIERS）
+  hub/post-receive       主中枢镜像到备用中枢
+  project/AGENTS.md      项目规则骨架
+  project/gitignore      .gitignore 骨架
+  project/publish-docs   docs/*.html 检查（--check）与自动发布到 curryPlan
+  curryplan/page/        通用页面骨架（图表、表格、指标格、折叠明细）
+  curryplan/plan/        方案页骨架
+  curryplan/machines/    机器页
+  pool/beat              每台机器每分钟一份心跳（含 --probe 拓扑探测）
+  pool/status            把心跳、队列和结论汇成机器页的 status.json
+  pool/executor          机器级 executor：每台机器一个，管这台机器的槽位，服务所有项目
+  pool/flow              拿槽位的命令：flow run（提交作业并等结论）、flow hold（占用槽位）、ls、cancel、release
+bin/planpub              把一个独立页面目录发布到 curryPlan
+test/pool/e2e            机器池的端到端测试：本机上的假中枢、两台假机器，跑完写出 results.tsv
+curryplan.md             curryPlan 的排版铁律、同源自动发布、注册项目、通知
+site/                    curryPlan 站点本身：shell/（页面目录和公共文件）、server/（评论、提问、通知）、test/push/（通知的端到端测试）
 ```
-
-只用 Python 3 标准库、git、ssh；incus 机器上的 agent 容器靠 [agentbox](https://github.com/curryfromuestc/agentbox)
-的 `agentctl`，herdr 让人能 attach 到 executor 和容器里的 agent。
 
 ## 机器池：两条命令
 

@@ -7,37 +7,69 @@
   `CURRYPLAN_URL=https://主机:端口`；下面的命令先 `. ~/.config/curryflow/local.env`。
 - 主机 `$CURRYPLAN_SSH`（key 登录），站点根 `/var/www/plan`，nginx 在 8443 端口，口令 cookie 挡在前面。
 - 域名还没备案，现在直接用 IP 访问（Let's Encrypt IP 证书，服务器上 lego-renew.timer 自动续期）；备案完成后改成正式域名。
-- `/api/*` 由 `~/curry-site/server.py`（127.0.0.1:8765）处理：评论、提问、可编辑正文。**不要改它**，也不要动
+- `/api/*` 由 `~/curry-site/server.py`（127.0.0.1:8765）处理：评论、提问、可编辑正文。**不要改它**，也不要直接手改
   站点根下的公共文件（`kit.css`、`ui.css`、`ui.js`、`kit.js`、`app.*`、`index.html`、`sw.js`）——它们的源在
   本仓库（curryFlow）的 `site/shell/`，服务端在 `site/server/`，端到端测试在 `site/test/push/`。
-- 动手前先看两三个现有页面学样子：`/var/www/plan/curryplan/flow/`（方案页的好样板）、`currygpu/sm/`、`rtlsim/paper/`。
 
-## 页面约定
+## 排版铁律（禁止大段文字）
 
-- 位置：`/var/www/plan/<项目>/<页面>/index.html`，同目录放 `meta.json` 和图片、视频、PDF。
-- `meta.json`：`{"title", "say", "kind", "updated": "YYYY-MM-DD HH:MM", "machine": 写页面的机器名}`。
-  `say` 是一句话结论，首页搜索读它；`kind` 用 方案 / 笔记 / 学习 / 状态（首页有 方案、笔记 两个筛选按钮）。
-- 骨架从 `templates/curryplan/page/index.html` 起：头里引 `/manifest.webmanifest`、`/icon-180.png`、`/kit.css`、`/ui.css`，
-  尾部引 `/kit.js`、`/ui.js`。顶上 `.back`（← 全部）和 `.top`（h1、`.sub`），一句话结论放 `.oneline`。
-- kit.css 的件：`.sec > h2 small`（小节）、`.wall`（桌面两栏、手机单栏的卡片墙）、`.card`（`.wide` 占满）、
-  `.say`、`.pair`、`.kpi`、`table.t`（数字列 `.n`）、`.scroll`、`svg.chart` 一族（`.bar .grid .tk .lb .val .ref`）。
-  颜色只用它的变量（`--ink --ink-2 --ink-3 --accent --c2 --c3 --warn --line --sunk --surface`），深色模式自动跟上。
-- 能评论的实体：带 `data-c="稳定的名字"` 的元素，或图、卡片、表格行、段落、标题、列表项。给要讨论的卡片和
-  表加 `data-c`，改版后评论还能挂回原处。
-- 内容：中文；**只写最终的产品形态**——结论、数字、图、表；不写讨论过程、待定选项、"我们考虑过"。
-  拍板发生在会话里，定了再改页面。高密度、图表优先，图能说清的不写段落。
-- 不带外部依赖（CDN、字体）；图片放同目录，大视频压一下再放。
+页面是给人快速扫读、加深对项目理解的，**严禁写成大段散文或满屏文字卡片**：
 
-## 发布
+1. **段落不超 2 行，数字对比一律进表或图**
+   - 任何 `<p>` 或 `<li>` 在桌面端不得超过 2 行；禁止用分号、括号把十几个模块名、拍数、commit 号塞进同一段话。
+   - 只要出现 3 组以上数字或前后对比（如改前/改后/目标、各层延迟、模块面积/WNS、配置参数），**禁止写进文字段落**，必须用 `table.t`（数字列加 `.n`）、`.metrics > .metric` 指标带或 `svg.chart` 条形图。
+2. **设计文档页（`docs/*/index.html`）：框图 + 规格表优先**
+   - 每个核心章节以一张 `svg.dg`（模块框图、数据通路、流水线时序图）配一张 `table.t`（位宽、深度、吞吐、延迟、参数）为主体。
+   - 禁止连续堆砌几十张结构雷同的"是什么 / 为什么 / 不这样"纯文字卡片；只有反直觉的设计取舍才用精简卡片或表格列说明。
+3. **待办页（`docs/*/todo.html`）：结论外露，排查明细折叠**
+   - 每张待办卡片外层只放四样东西：
+     - 标题行 + 状态标签（`.badge.warn` 阻塞/缺口、`.badge.acc` 待合并、`.badge.muted` 待验证）
+     - 一句话现状与差距（不超过 2 行）
+     - 关键指标表（`table.t` 或 `.metrics`）
+     - 下一步动作（`<div class="next">下一步：…</div>`）
+   - 历史排查过程、试过但没成的方案、逐层/逐内核长列表，一律放进 `<details class="fold"><summary>排查记录与明细</summary>…</details>` 默认折叠，点开才看。
 
-```sh
-ssh "$CURRYPLAN_SSH" 'mkdir -p /var/www/plan/<项目>/<页面>'
-scp -r <目录>/* "$CURRYPLAN_SSH":/var/www/plan/<项目>/<页面>/
-ssh "$CURRYPLAN_SSH" 'python3 /var/www/plan/gen_catalog.py'     # 重写首页目录 catalog.json
+```
+待办卡片标准结构:
+  .card[id][data-c]
+    ├─ h3: <span class="badge warn">性能缺口</span> 标题
+    ├─ p.say: 一句话结论（≤2行）
+    ├─ table.t 或 .metrics: 基线 / 当前 / 目标 / 瓶颈对比表
+    ├─ .next: 下一步要做的具体动作
+    └─ details.fold: <summary>排查记录与明细</summary> 历史实验、长列表
 ```
 
-每次发布都更新 `meta.json` 的 `updated`。`bin/planpub 项目 页面名 目录 "标题" "一句话结论" [种类]` 一条命令做完
-上面三步（自己写 meta.json，任何机器上都能用）。地址是 `$CURRYPLAN_URL/<项目>/<页面>/`。
+## 页面结构与组件
+
+- 位置：`/var/www/plan/<项目>/<页面>/index.html`，同目录放 `meta.json` 和图片、视频、PDF。
+- 仓库同源页面（推荐）：项目仓库里的 `docs/<模块>/index.html` 和 `docs/<模块>/todo.html` 在 `<head>` 写：
+  ```html
+  <meta name="cp-title" content="标题（与 <title> 完全一致）">
+  <meta name="cp-say" content="一句话结论（与正文 .oneline 完全一致）">
+  <meta name="cp-kind" content="方案"><!-- 方案 / 笔记 / 学习 / 状态 -->
+  ```
+  并在 `docs/pages.json` 登记 `{"pages": [{"source": "docs/rtl/index.html", "project": "currygpu", "page": "rtl"}, ...]}`。
+  `tools/publish-docs --check` 挂进项目的 `style` 验收阶段（检查标签闭合、死链、`id`/`data-c` 唯一、仓库内 `docs/...#id` 引用有效）。
+- `kit.css` 组件：
+  - 布局：`.sec > h2 small`、`.wall`（两栏卡片墙）、`.card`（`.wide` 占满两栏）、`.pair`、`.scroll > table.t`（数字列 `.n`）
+  - 视觉提炼：`.kpi`、`.metrics > .metric`（`<b>数值</b><span>说明</span>`）、`.badge.{acc,warn,ok,muted}`、`.ev.{nv,pub,rtl,inf,usr}`、`.next`（下一步动作条）、`details.fold > summary`（折叠明细）
+  - 图表：`svg.chart`（`.bar .grid .tk .lb .val .ref`）、`svg.dg`（`.box .box.hl .box.ref .box.off .t .s .lb .w`）
+  - 颜色只用 CSS 变量（`--ink --ink-2 --ink-3 --accent --c2 --c3 --warn --line --sunk --surface`），深色模式自动适配。
+- 能评论的实体：带 `data-c="稳定的名字"` 的元素。给卡片和表加 `data-c`，改版后评论仍挂回原处。
+- 不带外部依赖（CDN、外链字体）。
+
+## 发布与自动同步
+
+1. **项目 `docs/` 自动同步（主方式）**
+   在 curryPlan 机上建项目的稀疏 clone，cron 每分钟拉中枢 `main` 并执行 `tools/publish-docs`：
+   ```sh
+   ssh "$CURRYPLAN_SSH" 'git clone -q --filter=blob:none --sparse ci@<主中枢>:<项目>.git ~/curryflow/<项目>-docs &&
+     git -C ~/curryflow/<项目>-docs sparse-checkout set docs tools/publish-docs'
+   # crontab 加一行
+   * * * * * cd ~/curryflow/<项目>-docs && flock -n .git/pub.lock sh -c "git pull -q --ff-only && python3 tools/publish-docs" >/dev/null 2>&1  # curryPlan <项目> docs
+   ```
+2. **独立页面手工发布**
+   `bin/planpub 项目 页面名 目录 "标题" "一句话结论" [种类]`。
 
 ## 注册新项目
 
@@ -52,42 +84,14 @@ EOF
 mkdir -p <项目> && python3 gen_catalog.py'
 ```
 
-## 状态页（curryFlow 项目）
-
-模板在 `templates/curryplan/status/index.html`（把 `__PROJECT__` 换成项目名），页面本身不带
-数据，每 30 秒读同目录的 `status.json`：租约、任务、候选 × 阶段的结论、executor 心跳和槽位、每台机器每天的磁盘
-占用。`status.json` 由 curryPlan 机上的一份项目 clone 每分钟从中枢读出来（`ci/coord status --json`）：
-
-```sh
-# 一次：clone（curryPlan 机的公钥要在中枢 ci 用户的 authorized_keys 里）
-ssh "$CURRYPLAN_SSH" 'mkdir -p ~/curryflow && git clone -q ci@<主中枢>:<项目>.git ~/curryflow/<项目>-status'
-# crontab 加一行（保留已有的行；行尾注释用来认出它）
-* * * * * cd ~/curryflow/<项目>-status && flock -n .git/cf-status.lock sh -c "git pull -q --ff-only; python3 ci/coord status --json > /var/www/plan/<项目>/status/status.json.tmp && mv /var/www/plan/<项目>/status/status.json.tmp /var/www/plan/<项目>/status/status.json" >/dev/null 2>&1  # curryFlow <项目> 状态页
-```
-
-状态页的 `meta.json` 用 `"kind": "状态"`。读不到中枢时页面会显示"读不到 status.json"，数据时间写在右上角。
-
 ## 通知
 
 curryPlan 能往手机推通知（标准 Web Push）：机器告警、作业完成这类消息。它只是通道，什么时候发由调用方决定。
 
-- 开：首页右上角的"通知"→"开启通知"→ 允许 →"发一条测试"。每台设备各开一次，同一个地方可以关闭；开关上写着
-  当前状态，开不了时写明原因和该怎么做。
-- iPhone：网页通知只在主屏幕应用里可用（iOS 16.4 起），浏览器标签页里不行。先在 Safari 里打开站点，分享 →
-  "添加到主屏幕"，再从主屏幕的 curryPlan 图标打开（要再输一次口令），在那里开启。
-- Android：Chrome 标签页里直接开。Chrome 的推送走谷歌 FCM，手机要能连上谷歌；curryPlan 机直连不了谷歌，发往 FCM 的
-  请求走 `~/curry-site/push.env` 里 `FCM_PROXY_CMD` 指的转发（一条命令，stdin/stdout 当作到 `%h:%p` 的 TCP 流，
-  TLS 仍然直到谷歌）。现在转发经中枢（中枢上 curryPlan 机那把 key 只放行到 `fcm.googleapis.com:443`）。转发不通时，"发一条测试"和 `notify` 会把原因报出来。
-- 发：在 curryPlan 机上
-
+- 开：首页右上角的"通知"→"开启通知"→ 允许 →"发一条测试"。每台设备各开一次，同一个地方可以关闭。
+- iPhone：网页通知只在主屏幕应用里可用（iOS 16.4 起）。先在 Safari 里打开站点，分享 → "添加到主屏幕"，再从主屏幕图标打开开启。
+- Android：Chrome 标签页里直接开（手机要能连上谷歌 FCM；curryPlan 机经 `~/curry-site/push.env` 的 `FCM_PROXY_CMD` 转发）。
+- 发：
   ```sh
-  ~/curry-site/notify "标题" "正文" [url] [--tag 名字]
+  ssh "$CURRYPLAN_SSH" '~/curry-site/notify "标题" "正文" [url] [--tag 名字]'
   ```
-
-  发给所有开了通知的设备。`url` 是点通知后打开的地址，只收本站的（`/` 开头的路径或 `$CURRYPLAN_URL/…`（服务器上 `~/curry-site/site.env` 的 `SITE=`，不入库），不写就是首页）；同一个
-  `--tag` 的新通知顶掉设备上旧的那条。退出码：0 至少一台设备的推送服务收下了，1 一台也没有（原因在 stderr），
-  2 没问成。别的机器上：`ssh "$CURRYPLAN_SSH" '~/curry-site/notify "标题" "正文"'`。
-- 接口是 `POST /api/notify {title, body, url?, tag?}`，要带 `X-Notify-Key`（`~/curry-site/notify.key`）：nginx 把外面来的
-  `/api/*` 也从 127.0.0.1 转给服务，来源地址分不出本机，所以认密钥。每次发送在 `~/curry-site/push.log` 记一行；推送
-  服务说已失效（404/410）的订阅自动删。实现在 curryPlan 仓库的 `server/push.py`（RFC 8291 加密、RFC 8292 VAPID），
-  `~/curry-site/venv/bin/python ~/curry-site/push.py selftest` 对着 RFC 里的数值自检。
