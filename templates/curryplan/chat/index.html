@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<title>本地模型</title>
+<meta name="cp-title" content="本地模型">
+<meta name="cp-say" content="Mac mini 上的本地多模态模型：按需启动、停止，聊天记录存在 curryPlan 上">
+<meta name="cp-kind" content="工具">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<meta name="theme-color" content="#2747B0">
+<link rel="stylesheet" href="/kit.css">
+<style>
+html, body { height: 100%; }
+body { overflow: hidden; }
+.app { display: grid; grid-template-columns: 260px minmax(0, 1fr); height: 100dvh; }
+/* 会话列表 */
+.side { display: flex; flex-direction: column; min-height: 0; background: var(--surface); border-right: 1px solid var(--line); }
+.side .hd { display: flex; align-items: center; gap: 8px; padding: 12px 12px 8px; }
+.side .hd a { text-decoration: none; font-size: 13px; color: var(--ink-3); }
+.side .hd b { font-size: 15px; margin-right: auto; }
+.side input { margin: 0 12px 8px; padding: 7px 10px; border: 1px solid var(--line); border-radius: var(--r); background: var(--bg); color: var(--ink); font: inherit; }
+.convs { flex: 1; overflow-y: auto; padding: 0 6px 12px; }
+.conv { display: flex; align-items: center; gap: 6px; padding: 7px 8px; border-radius: var(--r); cursor: pointer; color: var(--ink-2); }
+.conv:hover { background: var(--sunk); }
+.conv.on { background: var(--accent-soft); color: var(--ink); }
+.conv .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conv .d { font: 11px var(--mono); color: var(--ink-3); }
+.convs .empty { color: var(--ink-3); font-size: 13px; padding: 12px 8px; }
+/* 主区 */
+.main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.bar { display: flex; align-items: center; gap: 8px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--surface); flex-wrap: wrap; }
+.bar .ttl { font-weight: 600; font-size: 15px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40vw; }
+.bar .sp { flex: 1; }
+.st { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--ink-3); }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--c2); }
+.dot.running { background: var(--c3); } .dot.loading { background: #D9A400; } .dot.offline, .dot.external { background: var(--warn); }
+button.b { flex-shrink: 0; white-space: nowrap; padding: 5px 12px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); color: var(--ink); font: inherit; font-size: 13px; cursor: pointer; }
+button.b:hover { border-color: var(--ink-3); }
+button.b.pri { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.b.warn { color: var(--warn); }
+button.b:disabled { opacity: .45; cursor: default; }
+button.lnk { border: 0; background: none; padding: 2px 4px; color: var(--ink-3); font: inherit; font-size: 12px; cursor: pointer; }
+button.lnk:hover { color: var(--accent); }
+.menu { display: none; }
+#log { flex: 1; overflow-y: auto; padding: 16px; }
+.msgs { max-width: 52rem; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
+.hello { color: var(--ink-3); text-align: center; margin-top: 18vh; font-size: 14px; }
+.m { line-height: 1.7; word-wrap: break-word; }
+.m.u { align-self: flex-end; max-width: 85%; background: var(--accent-soft); padding: 9px 13px; border-radius: 12px 12px 2px 12px; white-space: pre-wrap; }
+.m.u .imgs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.m.u img { max-width: 200px; max-height: 200px; border-radius: 6px; cursor: zoom-in; display: block; }
+.m.a { background: var(--surface); border: 1px solid var(--line); border-radius: 2px 12px 12px 12px; padding: 10px 14px; }
+.m.a details { margin-bottom: 6px; font-size: 13px; color: var(--ink-3); }
+.m.a details summary { cursor: pointer; user-select: none; }
+.m.a .think { white-space: pre-wrap; border-left: 3px solid var(--line); padding-left: 10px; margin-top: 6px; max-height: 360px; overflow-y: auto; }
+.md p { margin: 0 0 .6em; } .md p:last-child { margin-bottom: 0; }
+.md h1, .md h2, .md h3, .md h4 { font-size: 15px; margin: .8em 0 .4em; }
+.md ul, .md ol { margin: .3em 0 .6em; padding-left: 1.4em; }
+.md pre { background: var(--sunk); padding: 10px 12px; border-radius: var(--r); overflow-x: auto; font: 12.5px/1.55 var(--mono); position: relative; }
+.md code { font: 12.5px var(--mono); background: var(--sunk); padding: 1px 4px; border-radius: 4px; }
+.md pre code { background: none; padding: 0; }
+.md blockquote { margin: .4em 0; padding-left: 10px; border-left: 3px solid var(--line); color: var(--ink-2); }
+.md table { border-collapse: collapse; margin: .4em 0; font-size: 13px; display: block; overflow-x: auto; }
+.md th, .md td { border: 1px solid var(--line); padding: 3px 8px; }
+.meta { display: flex; gap: 10px; align-items: center; margin-top: 6px; font: 11.5px var(--mono); color: var(--ink-3); }
+.err { color: var(--warn); }
+/* 输入区 */
+.foot { border-top: 1px solid var(--line); background: var(--surface); padding: 10px 16px calc(10px + env(safe-area-inset-bottom, 0px)); }
+.box { max-width: 52rem; margin: 0 auto; display: flex; flex-direction: column; gap: 8px; }
+#thumbs { display: flex; gap: 8px; flex-wrap: wrap; }
+#thumbs:empty { display: none; }
+#thumbs div { position: relative; }
+#thumbs img { height: 60px; border-radius: 6px; border: 1px solid var(--line); display: block; }
+#thumbs span { position: absolute; top: -6px; right: -6px; width: 18px; height: 18px; border-radius: 50%; background: var(--ink); color: var(--bg); font-size: 12px; line-height: 18px; text-align: center; cursor: pointer; }
+textarea { width: 100%; min-height: 48px; max-height: 40vh; resize: none; padding: 9px 11px; border: 1px solid var(--line); border-radius: var(--r); background: var(--bg); color: var(--ink); font: inherit; }
+.row { display: flex; gap: 8px; align-items: center; }
+.row .sp { flex: 1; }
+.hint { font-size: 12px; color: var(--ink-3); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 弹层 */
+.ov { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; z-index: 20; padding: 16px; }
+.ov[hidden] { display: none; }
+.ov img { max-width: 100%; max-height: 100%; border-radius: 6px; }
+.dlg { background: var(--surface); border-radius: 10px; padding: 16px; width: min(560px, 100%); display: flex; flex-direction: column; gap: 10px; }
+.dlg h3 { margin: 0; font-size: 15px; }
+.dlg textarea { min-height: 160px; }
+@media (max-width: 760px) {
+  .app { grid-template-columns: minmax(0, 1fr); }
+  .side { position: fixed; inset: 0 25% 0 0; z-index: 15; transform: translateX(-102%); transition: transform .2s; }
+  .app.open .side { transform: none; box-shadow: 0 0 24px rgba(0,0,0,.25); }
+  .menu { display: inline-block; }
+  .bar .ttl { max-width: 34vw; }
+  .m.u { max-width: 92%; }
+}
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <aside class="side">
+    <div class="hd"><a href="/">← 全部</a><b>会话</b><button type="button" class="b pri" id="bNew">新对话</button></div>
+    <input id="q" type="search" placeholder="搜索标题和内容" autocomplete="off">
+    <div class="convs" id="convs"><p class="empty">加载中…</p></div>
+  </aside>
+  <section class="main">
+    <div class="bar">
+      <button type="button" class="b menu" id="bMenu">会话</button>
+      <span class="ttl" id="ttl">新对话</span>
+      <button type="button" class="lnk" id="bRen" hidden>改名</button>
+      <button type="button" class="lnk" id="bSys" hidden>设定</button>
+      <button type="button" class="lnk" id="bDel" hidden>删除</button>
+      <span class="sp"></span>
+      <span class="st"><span class="dot" id="dot"></span><span id="stx">…</span></span>
+      <button type="button" class="b pri" id="bStart" disabled>启动模型</button>
+      <button type="button" class="b warn" id="bStop" disabled>停止模型</button>
+    </div>
+    <div id="log"><div class="msgs" id="msgs"></div></div>
+    <div class="foot"><div class="box">
+      <div id="thumbs"></div>
+      <textarea id="txt" rows="2" placeholder="输入消息，Enter 发送，Shift+Enter 换行；可粘贴或拖入图片"></textarea>
+      <div class="row">
+        <button type="button" class="b" id="bImg">图片</button><input type="file" id="file" accept="image/*" multiple hidden>
+        <span class="hint" id="hint"></span>
+        <span class="sp"></span>
+        <button type="button" class="b" id="bAbort" hidden>停止生成</button>
+        <button type="button" class="b pri" id="bSend">发送</button>
+      </div>
+    </div></div>
+  </section>
+</div>
+<div class="ov" id="ovImg" hidden><img alt=""></div>
+<div class="ov" id="ovSys" hidden><div class="dlg">
+  <h3>本会话的设定（system prompt）</h3>
+  <textarea id="sysTxt" placeholder="例如：你是一个简洁的中文助手。留空则不用设定。"></textarea>
+  <div class="row"><span class="sp"></span><button type="button" class="b" id="sysCancel">取消</button><button type="button" class="b pri" id="sysSave">保存</button></div>
+</div></div>
+<script>
+(function () {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const API = "/api/chat/";
+  const H = { "Content-Type": "application/json", "X-Requested-With": "curryplan-chat" };
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  let convs = [], cur = null, model = { state: "offline" }, pending = [], ctl = null;
+
+  // ---------- Markdown（先整体转义，只认常见块：代码块、标题、列表、引用、表格、行内代码、粗体、链接） ----------
+  function inline(s) {
+    const codes = [];
+    return s.replace(/\u0000/g, "").replace(/`([^`\n]+)`/g, (_, c) => "\u0000" + (codes.push(c) - 1) + "\u0000")
+      .replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>")
+      .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+      .replace(/\u0000(\d+)\u0000/g, (_, i) => "<code>" + codes[+i] + "</code>");
+  }
+  function md(src) {
+    const out = [], lines = esc(src).split("\n");
+    for (let i = 0; i < lines.length;) {
+      const l = lines[i];
+      if (/^\s*```/.test(l)) {
+        const buf = []; i++;
+        while (i < lines.length && !/^\s*```/.test(lines[i])) buf.push(lines[i++]);
+        i++; out.push("<pre><code>" + buf.join("\n") + "</code></pre>"); continue;
+      }
+      let m;
+      if ((m = l.match(/^(#{1,4})\s+(.*)$/))) { out.push("<h" + m[1].length + ">" + inline(m[2]) + "</h" + m[1].length + ">"); i++; continue; }
+      if (/^\s*([-*+]|\d+[.)])\s+/.test(l)) {
+        const ordered = /^\s*\d/.test(l), items = [];
+        while (i < lines.length && /^\s*([-*+]|\d+[.)])\s+/.test(lines[i])) items.push("<li>" + inline(lines[i++].replace(/^\s*([-*+]|\d+[.)])\s+/, "")) + "</li>");
+        out.push((ordered ? "<ol>" : "<ul>") + items.join("") + (ordered ? "</ol>" : "</ul>")); continue;
+      }
+      if (/^&gt;\s?/.test(l)) {
+        const buf = []; while (i < lines.length && /^&gt;\s?/.test(lines[i])) buf.push(inline(lines[i++].replace(/^&gt;\s?/, "")));
+        out.push("<blockquote>" + buf.join("<br>") + "</blockquote>"); continue;
+      }
+      if (/^\s*\|.*\|\s*$/.test(l) && i + 1 < lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
+        const row = (s, t) => "<tr>" + s.trim().replace(/^\||\|$/g, "").split("|").map((c) => "<" + t + ">" + inline(c.trim()) + "</" + t + ">").join("") + "</tr>";
+        let html = "<table>" + row(l, "th"); i += 2;
+        while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) html += row(lines[i++], "td");
+        out.push(html + "</table>"); continue;
+      }
+      if (!l.trim()) { i++; continue; }
+      const buf = []; while (i < lines.length && lines[i].trim() && !/^\s*```|^#{1,4}\s|^\s*([-*+]|\d+[.)])\s+|^&gt;/.test(lines[i])) buf.push(inline(lines[i++]));
+      if (!buf.length) buf.push(inline(lines[i++]));
+      out.push("<p>" + buf.join("<br>") + "</p>");
+    }
+    return out.join("");
+  }
+
+  // ---------- 接口 ----------
+  async function api(path, body) {
+    const r = await fetch(API + path, body === undefined ? { cache: "no-store" } : { method: "POST", headers: H, body: JSON.stringify(body) });
+    if (r.status === 302 || r.redirected) { location.href = "/login.html?next=" + encodeURIComponent(location.pathname); throw new Error("login"); }
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+    return j;
+  }
+  const ago = (t) => { const d = Date.now() / 1000 - t; return d < 60 ? "刚刚" : d < 3600 ? Math.floor(d / 60) + " 分" : d < 86400 ? Math.floor(d / 3600) + " 时" : new Date(t * 1000).toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" }); };
+
+  // ---------- 会话列表 ----------
+  async function loadConvs() {
+    const q = $("q").value.trim();
+    try { convs = await api("convs" + (q ? "?q=" + encodeURIComponent(q) : "")); } catch (e) { $("convs").innerHTML = '<p class="empty">读不到会话：' + esc(e.message) + "</p>"; return; }
+    $("convs").innerHTML = convs.length ? convs.map((c) => `<div class="conv${cur && c.id === cur.id ? " on" : ""}" data-id="${c.id}"><span class="t">${esc(c.title)}</span><span class="d">${ago(c.updated)}</span></div>`).join("")
+      : '<p class="empty">' + (q ? "没有匹配的会话" : "还没有会话") + "</p>";
+  }
+  $("convs").addEventListener("click", (e) => { const d = e.target.closest(".conv"); if (d) { openConv(d.dataset.id); $("app").classList.remove("open"); } });
+  let qt; $("q").addEventListener("input", () => { clearTimeout(qt); qt = setTimeout(loadConvs, 250); });
+  $("bMenu").onclick = () => $("app").classList.toggle("open");
+  $("bNew").onclick = () => { if (ctl) return; cur = null; history.replaceState(null, "", location.pathname); render(); loadConvs(); $("app").classList.remove("open"); $("txt").focus(); };
+
+  async function openConv(id) {
+    if (ctl) return;
+    try { cur = await api("convs/" + id); } catch (e) { cur = null; }
+    history.replaceState(null, "", cur ? "?c=" + cur.id : location.pathname);
+    render(); loadConvs();
+  }
+
+  // ---------- 渲染会话 ----------
+  function render() {
+    $("ttl").textContent = cur ? cur.title : "新对话";
+    ["bRen", "bSys", "bDel"].forEach((b) => ($(b).hidden = !cur));
+    const ms = cur ? cur.messages : [];
+    if (!ms.length) { $("msgs").innerHTML = '<p class="hello">' + (model.state === "running" ? "模型已就绪，说点什么吧" : "先点右上角「启动模型」，加载约 5 秒") + "</p>"; return; }
+    const lastA = ms.map((m) => m.role).lastIndexOf("assistant");
+    $("msgs").innerHTML = ms.map((m, i) => m.role === "user"
+      ? `<div class="m u">${m.images && m.images.length ? '<div class="imgs">' + m.images.map((n) => `<img src="${API}img/${esc(n)}" alt="">`).join("") + "</div>" : ""}${esc(m.text)}</div>`
+      : `<div class="m a">${m.reasoning ? `<details><summary>思考过程</summary><div class="think">${esc(m.reasoning)}</div></details>` : ""}<div class="md">${md(m.text || "")}</div>` +
+        `<div class="meta">${m.secs != null ? m.secs + " 秒" : ""}${m.tps ? " · " + m.tps + " tok/s" : ""}${m.stopped ? ' · <span class="err">已停止</span>' : ""}` +
+        `<button type="button" class="lnk" data-copy="${i}">复制</button>${i === lastA && i === ms.length - 1 ? '<button type="button" class="lnk" data-regen="1">重新生成</button>' : ""}</div></div>`).join("");
+    $("log").scrollTop = 1e9;
+  }
+  $("msgs").addEventListener("click", (e) => {
+    const t = e.target;
+    if (t.dataset.copy) { navigator.clipboard.writeText(cur.messages[+t.dataset.copy].text || "").then(() => { t.textContent = "已复制"; setTimeout(() => (t.textContent = "复制"), 1200); }); }
+    else if (t.dataset.regen) send(true);
+    else if (t.tagName === "IMG") { $("ovImg").querySelector("img").src = t.src; $("ovImg").hidden = false; }
+  });
+  $("ovImg").onclick = () => ($("ovImg").hidden = true);
+
+  // ---------- 改名、设定、删除 ----------
+  $("bRen").onclick = async () => { const t = prompt("会话标题", cur.title); if (t && t.trim()) { cur = await api("convs/" + cur.id, { title: t.trim() }); render(); loadConvs(); } };
+  $("bDel").onclick = async () => { if (!confirm("删除会话「" + cur.title + "」？")) return; await api("convs/" + cur.id + "/delete", {}); $("bNew").onclick(); };
+  $("bSys").onclick = () => { $("sysTxt").value = cur.system || ""; $("ovSys").hidden = false; $("sysTxt").focus(); };
+  $("sysCancel").onclick = () => ($("ovSys").hidden = true);
+  $("sysSave").onclick = async () => { cur = await api("convs/" + cur.id, { system: $("sysTxt").value }); $("ovSys").hidden = true; };
+
+  // ---------- 模型状态 ----------
+  const LABEL = { running: "运行中", loading: "加载中…", stopped: "已停止", external: "端口被占用", offline: "Mac 连不上" };
+  async function refresh() {
+    try { model = await api("model"); } catch (e) { model = { state: "offline" }; }
+    $("dot").className = "dot " + model.state;
+    $("stx").textContent = (LABEL[model.state] || model.state) + (model.mem_gb ? " · " + model.mem_gb + " GB" : "");
+    $("stx").title = model.model || "";
+    $("bStart").disabled = model.state !== "stopped";
+    $("bStop").disabled = !(model.state === "running" || model.state === "loading");
+    $("bSend").disabled = model.state !== "running" || !!ctl;
+    $("hint").textContent = model.model ? model.model : "";
+    if (cur && !cur.messages.length || !cur) render();
+  }
+  async function act(a) { $("bStart").disabled = $("bStop").disabled = true; try { await api("model/" + a, {}); } catch (e) { alert(e.message); } refresh(); }
+  $("bStart").onclick = () => act("start");
+  $("bStop").onclick = () => { if (confirm("停止模型并释放 Mac 上约 10 GB 内存？")) act("stop"); };
+
+  // ---------- 图片 ----------
+  function shrink(file) {
+    return new Promise((res, rej) => {
+      const url = URL.createObjectURL(file), im = new Image();
+      im.onload = () => {
+        const k = Math.min(1, 1600 / Math.max(im.width, im.height)), w = Math.round(im.width * k), h = Math.round(im.height * k);
+        const c = document.createElement("canvas"); c.width = w; c.height = h;
+        const g = c.getContext("2d"); g.fillStyle = "#fff"; g.fillRect(0, 0, w, h); g.drawImage(im, 0, 0, w, h);
+        URL.revokeObjectURL(url); res(c.toDataURL("image/jpeg", 0.9));
+      };
+      im.onerror = () => { URL.revokeObjectURL(url); rej(new Error("读不了这张图")); };
+      im.src = url;
+    });
+  }
+  async function addFiles(files) {
+    for (const f of files) { if (!f.type.startsWith("image/") || pending.length >= 6) continue; try { pending.push(await shrink(f)); } catch (e) { alert(e.message); } }
+    drawThumbs();
+  }
+  function drawThumbs() {
+    $("thumbs").innerHTML = pending.map((u, i) => `<div><img src="${u}" alt=""><span data-i="${i}">×</span></div>`).join("");
+  }
+  $("thumbs").onclick = (e) => { if (e.target.dataset.i) { pending.splice(+e.target.dataset.i, 1); drawThumbs(); } };
+  $("bImg").onclick = () => $("file").click();
+  $("file").onchange = (e) => { addFiles([...e.target.files]); e.target.value = ""; };
+  $("txt").addEventListener("paste", (e) => { const fs = [...e.clipboardData.items].filter((i) => i.kind === "file").map((i) => i.getAsFile()).filter(Boolean); if (fs.length) { e.preventDefault(); addFiles(fs); } });
+  document.addEventListener("dragover", (e) => e.preventDefault());
+  document.addEventListener("drop", (e) => { e.preventDefault(); addFiles([...e.dataTransfer.files]); });
+
+  // ---------- 发送 ----------
+  const grow = () => { const t = $("txt"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight + 2, innerHeight * 0.4) + "px"; };
+  $("txt").addEventListener("input", grow);
+  $("txt").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing && matchMedia("(pointer: fine)").matches) { e.preventDefault(); send(false); } });
+  $("bSend").onclick = () => send(false);
+  $("bAbort").onclick = () => ctl && ctl.abort();
+
+  async function send(regen) {
+    const text = $("txt").value.trim();
+    if (ctl || (!regen && !text && !pending.length)) return;
+    if (model.state !== "running") {
+      await refresh();
+      if (model.state !== "running") { $("hint").textContent = "模型没在运行：先点右上角「启动模型」"; return; }
+    }
+    if (!cur) { try { cur = await api("convs", {}); history.replaceState(null, "", "?c=" + cur.id); } catch (e) { alert(e.message); return; } }
+    const imgs = pending.slice();
+    if (regen) { while (cur.messages.length && cur.messages[cur.messages.length - 1].role === "assistant") cur.messages.pop(); }
+    else { cur.messages.push({ role: "user", text, images: [], _local: imgs }); pending = []; drawThumbs(); $("txt").value = ""; grow(); }
+    render();
+    // 本地刚发的图先用 dataURL 显示
+    if (!regen && imgs.length) { const u = [...document.querySelectorAll(".m.u")].pop(); u.insertAdjacentHTML("afterbegin", '<div class="imgs">' + imgs.map((x) => `<img src="${x}" alt="">`).join("") + "</div>"); }
+    const box = document.createElement("div"); box.className = "m a";
+    box.innerHTML = '<details open><summary>思考中…</summary><div class="think"></div></details><div class="md"></div><div class="meta"></div>';
+    $("msgs").appendChild(box); $("log").scrollTop = 1e9;
+    const think = box.querySelector(".think"), ans = box.querySelector(".md"), sum = box.querySelector("summary"), det = box.querySelector("details");
+    let R = "", A = "", t0 = Date.now(), raf = 0;
+    const paint = () => { raf = 0; think.textContent = R; ans.innerHTML = md(A); const lg = $("log"); if (lg.scrollHeight - lg.scrollTop - lg.clientHeight < 160) lg.scrollTop = 1e9; };
+    ctl = new AbortController(); $("bAbort").hidden = false; $("bSend").disabled = true;
+    try {
+      const r = await fetch(API + "convs/" + cur.id + "/send", { method: "POST", headers: H, signal: ctl.signal,
+        body: JSON.stringify(regen ? { regenerate: true } : { text, images: imgs }) });
+      if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || "HTTP " + r.status); }
+      const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "";
+      for (;;) {
+        const { value, done } = await rd.read(); if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i; while ((i = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+          if (!line.startsWith("data:") || line.endsWith("[DONE]")) continue;
+          let j; try { j = JSON.parse(line.slice(5)); } catch (_) { continue; }
+          const d = (j.choices && j.choices[0] && j.choices[0].delta) || {};
+          const rc = d.reasoning_content || d.reasoning; if (rc) R += rc;
+          if (d.content) { A += d.content; if (det.open && sum.textContent === "思考中…") { sum.textContent = "思考过程（" + ((Date.now() - t0) / 1000).toFixed(1) + " 秒）"; det.open = false; } }
+          if (!raf) raf = requestAnimationFrame(paint);
+        }
+      }
+    } catch (e) {
+      if (e.name !== "AbortError") ans.insertAdjacentHTML("beforeend", '<p class="err">出错：' + esc(e.message) + "</p>");
+    }
+    ctl = null; $("bAbort").hidden = true;
+    // 以服务器存下的为准（回答、用时、图片地址）
+    await new Promise((ok) => setTimeout(ok, 300));
+    try { cur = await api("convs/" + cur.id); } catch (_) {}
+    render(); loadConvs(); refresh();
+  }
+
+  // ---------- 启动 ----------
+  const c0 = new URLSearchParams(location.search).get("c");
+  if (c0 && /^[a-z0-9]{12}$/.test(c0)) openConv(c0); else { render(); loadConvs(); }
+  refresh();
+  setInterval(() => { if (!document.hidden) refresh(); }, 4000);
+})();
+</script>
+</body>
+</html>

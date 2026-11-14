@@ -12,6 +12,7 @@ templates/
   curryplan/page/        通用页面骨架（图表、表格、指标格、折叠明细）
   curryplan/plan/        方案页骨架
   curryplan/machines/    机器页
+  curryplan/chat/        聊天页（本地模型）
   pool/beat              每台机器每分钟一份心跳（含 --probe 拓扑探测）
   pool/status            把心跳、队列和结论汇成机器页的 status.json
   pool/executor          机器级 executor：每台机器一个，管这台机器的槽位，服务所有项目
@@ -19,7 +20,7 @@ templates/
 bin/planpub              把一个独立页面目录发布到 curryPlan
 test/pool/e2e            机器池的端到端测试：本机上的假中枢、两台假机器，跑完写出 results.tsv
 curryplan.md             curryPlan 的排版铁律、同源自动发布、注册项目、通知
-site/                    curryPlan 站点本身：shell/（页面目录和公共文件）、server/（评论、提问、通知）、test/push/（通知的端到端测试）
+site/                    curryPlan 站点本身：shell/（页面目录和公共文件）、server/（评论、提问、通知）、chat/（聊天页后端与 Mac 模型节点）、test/push/、test/chat/（端到端测试）
 ```
 
 ## 机器池：两条命令

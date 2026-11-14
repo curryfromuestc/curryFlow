@@ -95,3 +95,26 @@ curryPlan 能往手机推通知（标准 Web Push）：机器告警、作业完�
   ```sh
   ssh "$CURRYPLAN_SSH" '~/curry-site/notify "标题" "正文" [url] [--tag 名字]'
   ```
+
+## 聊天页（工具 / 本地模型）
+
+`/curryplan/chat/`：和 Mac mini 上的本地多模态模型对话，会话、图片存在 curryPlan 机上，模型按需启动、停止。
+
+```
+浏览器 ──https──▶ nginx :8443（cpk 口令 cookie）
+                    ├─ /curryplan/chat/   页面   templates/curryplan/chat/index.html（planpub 发布）
+                    └─ /api/chat/         ──▶ 127.0.0.1:8767  site/chat/server.py（yanggl，curry-chat.service）
+                                               会话 ~/curry-chat/conv/*.json、图片 ~/curry-chat/img/
+                                               └─ 127.0.0.1:18090 ══ ssh -R ══▶ Mac 127.0.0.1:8090  site/chat/node.py
+                                                                                  └─ 按需起 mlx_vlm.server :8081
+```
+
+| 部件 | 位置 | 说明 |
+|---|---|---|
+| 页面 | `templates/curryplan/chat/index.html` | 会话列表、搜索、改名、删除、设定（system prompt）、发图、思考过程、复制、重新生成、停止生成 |
+| 后端 | `site/chat/server.py` → `~yanggl/curry-chat/server.py` | 只听 127.0.0.1；POST 要 `X-Requested-With: curryplan-chat`；`chat.env` 写 `NODE`、`NODE_KEY` |
+| 模型节点 | `site/chat/node.py` → Mac `~/llm-web/node.py` | 每个请求要 `X-LLM-Key`（`node.key`）；模型在 `node.json` 里配；LaunchAgent `com.curry.llm-web` |
+| 隧道 | Mac LaunchAgent `com.curry.llm-web-tunnel` | curryPlan 机上的 `llmtunnel` 用户只许 `permitlisten="127.0.0.1:18090"`，不能登录 |
+
+- 发布页面：`bin/planpub curryplan chat <目录> "本地模型" "<一句话>" 工具`。
+- 端到端（真 Chrome、模型真跑，13 步）：`CP_URL=… CP_COOKIE=<cpk> uvx --with playwright python site/test/chat/e2e.py 图.png 截图目录`。
