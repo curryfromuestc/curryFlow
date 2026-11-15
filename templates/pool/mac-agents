@@ -57,7 +57,7 @@ remove)
     ;;
 status)
     for label in $labels; do
-        state=$(launchctl print "$domain/$label" 2>/dev/null | awk '$1 == "state" { print $3; exit }')
+        state=$(launchctl print "$domain/$label" 2>/dev/null | sed -n 's/^[[:space:]]*state = //p' | head -1)
         echo "$label: ${state:-not loaded}"
     done
     ;;
