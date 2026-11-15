@@ -52,7 +52,7 @@ svg.sp line { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-s
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const secs = (t) => (Date.now() - Date.parse(t.replace(/([+-]\d\d)(\d\d)$/, "$1:$2"))) / 1000;
   const ago = (t) => { if (!t) return "-"; const s = secs(t); return s < 90 ? Math.round(s) + " 秒前" : s < 5400 ? Math.round(s / 60) + " 分前" : s < 172800 ? Math.round(s / 3600) + " 小时前" : Math.round(s / 86400) + " 天前"; };
-  const gb = (b) => b == null ? "-" : b >= 2 ** 40 ? (b / 2 ** 40).toFixed(1) + " T" : (b / 2 ** 30).toFixed(0) + " G";
+  const gb = (b) => b == null ? "-" : b >= 2 ** 40 ? (b / 2 ** 40).toFixed(1) + " T" : (b / 2 ** 30).toFixed(b < 10 * 2 ** 30 ? 1 : 0) + " G";   // one decimal below 10 G: a 1 GB machine read "1 G / 1 G"
   const bar = (x, of) => { const p = of ? Math.min(100, 100 * x / of) : 0; return `<span class="b${p >= 75 ? " hot" : ""}"><i style="width:${p.toFixed(0)}%"></i></span>`; };
   const row = (cells) => "<tr>" + cells.map((c) => `<td>${c}</td>`).join("") + "</tr>";
   const head = (cols) => "<tr>" + cols.map((c) => `<th>${c}</th>`).join("") + "</tr>";
