@@ -17,6 +17,11 @@ Everything shared is a JSON blob behind a ref of the pool repository (machines.g
                     while its machine's heartbeat moves and lists it
   refs/alive/<m>    pushed by the executor itself while it holds requests and its machine's heartbeat stands still
                     (beat stopped or stuck in a slow probe): the ids it holds, like the heartbeat
+A job hands a directory to other machines through its project's hub, not the pool's: what a job that ends with 0
+leaves in .build/cf/share/<name>/ of its work tree is pushed there as refs/cf/share/<name>/<id> (a commit without
+parents whose tree is the directory) before its conclusion is pushed, and `flow get` of any machine with access to
+that hub fetches it. A name has one content: the push deletes an earlier job's refs of the same name. Swept 14 days
+after the job.
 A request that is not well formed gets an error conclusion from whichever executor sees it first; so does a request
 that no slot of the pool fits for half an hour, judged only by an executor that runs its clone's version and whose
 machines.json is the hub's (a need it does not know means it cannot run the request). A run whose machine has had
@@ -77,6 +82,7 @@ BURST, QUIET = 15, 300   # on a shared machine a slot somebody loaded stays thei
 LOST, RUN_GRACE, UNFIT, SELF_BEAT = 600, 180, 1800, 150
 TOUCH, ALIVE, SPAWN, CANCEL_KILL, OVERRUN, LOCK_WAIT = 5, 60, 60, 90, 300, 60
 KEEP, TMP_KEEP, ABANDON_KEEP, TMPDIR_KEEP = 7 * 86400, 3600, 86400, 3 * 86400
+SHARE_KEEP = 14 * 86400        # how long a directory a job shared stays on its project's hub
 HOLD_MAX_HOURS = 8
 TIMEOUT_MAX = 86400
 LOG_MAX, LOG_HEAD, EXEC_LOG_MAX = 256 << 20, 1 << 20, 4 << 20
@@ -86,6 +92,8 @@ TAGS = {"synth"}
 ID = re.compile(r"\d{6}-\d{6}-[0-9a-f]{3,8}")
 SHA = re.compile(r"[0-9a-f]{40}")
 TMPREF = re.compile(r"refs/cf/tmp/\d{6}-\d{6}-[0-9a-f]{3,8}")
+SHARE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+SHAREREF = re.compile(r"refs/cf/share/[A-Za-z0-9][A-Za-z0-9._-]{0,99}/(\d{6}-\d{6}-[0-9a-f]{3,8})")
 REF = re.compile(r"(?!.*(?:\.\.|@\{|//|/\.|/-|\.lock(?:/|$)))refs/[^\x00-\x20\x7f~^:?*\[\\]+(?<![./])")
 LOCKS = ("*.lock", "refs/**/*.lock", "logs/**/*.lock")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -123,11 +131,11 @@ def git_env(proxy=None, bulk=False):
     return {**os.environ, "GIT_SSH_COMMAND": ssh_command(proxy, bulk), "GIT_TERMINAL_PROMPT": "0"}
 
 
-def git(cwd, *args, input=None, timeout=None, proxy=None):
+def git(cwd, *args, input=None, timeout=None, proxy=None, bulk=False, env=None):
     timeout = timeout or GIT_TIMEOUT
     try:
-        r = subprocess.run(["git", *args], cwd=cwd, input=input, capture_output=True, text=True, env=git_env(proxy),
-                           timeout=timeout)
+        r = subprocess.run(["git", *args], cwd=cwd, input=input, capture_output=True, text=True,
+                           env={**git_env(proxy, bulk), **(env or {})}, timeout=timeout)
     except subprocess.TimeoutExpired:
         raise GitError(f"git {' '.join(args[:2])}: no answer in {timeout} s")
     if r.returncode:
@@ -818,7 +826,7 @@ def prepare(job, say, run, must, check):
         say("清空 .build（--clean）" if req.get("clean") else "清空 .build（deps.json 或槽位环境变了）")
         shutil.rmtree(os.path.join(tree, ".build"), ignore_errors=True)
     else:
-        for sub in ("accept", "synth", "release", "downstream"):
+        for sub in ("accept", "synth", "release", "downstream", os.path.join("cf", "share")):
             shutil.rmtree(os.path.join(tree, ".build", sub), ignore_errors=True)
     os.makedirs(os.path.join(tree, ".build", "tmp"), exist_ok=True)
     jdump(stamp_path, cur_env)
@@ -1627,6 +1635,8 @@ class Executor:
                     secs=int(ex["end"] - job["start"]), code=ex["code"], reason=ex["reason"], note=ex.get("note", ""),
                     last=next((x for x in reversed(tail) if x.strip()), ""), tail=tail,
                     log={"machine": self.machine, "path": os.path.join(rundir, "log")} if job["kind"] == "job" else None)
+        if job["kind"] == "job" and ex["code"] == 0:
+            done["share"] = self.share(job)
         jdump(os.path.join(rundir, "done.json"), done)
         if job.get("agent"):     # (macOS) what a job that lost its supervisor left in its coalition, and its agent
             agent_kill(job, rundir)
@@ -1641,10 +1651,64 @@ class Executor:
         self.log(f"{rid}：结束，{done['reason']}，退出码 {done['code']}，{done['secs']} 秒")
         self.report(job)
 
+    def share(self, job):
+        """What a job that ended with 0 left for other machines: every directory NAME of <tree>/.build/cf/share
+        becomes a commit without parents in the project's mirror (the directory is its tree), kept there by
+        refs/cf/share/NAME/<id>, and the directory goes. report pushes the commits to the project's hub under the
+        same refs, where `flow get` finds them. Returns {NAME: commit}."""
+        rid, mirror, shared = job["id"], job["mirror"], {}
+        root = os.path.join(job["tree"], ".build", "cf", "share")
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            return shared
+        index = os.path.join(job["rundir"], "share.index")
+        who = {f"GIT_{role}_{key}": value for role in ("AUTHOR", "COMMITTER")
+               for key, value in (("NAME", "curryflow"), ("EMAIL", "curryflow@localhost"))}
+        for name in names:
+            path = os.path.join(root, name)
+            if not SHARE.fullmatch(name) or os.path.islink(path) or not os.path.isdir(path):
+                self.log(f"{rid}：.build/cf/share/{name} 不是一个名字合规的目录，不共享")
+                continue
+            env = {**who, "GIT_DIR": mirror, "GIT_WORK_TREE": path, "GIT_INDEX_FILE": index}
+            try:
+                if os.path.exists(index):
+                    os.remove(index)
+                git(path, "add", "-A", "-f", ".", env=env, timeout=600)
+                tree = git(path, "write-tree", env=env, timeout=600).strip()
+                commit = git(path, "commit-tree", tree, "-m", f"{name} (job {rid} on {self.machine})", env=env).strip()
+                git(mirror, "update-ref", f"refs/cf/share/{name}/{rid}", commit)
+                shared[name] = commit
+            except (GitError, OSError) as e:
+                self.log(f"{rid}：.build/cf/share/{name} 没能做成提交，不共享（{e}）")
+        shutil.rmtree(root, ignore_errors=True)
+        return shared
+
+    def push_share(self, job, shared):
+        """The commits of share to the project's hub; an earlier job's directory of the same name goes with the same
+        push (here and on the hub): a name has one content."""
+        rid, mirror, hub = job["id"], job["mirror"], job["hub"]
+        mine = {f"refs/cf/share/{name}/{rid}" for name in shared}
+        there = git(mirror, "ls-remote", hub, *[f"refs/cf/share/{name}/*" for name in shared], proxy=self.proxy)
+        older = [ref for ref in (line.split("\t")[1] for line in there.splitlines())
+                 if SHAREREF.fullmatch(ref) and ref not in mine]
+        git(mirror, "push", "-q", "-f", hub, *[f"{commit}:refs/cf/share/{name}/{rid}" for name, commit in shared.items()],
+            *[f":{ref}" for ref in older], proxy=self.proxy, bulk=True, timeout=1800)
+        for line in git(mirror, "for-each-ref", "--format=%(refname)",
+                        *[f"refs/cf/share/{name}/" for name in shared]).splitlines():
+            if line not in mine:
+                git(mirror, "update-ref", "-d", line)
+        self.log(f"{rid}：共享了 {' '.join(sorted(shared))}（项目中枢的 refs/cf/share/<名字>/{rid}）")
+
     def report(self, job):
-        """The conclusion replaces nothing but a lost one; a conclusion already there otherwise stays."""
+        """The conclusion replaces nothing but a lost one; a conclusion already there otherwise stays. What the job
+        shared is on the project's hub before its conclusion is on the pool's."""
         rid, rundir = job["id"], job["rundir"]
         try:
+            shared = (jload(os.path.join(rundir, "done.json")) or {}).get("share")
+            if shared and not os.path.exists(os.path.join(rundir, "shared")):
+                self.push_share(job, shared)
+                open(os.path.join(rundir, "shared"), "w").close()
             refs = self.ls(f"refs/q/{rid}", f"refs/run/{rid}", f"refs/cancel/{rid}", f"refs/done/{rid}")
             old = refs["done"].get(rid)
             gone = [f":refs/{kind}/{rid}" for kind in ("q", "run", "cancel") if rid in refs[kind]]
@@ -1736,18 +1800,21 @@ class Executor:
         keep |= {r.get("ref") for r, _ in self.blobs.values() if isinstance(r, dict)}
         for name, p in self.projects.items():
             try:
-                out = git(ROOT, "ls-remote", p["hub"], "refs/cf/tmp/*", proxy=self.proxy)
+                out = git(ROOT, "ls-remote", p["hub"], "refs/cf/tmp/*", "refs/cf/share/*", proxy=self.proxy)
                 stale = []
                 for line in out.splitlines():
                     sha, ref = line.split("\t")
                     rid = ref[len("refs/cf/tmp/"):]
+                    share = SHAREREF.fullmatch(ref)
                     if TMPREF.fullmatch(ref) and rid not in keep and ref not in keep and (
                             id_time(rid) or 0) < time.time() - TMP_KEEP:
+                        stale.append((ref, sha))
+                    elif share and (id_time(share.group(1)) or 0) < time.time() - SHARE_KEEP:
                         stale.append((ref, sha))
                 if stale:
                     git(ROOT, "push", "-q", *[f"--force-with-lease={ref}:{sha}" for ref, sha in stale], p["hub"],
                         *[f":{ref}" for ref, _ in stale], proxy=self.proxy)
-                    self.log(f"清掉项目 {name} 中枢上没人用的临时 ref：{' '.join(ref for ref, _ in stale)}")
+                    self.log(f"清掉项目 {name} 中枢上没人用的临时 ref 和过期的共享目录：{' '.join(ref for ref, _ in stale)}")
             except (GitError, KeyError, TypeError, ValueError) as e:
                 self.log(f"清理项目 {name} 的临时 ref 没成：{e}")
 

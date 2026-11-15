@@ -7,6 +7,7 @@ usage: flow run --project P [--commit REV | --here] [--threads N] [--mem G] [--g
        flow release ID | flow cancel ID [--no-wait]
        flow ls [--all] [--json]
        flow wait ID
+       flow get --project P NAME DIR
 
 run    queues COMMAND for the project at a commit: REV is a commit, a branch or a ref of the project's hub (default
        main), or anything the current repository resolves; it is sent as a full commit id;
@@ -24,6 +25,11 @@ wait   follows a request to its conclusion. While an executor has it, the heartb
        client reading the hub, wait gives up with exit code 254 (the job may still run, its conclusion comes back with
        the machine).
 
+get    fetches what a job shared into the new directory DIR: a job that ends with 0 and leaves directories in
+       .build/cf/share of its work tree has each of them, by its name, on the project's hub before its conclusion
+       (the executor pushes them; a name has one content, the latest job's; they stay 14 days). Exit code 3 when the
+       hub has no NAME. It needs this machine's access to the hub, which a slot in a container does not have.
+
 It runs from a clone of the pool repository (machines.git, on every machine in ~/curryflow/machines): requests are
 JSON blobs behind refs/q/<id> there, the executors answer with refs/run/<id> and refs/done/<id> (see executor).
 Who asks is $CF_WHO, else user@host:branch.
@@ -35,8 +41,10 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 
@@ -47,6 +55,9 @@ HOLD_MAX_HOURS = 8
 TIMEOUT_MAX = 86400
 HB_LOST, HB_CHECK, WAIT_STEP = 1200, 120, 4
 CODE_GONE = 254
+CODE_NONE = 3
+SHARE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+SHAREREF = re.compile(r"refs/cf/share/[A-Za-z0-9][A-Za-z0-9._-]{0,99}/(\d{6}-\d{6}-[0-9a-f]{3,8})")
 VERDICT = {"exit": "结束", "timeout": "超时", "cancelled": "已取消", "error": "没跑起来", "lost": "丢了",
            "expired": "占用到期", "released": "占用已放"}
 
@@ -548,6 +559,44 @@ def cmd_wait(a):
     return code_of(d)
 
 
+def cmd_get(a):
+    project = CONF.get("projects", {}).get(a.project)
+    if not project:
+        die(f"machines.json 里没有项目 {a.project}")
+    if not SHARE.fullmatch(a.name):
+        die(f"共享目录的名字不合规：{a.name!r}")
+    if os.path.lexists(a.dir):
+        die(f"{a.dir} 已经存在")
+    hub = project["hub"]
+    for attempt in (1, 2):         # an executor that shares the name again deletes the one listed here
+        refs = [line.split("\t")[1] for line in patient(git, "ls-remote", hub, f"refs/cf/share/{a.name}/*").splitlines()]
+        refs = sorted((ref for ref in refs if SHAREREF.fullmatch(ref)), key=lambda ref: ref.rsplit("/", 1)[1])
+        if not refs:
+            note(f"项目 {a.project} 的中枢上没有共享目录 {a.name}")
+            return CODE_NONE
+        tmp = tempfile.mkdtemp(prefix="cf-get-")
+        try:
+            git("init", "-q", "--bare", tmp)
+            try:
+                git("fetch", "-q", "--no-tags", "--depth", "1", hub, refs[-1], cwd=tmp, bulk=True, timeout=1800)
+            except GitError:
+                if attempt == 2:
+                    raise
+                continue
+            out = a.dir + f".tmp{os.getpid()}"
+            os.makedirs(out)
+            archive = subprocess.Popen(["git", "archive", "--format=tar", "FETCH_HEAD"], cwd=tmp, stdout=subprocess.PIPE)
+            untar = subprocess.run(["tar", "-x", "-f", "-", "-C", out], stdin=archive.stdout)
+            if archive.wait() or untar.returncode:
+                shutil.rmtree(out, ignore_errors=True)
+                die(f"{refs[-1]} 没能解到 {a.dir}")
+            os.rename(out, a.dir)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        print(f"{a.name}：作业 {refs[-1].rsplit('/', 1)[1]} 共享的，在 {a.dir}")
+        return 0
+
+
 def main():
     globals().update(json.loads(os.environ.get("CF_POOL_TUNE") or "{}"))
     argv = sys.argv[1:]
@@ -587,10 +636,14 @@ def main():
     ls.add_argument("--all", action="store_true")
     ls.add_argument("--json", action="store_true")
     sub.add_parser("wait").add_argument("id")
+    get = sub.add_parser("get")
+    get.add_argument("--project", required=True)
+    get.add_argument("name")
+    get.add_argument("dir")
     a = ap.parse_args(argv)
     a.command = command
     return {"run": cmd_run, "hold": cmd_hold, "release": cmd_cancel, "cancel": cmd_cancel, "ls": cmd_ls,
-            "wait": cmd_wait}[a.cmd](a)
+            "wait": cmd_wait, "get": cmd_get}[a.cmd](a)
 
 
 try:

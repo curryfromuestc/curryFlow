@@ -40,7 +40,7 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 GIT = shutil.which("git")
 PY = sys.executable
 TUNE = {"TICK": 0.5, "POLL": 1.5, "POLL_MAX": 6, "SWEEP": 8, "REAP": 2, "LOST": 20, "RUN_GRACE": 2, "UNFIT": 6,
-        "TOUCH": 1, "ALIVE": 6, "SPAWN": 5, "CANCEL_KILL": 10, "TMP_KEEP": 4, "LOG_MAX": 262144, "LOG_HEAD": 16384,
+        "TOUCH": 1, "ALIVE": 6, "SPAWN": 5, "CANCEL_KILL": 10, "TMP_KEEP": 4, "SHARE_KEEP": 4 * 86400, "LOG_MAX": 262144, "LOG_HEAD": 16384,
         "EXEC_LOG_MAX": 8192, "GIT_TIMEOUT": 5, "BUSY_MAX": 2, "WINDOW": 5, "MIN_WINDOW": 1, "BURST": 2, "QUIET": 0,
         "SELF_BEAT": 8, "PULL": 1e9, "OVERRUN": 4, "LOCK_WAIT": 2, "HB_LOST": 30, "WAIT_STEP": 1, "HB_CHECK": 3}
 INJECT = '    globals().update(json.loads(os.environ.get("CF_POOL_TUNE") or "{}"))\n'
@@ -1341,6 +1341,65 @@ def c_buildclean(r):
     parts = env_line.split(":")
     ok_env = len(parts) == 3 and parts[1].isdigit() and int(parts[1]) >= 1 and parts[2] == "4"
     return f"{env_line}，普通跑 rc={rc2}，--clean rc={rc3}", rc1 == 0 and ok_env and rc2 == 0 and rc3 == 0
+
+
+def share_refs(r):
+    return sorted(line.split()[1] for line in r.proj("for-each-ref", "--format=%(objectname) %(refname)",
+                                                     "refs/cf/share/").splitlines())
+
+
+@case("S-share", "t1 上的作业在 .build/cf/share/pack 里留下两个文件（一个在子目录里）后以 0 结束；之后 t2 上的作业用同一个名字留下"
+      "另一份内容；再取一个中枢上没有的名字，再取到一个已经存在的目录",
+      "结论推上去时项目中枢上已有 refs/cf/share/pack/<作业>；另一台机器 flow get 取到的文件和内容一致，工作树里的 share 目录没了；"
+      "第二个作业之后中枢上只剩它的那个 ref，取到的是新内容；没有的名字退出码 3；目录已存在时报错不覆盖")
+def c_share(r):
+    rid1 = r.submit("--machine", "t1", "--", "mkdir -p .build/cf/share/pack/sub && printf one > .build/cf/share/pack/a "
+                    "&& printf two > .build/cf/share/pack/sub/b && echo .gitignore > .build/cf/share/pack/.gitignore")
+    d1 = r.done(rid1, 60)
+    at_done = share_refs(r)
+    rc1, o1 = r.flow("get", "--project", "demo", "pack", f"{r.out}/S1", m="t2")
+    got1 = {n: open(os.path.join(dp, n)).read().strip() for dp, _, fs in os.walk(f"{r.out}/S1") for n in fs}
+    rc_left, _ = r.flow("run", "--project", "demo", "--machine", "t1", "--slot", d1["slot"] if d1 else "a0", "--",
+                        "test ! -e .build/cf/share")
+    rid2 = r.submit("--machine", "t2", "--", "mkdir -p .build/cf/share/pack && printf three > .build/cf/share/pack/a")
+    r.done(rid2, 60)
+    after = share_refs(r)
+    rc2, _ = r.flow("get", "--project", "demo", "pack", f"{r.out}/S2")
+    got2 = sorted(os.listdir(f"{r.out}/S2")) if rc2 == 0 else []
+    new = open(f"{r.out}/S2/a").read() if got2 else ""
+    rc3, _ = r.flow("get", "--project", "demo", "nothing", f"{r.out}/S3")
+    rc4, _ = r.flow("get", "--project", "demo", "pack", f"{r.out}/S2")
+    ok = (d1 and d1["code"] == 0 and at_done == [f"refs/cf/share/pack/{rid1}"] and rc1 == 0
+          and got1 == {"a": "one", "b": "two", ".gitignore": ".gitignore"} and rc_left == 0
+          and after == [f"refs/cf/share/pack/{rid2}"] and got2 == ["a"] and new == "three" and rc3 == 3
+          and rc4 not in (0, 3) and new == open(f"{r.out}/S2/a").read())
+    return (f"结论时中枢上 {at_done}，取到 {got1}（rc={rc1}），工作树里 share 还在否 rc={rc_left}；第二个作业后 {after}，"
+            f"取到 {got2} 内容 {new!r}；没有的名字 rc={rc3}，目录已存在 rc={rc4}"), bool(ok)
+
+
+@case("S-noshare", "一个以 3 结束的作业留下 .build/cf/share/bad；同一个槽位的下一个作业以 0 结束、自己不留东西；另一个作业留下一个"
+      "文件 .build/cf/share/plain、一个名字不合规的目录和一个合规的目录 good",
+      "失败的作业不共享，它留下的目录也不会被下一个作业共享出去；文件和不合规的名字不共享，good 照常共享，结论都是作业自己的退出码")
+def c_noshare(r):
+    rc1, _ = r.flow("run", "--project", "demo", "--machine", "t1", "--slot", "a0", "--",
+                    "mkdir -p .build/cf/share/bad && touch .build/cf/share/bad/x; exit 3")
+    rc2, _ = r.flow("run", "--project", "demo", "--machine", "t1", "--slot", "a0", "--", "true")
+    middle = share_refs(r)
+    rc3, _ = r.flow("run", "--project", "demo", "--machine", "t1", "--slot", "a0", "--",
+                    "mkdir -p '.build/cf/share/no good' .build/cf/share/good && touch .build/cf/share/plain "
+                    "'.build/cf/share/no good/x' .build/cf/share/good/x")
+    names = sorted({ref.split("/")[3] for ref in share_refs(r)} - {"pack"})
+    return (f"退出码 {rc1}、{rc2}、{rc3}；前两个作业后中枢上 {[x for x in middle if '/pack/' not in x]}，最后共享的名字 {names}",
+            rc1 == 3 and rc2 == 0 and rc3 == 0 and not [x for x in middle if "/pack/" not in x] and names == ["good"])
+
+
+@case("S-sweep", "项目中枢上有一个 10 天前的作业共享的目录和一个 1 天前的（保留期调成 4 天）", "清理删掉 10 天前的，留下 1 天前的")
+def c_sharesweep(r):
+    old, young = f"refs/cf/share/swept/{r.old_rid(10)}", f"refs/cf/share/kept/{r.old_rid(1)}"
+    r.proj("update-ref", old, r.main)
+    r.proj("update-ref", young, r.main)
+    gone = until(lambda: old not in share_refs(r), 40)
+    return f"10 天前的{'删了' if gone else '还在'}，1 天前的{'还在' if young in share_refs(r) else '没了'}", bool(gone) and young in share_refs(r)
 
 
 @case("N-named", "t2 在 machines.json 里标了 named_only；提交 3 个不点名的作业，再提交 1 个 --machine t2 的作业",

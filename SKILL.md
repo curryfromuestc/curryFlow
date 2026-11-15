@@ -108,6 +108,10 @@ curryFlow 是多机开发、机器池调度和 curryPlan 文档的统一入口�
   的结论回来后会替换掉 255，`flow wait <id>` 取到的就是替换后的。254 是 `flow wait` 不等了：认领它的机器 20 分钟没有
   心跳也没有存活信号（flow 自己读不到中枢的时间不算；作业也许还在跑，结论回来后 `flow wait <id>` 能取到）。
   `--no-wait` 只打印 id，之后 `flow wait <id>`。
+- 作业之间传目录：`flow get --project <名> <名字> <新目录>`。以 0 结束的作业留在工作树 `.build/cf/share/<名字>/` 里的每个目录，
+  executor 在推结论之前先推到项目中枢的 `refs/cf/share/<名字>/<id>`（一个没有父提交的提交，树就是那个目录），别的机器用
+  `flow get` 取；一个名字只有一份内容（后来的作业顶掉先前的），留 14 天。中枢上没有这个名字时 `flow get` 退出码 3。`flow get`
+  要用本机到中枢的通路，容器槽位里的作业用不了（它们只能往外共享）。
 - `flow ls`：排队、在跑、最近完成。`flow cancel <id>`：没开始的撤掉（写 143 的结论，中枢上已经有结论时不盖它），在跑的
   结束它的全部进程。排队时撤掉和 executor 认领撞上时，认领的 executor 看到中枢上已有的结论（取消、不合规）就结束作业、
   不推自己的结论；只有已有的结论是"丢了"时才接着跑。
@@ -140,7 +144,7 @@ curryFlow 是多机开发、机器池调度和 curryPlan 文档的统一入口�
   顶上，不按作业推心跳。不合规的请求（字段类型或取值不对、半小时没有哪个槽位满足）由先看到的 executor 写一个 99 的
   结论并撤掉；`need` 里本机不认识的键或 tag 算"本机跑不了"，不算不合规；"半小时没有槽位满足"只由运行着本机 clone 里
   那版 executor、并且 clone 里的 `machines.json` 和中枢 main 上一样的 executor 判（clone 落后的不判）。项目仓库上只碰
-  `refs/cf/tmp/<id>`：flow 推，executor 取到提交后删；flow 没交上请求（失败或 Ctrl-C）时自己删；剩下的 executor 每小时清一次（没有请求在用、推了
+  `refs/cf/tmp/<id>` 和 `refs/cf/share/<名字>/<id>`（上一条）：flow 推，executor 取到提交后删；flow 没交上请求（失败或 Ctrl-C）时自己删；剩下的 executor 每小时清一次（没有请求在用、推了
   一小时以上的）。
 - 每台机器两行 cron（装的时候保留已有的行；远端用脚本整段重写，不在 `set -e` 下 `crontab -l | grep -v`）：
   ```
