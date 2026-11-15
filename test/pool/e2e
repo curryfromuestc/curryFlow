@@ -972,6 +972,39 @@ def c_home(r):
             f"之后{'恢复' if back else '没恢复'}"), ok1 and ok2 and ok3 and ok4
 
 
+@case("M6-empty", "t1 的 beat 停着时，它的 clone 里最后一个心跳对象（中枢 refs/hb/t1 指着的 blob）变成长度为零的文件（机器异常重启"
+      "后留下的样子），同一目录里还有一个别的进程正在写的空文件 tmp_obj_e2e；先手工做一次心跳的两条 git 命令，再把 beat 开起来",
+      "手工那次推不上去（git 报对象为空）；beat 开起来后心跳接着推，空的对象文件没了，tmp_obj_e2e 还在")
+def c_empty(r):
+    r.beat_off("t1")
+    sha = r.refs("hb")["t1"]
+    last = r.blob(sha)
+    fan = os.path.join(r.clone("t1"), ".git", "objects", sha[:2])
+    obj, tmp = os.path.join(fan, sha[2:]), os.path.join(fan, "tmp_obj_e2e")
+    try:
+        if not os.path.isfile(obj):
+            return f"t1 的 clone 里没有松散对象 {sha[:12]}，情形搭不起来", False
+        os.chmod(obj, 0o644)
+        open(obj, "w").close()
+        open(tmp, "w").close()
+        blob = sh(GIT, "hash-object", "-w", "--stdin", cwd=r.clone("t1"), env=r.env("t1"),
+                  input=json.dumps({**last, "e2e": time.time()}, ensure_ascii=False))     # never the emptied blob again
+        push = subprocess.run([GIT, "push", "-q", "-f", "origin", f"{blob}:refs/hb/t1"], cwd=r.clone("t1"), env=r.env("t1"),
+                              capture_output=True, text=True, timeout=60)
+        still = os.path.isfile(obj) and os.path.getsize(obj) == 0
+        r.beat_on("t1")
+        moved = until(lambda: r.refs("hb").get("t1") not in (sha, blob) and r.hb("t1").get("at") != last.get("at"), 40)
+        gone, kept = not os.path.exists(obj), os.path.exists(tmp)
+    finally:
+        if "beat-t1" not in r.procs:
+            r.beat_on("t1")
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    return (f"手工推 rc={push.returncode}（{push.stderr.strip().splitlines()[0][-60:] if push.stderr.strip() else '没有输出'}）；"
+            f"beat 开起来后心跳{'接着推' if moved else '没动'}，空对象文件{'没了' if gone else '还在'}，tmp_obj_e2e {'还在' if kept else '被删了'}"), \
+        push.returncode != 0 and still and bool(moved) and gone and kept
+
+
 def cut(d):
     return json.dumps(d, ensure_ascii=False)[:160]
 

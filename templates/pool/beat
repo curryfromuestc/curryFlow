@@ -18,6 +18,11 @@ out there (git refuses when a local change is in the way), the branch alone othe
 merges or rewinds: a main with commits of its own stays as it is. The heartbeat says what it found (homes: branch,
 main, behind, ahead, at, error), so a directory that falls behind shows on the machines page. Submodules are not
 updated.
+
+Before its first git call it removes the zero-length loose objects of the clone (.git/objects/xx/<38 hex>): what an
+unclean shutdown leaves of the object written last, usually a heartbeat blob, and what every push and fetch of beat
+and of the executor then fails on (111, 2026-11-14: a day without heartbeats or jobs). A finished loose object is
+never empty; a writer's tmp_obj_* file may be and is left alone.
 With --probe (e.g. `ssh <host> python3 - --probe < beat`), prints the host's NUMA/L3 topology, memory, GPUs, disks,
 container backend and suggested slot CPU ranges as JSON without reading machines.json.
 
@@ -409,6 +414,22 @@ def pull(proxy):
         keep(PULLED, {"tried": time.time(), "at": last.get("at"), "ok": False, "error": str(e)[-300:]})
 
 
+def drop_empty_objects():
+    """Remove the zero-length loose objects of the clone (see the header); a file that cannot be removed stays."""
+    base = os.path.join(ROOT, ".git", "objects")
+    try:
+        fans = [d.path for d in os.scandir(base) if re.fullmatch(r"[0-9a-f]{2}", d.name)]
+    except OSError:
+        return
+    for fan in fans:
+        try:
+            for f in os.scandir(fan):
+                if re.fullmatch(r"[0-9a-f]{38}", f.name) and f.is_file(follow_symlinks=False) and not f.stat().st_size:
+                    os.unlink(f.path)
+        except OSError:
+            pass
+
+
 def home_paths(projects, machine):
     return {p: d["home"][machine] for p, d in projects.items()
             if isinstance(d, dict) and isinstance(d.get("home"), dict) and machine in d["home"]}
@@ -495,6 +516,7 @@ def main():
     conf, projects = pool["machines"].get(a.machine), pool.get("projects") or {}
     if conf is None:
         raise SystemExit(f"machines.json has no machine {a.machine}")
+    drop_empty_objects()
     beat = collect(a.machine, conf)
     if home_paths(projects, a.machine):
         beat["homes"] = homes(projects, a.machine)
