@@ -1,0 +1,13 @@
+#!/bin/sh
+# 备用中枢的 pre-receive：这里只收主中枢的镜像推送（推送选项 cf-mirror）。别的推送拒掉并说明主中枢在哪，
+# 否则推上来的分支会被下一次镜像删掉，而主中枢上并没有它。
+# 装法：cp 到 <repo>.git/hooks/pre-receive，chmod +x；git config receive.advertisePushOptions true；
+# git config curryflow.primary ci@<主中枢>:<repo>.git
+i=0
+while [ "$i" -lt "${GIT_PUSH_OPTION_COUNT:-0}" ]; do
+  eval "o=\$GIT_PUSH_OPTION_$i"
+  [ "$o" = cf-mirror ] && exit 0
+  i=$((i + 1))
+done
+echo "This repository is a mirror. Push to the hub: $(git config curryflow.primary)" >&2
+exit 1
