@@ -4,6 +4,7 @@
 usage: executor run --machine NAME    the loop; cron starts it every minute under flock, so there is one per machine
        executor _job RUNDIR           (internal) prepare the work tree on the host, then start the supervisor in the slot
        executor _sup RUNDIR           (internal) the supervisor: runs the command, enforces the timeout and a cancel
+       executor _agent RUNDIR         (internal, macOS) runs the supervisor as a launchd agent and waits for its end
 
 Everything shared is a JSON blob behind a ref of the pool repository (machines.git), like the heartbeats:
   refs/q/<id>       a request, written by flow: a job (project, commit, command, needs, priority, timeout) or a hold
@@ -39,6 +40,14 @@ A job's processes are run by the supervisor, a child subreaper, so every descend
 ends them (timeout, cancel file, or what is left when the command exits) by walking its own process tree and writes
 exit.json last. The launcher creates launch.json itself, exclusively, so a run directory never gets two launchers.
 The executor only reads files of the run directory, so it can be restarted while jobs run.
+
+macOS (DARWIN) has no /proc, no CPU affinity, no cgroups and no child subreaper. The executor asks libproc and Mach
+what it reads from /proc on Linux. A slot there is a number of threads and a memory budget, not CPUs: no thread is
+pinned, and a slot is busy by what the machine's load leaves of its share. Each job's supervisor runs as a launchd
+agent of its own (cf.<id>, started and awaited by `executor _agent`): launchd gives an agent a coalition, which its
+descendants cannot leave whatever session, process group or parent they end up with, so the processes of the job are
+the processes of that coalition. The supervisor ends them by it and adds up their memory against the slot's (over it,
+the job ends with 137), as the kernel does for a scope's MemoryMax on Linux.
 """
 import argparse
 import calendar
@@ -59,6 +68,7 @@ import time
 import traceback
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+DARWIN = sys.platform == "darwin"
 BASE = os.path.expanduser("~/curryflow")
 TICK, POLL, POLL_MAX, SWEEP, REAP = 3, 15, 120, 3600, 300
 BUSY_MAX = 0.20          # a slot whose measured busy share is at or above this is somebody else's
@@ -81,6 +91,7 @@ LOCKS = ("*.lock", "refs/**/*.lock", "logs/**/*.lock")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 CODE_ERROR, CODE_TIMEOUT, CODE_CANCEL, CODE_LOST = 99, 124, 143, 255
+CODE_MEMORY = 137        # (macOS) the job's processes went over the slot's memory: what an OOM kill gives on Linux
 
 
 class GitError(Exception):
@@ -191,6 +202,86 @@ def pid_alive(pid, ticks):
     return bool(s and s[0] != "Z" and s[2] == ticks)
 
 
+# ---- macOS: what Linux says in /proc, asked of libproc and Mach ------------------------------------------
+
+if DARWIN:
+    LIBC = ctypes.CDLL(None, use_errno=True)
+    LIBPROC = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    LIBC.mach_host_self.restype = ctypes.c_uint
+    LIBC.host_processor_info.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.POINTER(ctypes.c_uint),
+                                         ctypes.POINTER(ctypes.POINTER(ctypes.c_uint)), ctypes.POINTER(ctypes.c_uint)]
+    LIBC.vm_deallocate.argtypes = [ctypes.c_uint, ctypes.c_void_p, ctypes.c_size_t]
+    MACH_HOST = LIBC.mach_host_self()
+
+    class BsdInfo(ctypes.Structure):
+        """struct proc_bsdinfo (sys/proc_info.h), what proc_pidinfo(PROC_PIDTBSDINFO) fills."""
+        _fields_ = [(n, ctypes.c_uint32) for n in ("flags", "status", "xstatus", "pid", "ppid", "uid", "gid", "ruid",
+                                                    "rgid", "svuid", "svgid", "rfu")]
+        _fields_ += [("comm", ctypes.c_char * 16), ("name", ctypes.c_char * 32)]
+        _fields_ += [(n, ctypes.c_uint32) for n in ("nfiles", "pgid", "pjobc", "tdev", "tpgid")]
+        _fields_ += [("nice", ctypes.c_int32), ("start_sec", ctypes.c_uint64), ("start_usec", ctypes.c_uint64)]
+
+    def bsd_info(pid):
+        """A process's proc_bsdinfo; None when it is gone, a zombie, or not this caller's to ask about."""
+        b = BsdInfo()
+        n = LIBPROC.proc_pidinfo(int(pid), 3, ctypes.c_uint64(0), ctypes.byref(b), ctypes.sizeof(b))
+        return b if n == ctypes.sizeof(b) else None
+
+    def all_pids():
+        n = LIBPROC.proc_listallpids(None, 0)
+        buf = (ctypes.c_int * (max(n, 0) + 256))()
+        n = LIBPROC.proc_listallpids(buf, ctypes.sizeof(buf))
+        return [p for p in buf[:max(n, 0)] if p > 0]
+
+    def cpu_times():
+        """{cpu: (ticks, idle ticks)} from host_processor_info(PROCESSOR_CPU_LOAD_INFO): user, system, idle, nice."""
+        n, info, count = ctypes.c_uint(), ctypes.POINTER(ctypes.c_uint)(), ctypes.c_uint()
+        if LIBC.host_processor_info(MACH_HOST, 2, ctypes.byref(n), ctypes.byref(info), ctypes.byref(count)):
+            return {}
+        t = {c: (sum(info[4 * c + k] for k in range(4)), info[4 * c + 2]) for c in range(n.value)}
+        LIBC.vm_deallocate(ctypes.c_uint.in_dll(LIBC, "mach_task_self_"), ctypes.cast(info, ctypes.c_void_p),
+                           count.value * 4)
+        return t
+
+    def proc_stat(pid):
+        """(state, ppid, start in microseconds) of a process, None when it is gone (a zombie counts as gone)."""
+        b = bsd_info(pid)
+        return ("R", b.ppid, b.start_sec * 1000000 + b.start_usec) if b else None
+
+    def coalition(pid):
+        """The id of a process's resource coalition (proc_pidinfo(PROC_PIDCOALITIONINFO)); None when it cannot be
+        read. launchd gives each of its jobs one, and a process keeps its parent's for life."""
+        buf = (ctypes.c_uint64 * 5)()
+        return buf[0] if LIBPROC.proc_pidinfo(int(pid), 20, ctypes.c_uint64(0), ctypes.byref(buf), 40) == 40 else None
+
+    def coalition_pids(cid):
+        """The processes of coalition cid but this one."""
+        me = os.getpid()
+        return [p for p in all_pids() if p != me and coalition(p) == cid] if cid else []
+
+    def footprint(pid):
+        """A process's physical footprint in bytes (proc_pid_rusage, RUSAGE_INFO_V0: ri_phys_footprint), what
+        Activity Monitor calls its memory; 0 when it is gone."""
+        buf = (ctypes.c_uint64 * 12)()
+        return buf[9] if LIBPROC.proc_pid_rusage(int(pid), 0, ctypes.byref(buf)) == 0 else 0
+
+    def proc_cwd(pid):
+        """A process's working directory (PROC_PIDVNODEPATHINFO: pvi_cdir's path); None when it cannot be read."""
+        buf = ctypes.create_string_buffer(2352)
+        if LIBPROC.proc_pidinfo(int(pid), 9, ctypes.c_uint64(0), buf, 2352) != 2352:
+            return None
+        return os.fsdecode(buf.raw[152:152 + 1024].split(b"\0", 1)[0])
+
+    def proc_args(pid):
+        """A process's executable path and arguments as the kernel keeps them (sysctl KERN_PROCARGS2); None when
+        they cannot be read (another user's process)."""
+        mib, size = (ctypes.c_int * 3)(1, 49, int(pid)), ctypes.c_size_t(1 << 20)
+        buf = ctypes.create_string_buffer(size.value)
+        if LIBC.sysctl(mib, 3, buf, ctypes.byref(size), None, ctypes.c_size_t(0)):
+            return None
+        return buf.raw[:size.value]
+
+
 def id_time(rid):
     try:
         return calendar.timegm(time.strptime(rid[:13], "%y%m%d-%H%M%S"))
@@ -293,6 +384,20 @@ def git_busy(root):
     """Whether a git process may work in the repository at root (the work tree's top, or a bare repository): its
     arguments name it, it runs in it, or where it runs cannot be read (another user's, a container's)."""
     real = os.path.realpath(root)
+    if DARWIN:
+        for pid in all_pids():
+            b = bsd_info(pid)
+            comm = os.fsdecode(b.comm) if b else ""
+            if pid == os.getpid() or (comm != "git" and not comm.startswith("git-")):
+                continue
+            args, cwd = proc_args(pid), proc_cwd(pid)
+            if args is None or cwd is None:
+                if bsd_info(pid):            # still there, and where it runs cannot be read
+                    return True
+                continue
+            if real.encode() in args or root.encode() in args or cwd == real or cwd.startswith(real + "/"):
+                return True
+        return False
     for d in os.listdir("/proc"):
         if not d.isdigit() or int(d) == os.getpid():
             continue
@@ -339,7 +444,12 @@ def clear_locks(root, gitdir, say, check):
 
 # ---- the supervisor: runs in the slot (in the container when the slot has one) ------------------------
 
+JOB_COALITION = None     # (macOS) the supervisor's own coalition, when launchd gave it one: the job's processes
+
+
 def descendants():
+    if DARWIN:
+        return darwin_descendants()
     kids = collections.defaultdict(list)
     for d in os.listdir("/proc"):
         if d.isdigit():
@@ -352,6 +462,42 @@ def descendants():
             out.append(k)
             todo.append(k)
     return out
+
+
+def darwin_descendants():
+    """The job's processes on macOS: every other process of the supervisor's coalition (JOB_COALITION), which no
+    process leaves; and, as without a coalition of its own, its process tree and its process group."""
+    me, procs = os.getpid(), {}
+    for p in all_pids():
+        b = bsd_info(p)
+        if b:
+            procs[p] = (b.ppid, b.pgid)
+    out = set(coalition_pids(JOB_COALITION))
+    if os.getpgrp() == me:
+        out |= {p for p, (_, pgid) in procs.items() if pgid == me}
+    kids = collections.defaultdict(list)
+    for p, (ppid, _) in procs.items():
+        kids[ppid].append(p)
+    todo = [me]
+    while todo:
+        for k in kids.get(todo.pop(), []):
+            if k not in out:
+                out.add(k)
+                todo.append(k)
+    out.discard(me)
+    return sorted(out)
+
+
+def own_coalition(job, rundir, say):
+    """(macOS) The supervisor's coalition when it is its job's launchd agent: launchd started it under the agent's
+    label, and the coalition is not the one the agent was submitted from (agent.json). None otherwise (a supervisor
+    started by hand shares its coalition with everything of that login: it must not end those)."""
+    mine = coalition(os.getpid())
+    outside = (jload(os.path.join(rundir, "agent.json")) or {}).get("outside")
+    if job.get("agent") and os.environ.get("XPC_SERVICE_NAME") == job["agent"] and mine and outside and mine != outside:
+        return mine
+    say("监管进程不是作为这个作业的 launchd agent 起来的：只按进程树和进程组清理作业的进程")
+    return None
 
 
 def signal_tree(sig):
@@ -373,7 +519,8 @@ def sup_main(rundir, detach=False):
         os.setsid()
     except OSError:
         pass
-    ctypes.CDLL(None).prctl(36, 1, 0, 0, 0)          # PR_SET_CHILD_SUBREAPER: orphans of the job come to this process
+    if not DARWIN:
+        ctypes.CDLL(None).prctl(36, 1, 0, 0, 0)      # PR_SET_CHILD_SUBREAPER: orphans of the job come to this process
     asked = []
     for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(s, lambda *_: asked.append(1))
@@ -382,7 +529,13 @@ def sup_main(rundir, detach=False):
     alive, cancel = os.path.join(rundir, "alive"), os.path.join(rundir, "cancel")
     argv = job["req"]["argv"]
     start = time.time()
-    jdump(os.path.join(rundir, "sup.json"), {"pid": os.getpid(), "start": start})
+    if DARWIN:
+        global JOB_COALITION
+        JOB_COALITION = own_coalition(job, rundir, say)
+        jdump(os.path.join(rundir, "sup.json"), {"pid": os.getpid(), "start": start, "coalition": JOB_COALITION,
+                                                 "ticks": proc_stat(os.getpid())[2]})
+    else:
+        jdump(os.path.join(rundir, "sup.json"), {"pid": os.getpid(), "start": start})
     open(alive, "w").close()
     try:
         child = subprocess.Popen(["bash", "-c", argv[0]] if len(argv) == 1 else argv, cwd=job["tree"], env=job["env"],
@@ -424,10 +577,13 @@ def sup_main(rundir, detach=False):
         time.sleep(0.5)
         reap()
         t = time.time()
+        used = 0
         if t - touched >= TOUCH:
             os.utime(alive)
             touched = t
             cap()
+            if DARWIN and job.get("mem"):            # no cgroup holds the job to the slot's memory: add it up
+                used = sum(footprint(p) for p in descendants())
         if killing is None:
             if asked or os.path.exists(cancel):
                 reason, killing = "cancelled", t
@@ -435,6 +591,9 @@ def sup_main(rundir, detach=False):
             elif t - start >= job["req"]["timeout"]:
                 reason, killing = "timeout", t
                 say(f"超时（{job['req']['timeout']} 秒）：结束作业的进程")
+            elif used > job.get("mem", 0) > 0:
+                reason, killing = "memory", t
+                say(f"作业的进程一共占了 {used / 2 ** 30:.1f} GiB，超过槽位的 {job['mem'] / 2 ** 30:g} GiB：结束作业的进程")
             if killing:
                 signal_tree(signal.SIGTERM)
         elif t - killing > 10:
@@ -454,8 +613,12 @@ def sup_main(rundir, detach=False):
             signal_tree(signal.SIGKILL)
         time.sleep(0.2)
     cap()
+    note = f"日志超过 {LOG_MAX / 2 ** 20:g} MB，中间截掉过 {len(cuts)} 次" if cuts else ""
+    if reason == "memory":
+        return write_exit(rundir, CODE_MEMORY, "exit", f"超过槽位的内存上限 {job['mem'] / 2 ** 30:g} GiB，被结束" +
+                          (f"；{note}" if note else ""))
     final = {"exit": code[0], "timeout": CODE_TIMEOUT, "cancelled": CODE_CANCEL}[reason]
-    write_exit(rundir, final, reason, f"日志超过 {LOG_MAX / 2 ** 20:g} MB，中间截掉过 {len(cuts)} 次" if cuts else "")
+    write_exit(rundir, final, reason, note)
 
 
 # ---- the launcher: runs on the host, one per job, detached from the executor ---------------------------
@@ -471,10 +634,11 @@ def job_main(rundir):
     log = open(os.path.join(rundir, "log"), "ab", buffering=0)
     say = lambda text: log.write(f"[cf] {text}\n".encode())
     cancel = os.path.join(rundir, "cancel")
-    try:
-        os.sched_setaffinity(0, cpu_list(job["cpus"]))
-    except (OSError, ValueError):
-        say(f"准备阶段没能钉在核 {job['cpus']} 上")
+    if not DARWIN:                                   # macOS pins no thread
+        try:
+            os.sched_setaffinity(0, cpu_list(job["cpus"]))
+        except (OSError, ValueError):
+            say(f"准备阶段没能钉在核 {job['cpus']} 上")
 
     def check():
         if os.path.exists(cancel):
@@ -532,6 +696,8 @@ def job_main(rundir):
     if not os.path.exists(exit_json):
         if job.get("unit"):
             subprocess.run(["systemctl", "--user", "stop", job["unit"] + ".scope"], capture_output=True)
+        if job.get("agent"):
+            agent_kill(job, rundir)
         say(f"监管进程没留下结论就退出了（rc={rc}）")
         write_exit(rundir, CODE_LOST, "lost", f"监管进程退出 rc={rc}")
 
@@ -541,6 +707,8 @@ def overrun(job, rundir, p, say):
     container paused): what can be reached of the job goes, and the job is lost."""
     if job.get("unit"):
         subprocess.run(["systemctl", "--user", "kill", "--signal=SIGKILL", job["unit"] + ".scope"], capture_output=True)
+    elif job.get("agent"):
+        agent_kill(job, rundir)
     elif not job.get("container"):
         try:
             os.killpg(p.pid, signal.SIGKILL)
@@ -660,6 +828,8 @@ def prepare(job, say, run, must, check):
 
 def launch_command(job, rundir, run, say):
     me = os.path.join(rundir, "executor")
+    if job.get("agent"):
+        return [sys.executable, me, "_agent", rundir]
     if not job.get("container"):
         cmd = []
         if job.get("unit"):
@@ -680,6 +850,76 @@ def launch_command(job, rundir, run, say):
         raise JobError(f"容器 {c} 里没法给 uid {uid} 建用户（见日志）")
     return wrap(inc, ["exec", c, "--user", str(uid), "--group", str(gid), "--cwd", job["dir"], "-T", "-n",
                       "--env", f"HOME={home}", "--", "python3", me, "_sup", "--detach", rundir])
+
+
+# ---- macOS: the supervisor as a launchd agent ----------------------------------------------------------
+
+def agent_domain(job, rundir):
+    return (jload(os.path.join(rundir, "agent.json")) or {}).get("domain") or f"gui/{os.getuid()}"
+
+
+def agent_remove(job, rundir):
+    subprocess.run(["launchctl", "bootout", f"{agent_domain(job, rundir)}/{job['agent']}"], capture_output=True)
+
+
+def agent_kill(job, rundir):
+    """What `systemctl kill` does to a scope: SIGKILL to every process of the job's coalition (the supervisor wrote
+    its id into sup.json), unless that is this process's own; then the agent is removed."""
+    cid = (jload(os.path.join(rundir, "sup.json")) or {}).get("coalition")
+    if cid and cid != coalition(os.getpid()):
+        for _ in range(10):
+            pids = coalition_pids(cid)
+            if not pids:
+                break
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            time.sleep(0.3)
+    agent_remove(job, rundir)
+
+
+def agent_main(rundir):
+    """Runs the job's supervisor as the launchd agent cf.<id> and stays until it has concluded or is gone, as
+    `systemd-run --scope` stays with its scope. Exit status 0 when there is a conclusion."""
+    import plistlib
+    job = jload(os.path.join(rundir, "job.json"))
+    label, me = job["agent"], os.path.join(rundir, "executor")
+    plist, out = os.path.join(rundir, label + ".plist"), os.path.join(rundir, "launch.log")
+    with open(plist, "wb") as f:
+        # Interactive: launchd applies no background throttling to the job. Its processes other than those of the
+        # supervisor's process group are ended by the supervisor (launchd ends that group when the agent exits).
+        # The supervisor's environment is launchd's, not this process's: the tests' tuning is handed on.
+        plistlib.dump({"Label": label, "ProgramArguments": [sys.executable, me, "_sup", rundir], "RunAtLoad": True,
+                       "ProcessType": "Interactive", "WorkingDirectory": job["dir"], "StandardOutPath": out,
+                       "StandardErrorPath": out,
+                       "EnvironmentVariables": {k: os.environ[k] for k in ("CF_POOL_TUNE",) if k in os.environ}}, f)
+    error = ""
+    for domain in (f"gui/{os.getuid()}", f"user/{os.getuid()}"):      # the login's session, else the user's background one
+        jdump(os.path.join(rundir, "agent.json"), {"domain": domain, "outside": coalition(os.getpid())})
+        subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True)   # an earlier launcher's
+        r = subprocess.run(["launchctl", "bootstrap", domain, plist], capture_output=True, text=True)
+        if r.returncode == 0:
+            break
+        error = (r.stderr or r.stdout).strip()[-300:]
+    else:
+        write_exit(rundir, CODE_ERROR, "error", f"launchd 没接下监管进程：{error}")
+        return 1
+    exit_json, t0 = os.path.join(rundir, "exit.json"), time.time()
+    while not os.path.exists(exit_json):
+        sup = jload(os.path.join(rundir, "sup.json"))
+        if sup:
+            if not pid_alive(sup.get("pid", 0), sup.get("ticks")):
+                break
+        elif time.time() - t0 > SPAWN:
+            write_exit(rundir, CODE_LOST, "lost", f"launchd 接下了监管进程，{SPAWN} 秒里它没有起来（见 launch.log）")
+            break
+        time.sleep(0.5)
+    if os.path.exists(exit_json):
+        agent_remove(job, rundir)
+        return 0
+    return 1                 # the launcher ends what is left of the job by its coalition (agent_kill)
 
 
 def wrap(mode, args):
@@ -769,6 +1009,9 @@ class Executor:
             s = self.slots[name] = Slot(name, c)
             if name in old:
                 s.job, s.clean, s.foreign = old[name].job, old[name].clean, old[name].foreign
+        # A machine that is named_only takes only the requests that name it (need.machine): one whose jobs need
+        # what the pool's other machines do not have (macOS: a project's Linux tools do not run there).
+        self.named = {m for m, mc in conf["machines"].items() if isinstance(mc, dict) and mc.get("named_only")}
         self.pool = []
         for m, mc in conf["machines"].items():
             for name, c in (mc.get("slots") or {}).items() if mc.get("executor") else ():
@@ -802,9 +1045,25 @@ class Executor:
         if first is None or t1 - first[0] < MIN_WINDOW:
             return None
         a = first[1]
+        if DARWIN:
+            return self.share_busy(slot, a, b)
         total = sum(b[c][0] - a[c][0] for c in slot.cpus if c in a and c in b)
         idle = sum(b[c][1] - a[c][1] for c in slot.cpus if c in a and c in b)
         return 1 - idle / total if total > 0 else None
+
+    def share_busy(self, slot, a, b):
+        """(macOS) No thread is pinned, so a slot has no CPUs of its own, only a share of the machine's: as many
+        CPUs as it has threads. Its busy share is what the machine's load takes of that share after filling the CPUs
+        outside the slots and the shares of the other slots that run a job."""
+        cpus = [c for c in b if c in a]
+        total = sum(b[c][0] - a[c][0] for c in cpus)
+        idle = sum(b[c][1] - a[c][1] for c in cpus)
+        if total <= 0:
+            return None
+        load = len(cpus) * (1 - idle / total)
+        room = len(cpus) - sum(len(s.cpus) for s in self.slots.values())
+        room += sum(len(s.cpus) for s in self.slots.values() if s is not slot and s.job and s.job["kind"] == "job")
+        return min(1.0, max(0.0, load - max(0, room)) / max(1, len(slot.cpus)))
 
     def containers(self):
         if not any(s.container for s in self.slots.values()):
@@ -849,7 +1108,7 @@ class Executor:
         jdump(os.path.join(self.dir, "state.json"),
               {"machine": self.machine, "at": int(time.time()), "pid": os.getpid(), "poll": int(self.last_poll),
                "queued": self.queued, "memcap": "container" if any(s.container for s in self.slots.values())
-               else "systemd" if self.unit_ok else "none", "slots": slots,
+               else "systemd" if self.unit_ok else "watch" if DARWIN else "none", "slots": slots,
                "jobs": self.held()})
 
     def held(self):
@@ -891,6 +1150,8 @@ class Executor:
         need = req.get("need", {})
         if need.get("machine") not in (None, self.machine):
             return False
+        if self.machine in self.named and need.get("machine") != self.machine:
+            return False
         if req["kind"] == "job" and req.get("project") not in self.projects:
             return False
         return any(self.fits(req, s) for s in self.slots.values())
@@ -899,13 +1160,18 @@ class Executor:
         if req["kind"] == "job" and req["project"] not in self.projects:
             return False
         machine = req.get("need", {}).get("machine")
-        return any(machine in (None, m) and self.fits(req, s) for m, s in self.pool)
+        return any((machine == m or machine is None and m not in self.named) and self.fits(req, s)
+                   for m, s in self.pool)
 
     def current(self):
         """Whether this executor may judge that the pool has no slot for a request: it runs its clone's version of
         this file, and the clone's machines.json is the one on the hub's main (a clone behind does not know newer
         machines and projects)."""
         path = os.path.join(ROOT, "machines.json")
+        if os.stat(path).st_mtime_ns != self.conf_stamp:
+            # The file changed since load_conf read it (a pull a moment ago): the pool this executor judges by is
+            # the old one, and a request for a machine the new file adds would get a 99. The next round has it.
+            return False
         key = (self.main, os.stat(path).st_mtime_ns)
         if key != self.current_key:
             try:
@@ -1227,6 +1493,8 @@ class Executor:
                        mirror=os.path.join(BASE, "mirror", req["project"] + ".git"), mem=slot.mem)
             if slot.container:
                 job["incus"] = self.incus
+            elif DARWIN:
+                job["agent"] = "cf." + rid       # the supervisor's launchd agent: its coalition is the job's processes
             elif self.memory_cap():
                 job["unit"] = "cf-" + rid
         sha = job["run"] = self.run_blob(job)
@@ -1252,6 +1520,8 @@ class Executor:
 
     def memory_cap(self):
         """systemd-run --user --scope gives a job its own cgroup with MemoryMax; without it a job is only pinned."""
+        if DARWIN:               # no cgroups: the supervisor adds the job's memory up itself
+            self.unit_ok = False
         if self.unit_ok is None:
             run = f"/run/user/{os.getuid()}"
             if os.path.isdir(run):
@@ -1358,6 +1628,8 @@ class Executor:
                     last=next((x for x in reversed(tail) if x.strip()), ""), tail=tail,
                     log={"machine": self.machine, "path": os.path.join(rundir, "log")} if job["kind"] == "job" else None)
         jdump(os.path.join(rundir, "done.json"), done)
+        if job.get("agent"):     # (macOS) what a job that lost its supervisor left in its coalition, and its agent
+            agent_kill(job, rundir)
         del self.jobs[rid]
         self.procs.pop(rid, None)
         slot = self.slots.get(job["slot"])
@@ -1561,9 +1833,12 @@ def main():
     s = sub.add_parser("_sup")
     s.add_argument("--detach", action="store_true")
     s.add_argument("rundir")
+    sub.add_parser("_agent").add_argument("rundir")
     a = ap.parse_args()
     if a.cmd == "_job":
         return job_main(a.rundir)
+    if a.cmd == "_agent":
+        sys.exit(agent_main(a.rundir))
     if a.cmd == "_sup":
         return sup_main(a.rundir, a.detach)
     d = os.path.join(BASE, "exec", a.machine)

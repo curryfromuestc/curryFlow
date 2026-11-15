@@ -12,6 +12,11 @@ hold in each slot, whether the executor would schedule the slot, and the ids of 
 it pulls the clone; the heartbeat carries the clone's commit and how the last pull went (pull: ok, error, at).
 With --probe (e.g. `ssh <host> python3 - --probe < beat`), prints the host's NUMA/L3 topology, memory, GPUs, disks,
 container backend and suggested slot CPU ranges as JSON without reading machines.json.
+
+macOS (DARWIN) has no /proc and pins no thread: CPU times come from Mach, memory from sysctl and vm_stat, and the
+machine is one node. A slot there has no CPUs of its own (its `cpus` only count its threads), so its busy threads are
+the machine's: what its load takes of the slot's share once the CPUs outside the slot are full, or the whole load up
+to the slot's size while the slot runs a job; its top processes are the machine's.
 """
 import argparse
 import collections
@@ -21,11 +26,13 @@ import pwd
 import re
 import shutil
 import subprocess
+import sys
 import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
 PULLED = os.path.join(ROOT, ".git", "cf-pull.json")
 PULL = 600
+DARWIN = sys.platform == "darwin"
 
 
 def run(cmd, timeout=20, shell=False):
@@ -67,6 +74,26 @@ def cpu_times():
     return t
 
 
+if DARWIN:
+    import ctypes
+    LIBC = ctypes.CDLL(None, use_errno=True)
+    LIBC.mach_host_self.restype = ctypes.c_uint
+    LIBC.host_processor_info.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.POINTER(ctypes.c_uint),
+                                         ctypes.POINTER(ctypes.POINTER(ctypes.c_uint)), ctypes.POINTER(ctypes.c_uint)]
+    LIBC.vm_deallocate.argtypes = [ctypes.c_uint, ctypes.c_void_p, ctypes.c_size_t]
+    MACH_HOST = LIBC.mach_host_self()
+
+    def cpu_times():
+        """{cpu: (ticks, idle ticks)} from host_processor_info(PROCESSOR_CPU_LOAD_INFO): user, system, idle, nice."""
+        n, info, count = ctypes.c_uint(), ctypes.POINTER(ctypes.c_uint)(), ctypes.c_uint()
+        if LIBC.host_processor_info(MACH_HOST, 2, ctypes.byref(n), ctypes.byref(info), ctypes.byref(count)):
+            return {}
+        t = {c: (sum(info[4 * c + k] for k in range(4)), info[4 * c + 2]) for c in range(n.value)}
+        LIBC.vm_deallocate(ctypes.c_uint.in_dll(LIBC, "mach_task_self_"), ctypes.cast(info, ctypes.c_void_p),
+                           count.value * 4)
+        return t
+
+
 def busy_per_cpu(seconds=2.0):
     a = cpu_times()
     time.sleep(seconds)
@@ -75,6 +102,9 @@ def busy_per_cpu(seconds=2.0):
 
 
 def numa_nodes():
+    if DARWIN:               # one node: every CPU of the machine
+        n = len(cpu_times())
+        return [(0, f"0-{n - 1}")] if n else []
     base = "/sys/devices/system/node"
     nodes = []
     for d in sorted(os.listdir(base)) if os.path.isdir(base) else []:
@@ -84,6 +114,14 @@ def numa_nodes():
 
 
 def memory():
+    if DARWIN:
+        # Available as the system would give it without swapping: free, inactive, speculative and purgeable pages.
+        total = int(run(["sysctl", "-n", "hw.memsize"]).strip() or 0)
+        text = run(["vm_stat"])
+        page = int((re.search(r"page size of (\d+) bytes", text) or [0, 16384])[1])
+        pages = sum(int(m.group(1)) for k in ("free", "inactive", "speculative", "purgeable")
+                    for m in [re.search(rf"Pages {k}:\s+(\d+)", text)] if m)
+        return {"total": total, "avail": min(total, pages * page)}
     m = {}
     for line in open("/proc/meminfo"):
         k, v = line.split(":")
@@ -155,6 +193,12 @@ def containers():
 def processes():
     """(cpu, threads, owner, command) of each process over 5% CPU; owner as owner_of names it."""
     out = []
+    if DARWIN:               # ps there knows no psr (a thread has no CPU of its own), and comm is the whole path
+        for line in run(["ps", "-Ao", "pid=,pcpu=,uid=,comm="]).splitlines():
+            p = line.split(None, 3)
+            if len(p) == 4 and float(p[1]) >= 5:
+                out.append((None, float(p[1]) / 100, owner_of(int(p[0]), int(p[2])), os.path.basename(p[3])))
+        return out
     for line in run(["ps", "-eo", "pid=,psr=,pcpu=,uid=,comm="]).splitlines():
         p = line.split(None, 4)
         if len(p) == 5 and float(p[2]) >= 5:
@@ -211,23 +255,33 @@ def collect(name, conf):
     busy = busy_per_cpu()
     procs = processes()
     total = lambda spec: round(sum(busy.get(c, 0) for c in cpu_list(spec)), 1)
+    jobs = {sname for sname, e in ((ex or {}).get("slots") or {}).items() if e.get("job")}
+
+    def slot_busy(sname, spec):
+        if not DARWIN:
+            return total(spec)
+        n, load = len(cpu_list(spec)), sum(busy.values())
+        return round(min(n, load if sname in jobs else max(0.0, load - (len(busy) - n))), 1)
 
     def top(spec, n=2):
         cs, agg = set(cpu_list(spec)), collections.Counter()
         for psr, load, uid, comm in procs:
-            if psr in cs:
+            if psr is None or psr in cs:
                 agg[(uid, comm)] += load
         return [{"user": u, "cmd": c, "threads": round(v, 1)} for (u, c), v in agg.most_common(n) if v >= 0.5]
 
     users = collections.Counter()
     for psr, load, uid, comm in procs:
         users[uid] += load
+    if DARWIN:               # for the page: this machine's slots are shares, not CPUs
+        conf = {**conf, "slots": {s: {**d, "note": d.get("note") or "macOS：不钉核，槽位是线程数配额"}
+                                  for s, d in conf.get("slots", {}).items()}}
     beat = {
         "machine": name, "host": os.uname().nodename, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "threads": len(busy), "busy": round(sum(busy.values()), 1), "load": os.getloadavg()[0],
         "nodes": [{"id": i, "cpus": spec, "threads": len(cpu_list(spec)), "busy": total(spec)} for i, spec in numa_nodes()],
         "mem": memory(), "disks": disks(conf.get("disks", ["/"])), "gpus": gpus(), "containers": containers(),
-        "slots": [{"name": s, "cpus": d["cpus"], "threads": len(cpu_list(d["cpus"])), "busy": total(d["cpus"]),
+        "slots": [{"name": s, "cpus": d["cpus"], "threads": len(cpu_list(d["cpus"])), "busy": slot_busy(s, d["cpus"]),
                    "top": top(d["cpus"]), **{k: d[k] for k in ("mem", "container", "note") if k in d}}
                   for s, d in conf.get("slots", {}).items()],
         "users": [{"user": u, "threads": round(v, 1)} for u, v in users.most_common(6) if v >= 0.5],
@@ -246,7 +300,27 @@ def collect(name, conf):
     return beat
 
 
+def probe_darwin():
+    sysctl = lambda k: run(["sysctl", "-n", k]).strip()
+    levels = []
+    for i in range(int(sysctl("hw.nperflevels") or 0)):
+        g = lambda k: sysctl(f"hw.perflevel{i}.{k}")
+        levels.append({"name": g("name"), "cpus": int(g("logicalcpu") or 0), "cpus_per_l2": int(g("cpusperl2") or 0),
+                       "l2_mb": int(g("l2cachesize") or 0) >> 20})
+    load, mem = busy_per_cpu(), memory()
+    print(json.dumps({
+        "host": os.uname().nodename, "os": "macOS " + run(["sw_vers", "-productVersion"]).strip(),
+        "cpu": sysctl("machdep.cpu.brand_string"), "mem_gb": mem["total"] >> 30, "avail_gb": mem["avail"] >> 30,
+        "threads": len(load), "busy_threads": round(sum(load.values()), 1), "perf_levels": levels, "pinning": False,
+        "note": "macOS 不钉核、没有 cgroup：槽位写成线程数配额（cpus 0-<N-1>）和内存预算，机器标 named_only",
+        "gpus": gpus(), "containers": containers(), "disks": disks(["/", os.path.expanduser("~")]),
+        "load1": os.getloadavg()[0],
+    }, ensure_ascii=False, indent=1))
+
+
 def probe():
+    if DARWIN:
+        return probe_darwin()
     rows = [l.split(",") for l in run(["lscpu", "-p=CPU,CORE,SOCKET,NODE,CACHE"]).splitlines() if not l.startswith("#")]
     l3 = {}
     for r in rows:

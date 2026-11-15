@@ -132,7 +132,7 @@ curryFlow 是多机开发、机器池调度和 curryPlan 文档的统一入口�
 - `machines.json`：每台机器的槽位（钉的核、内存、容器名、有没有 NV 显卡 `gpu`）、要报告的挂载点、`executor: true`、依赖缓存
   `deps_cache`、给作业加的环境变量 `env`；国内机器写 `hub_proxy`（和 `host`）。`projects` 是项目名到中枢地址的表：`seed` 是
   每台机器上已有的 clone（镜像从它建），`seed_only` 表示不许从中枢全量取（中枢小，大仓库都要写）。
-- `beat`、`status`、`executor`、`flow` 从 `templates/pool/` 拷来。
+- `beat`、`status`、`executor`、`flow`、`mac-agents` 从 `templates/pool/` 拷来。
 - 状态全是 ref（JSON blob，格式见 `executor` 开头）：`refs/hb/<机器>` 心跳；`refs/q/<id>` 请求；`refs/run/<id>` 认领，用
   "该 ref 必须不存在"的 push 建，只写这一次，两个 executor 抢同一个请求只有一个成功；`refs/done/<id>` 结论（退出码、
   最后一行、用时、日志最后 40 行、完整日志在哪台机器的哪个路径），结束 7 天后清；`refs/cancel/<id>` 取消在跑的。作业
@@ -160,7 +160,19 @@ curryFlow 是多机开发、机器池调度和 curryPlan 文档的统一入口�
   写出 `/var/www/plan/curryplan/machines/status.json`；页面是 `templates/curryplan/machines/index.html`：槽位表的"作业"列、
   "排队"和"最近完成"两张表。重发这个页面只 scp `index.html` 和 `meta.json`（`bin/planpub` 会清掉目录里的 `status.json`）。
 - 改槽位、加项目：改 `machines.json` 推到 `machines.git`，各机器十分钟内自己拉到。加机器：`beat --probe` → 在 `machines.json`
-  加一项 → 在那台机器上 clone `machines.git`、装两行 cron。
+  加一项 → 在那台机器上 clone `machines.git`、装两行 cron（Mac 上是 `./mac-agents install <名>`）。
+- **macOS 机器**（不能钉核，没有 cgroup、`/proc` 和 cron 用的 `flock`）：
+
+  | 方面 | Linux | macOS |
+  |---|---|---|
+  | 槽位 | 一组钉住的核 | 线程数配额加内存预算：`cpus` 写 `0-<N-1>`，只算个数 |
+  | 槽位空闲 | 槽位那几个核的忙线程不到 20% | 整机负载占满槽位以外的核之后，伸进槽位份额的部分不到 20% |
+  | 作业的进程 | 监管进程（child subreaper）的进程树 | 监管进程是独立的 launchd agent `cf.<id>`，作业的进程 = 它那个联盟（coalition）里的进程，脱离会话的也跑不出去 |
+  | 内存上限 | systemd scope 的 `MemoryMax` 或容器 | 监管进程每几秒加一次联盟里进程的内存，超了结束作业，结论 137 并注明 |
+  | 常驻 | 两行 cron + `flock` | 两个 LaunchAgent（`mac-agents install`）：beat 每分钟一次，executor 常驻；只在这个用户登录着时跑 |
+
+  机器标 `"named_only": true`：只接点名给它的请求（`--machine <名>`），因为项目的 Linux 工具链在上面跑不了；不点名的作业和
+  占用不会落到它上面。连中枢要走代理的写 `hub_proxy`，作业的 `PATH`、`LANG` 写在 `env` 里（默认的是 Linux 的）。
 
 通用容器（incus 机器）：同一个镜像（基础系统加构建用的包），钉在一个槽位的核上，依赖缓存只读挂入，工作目录是宿主机
 `~/<容器名>` 同路径挂入（`shift=true`，容器里的 uid 和宿主机一一对应）；会变的工具（仿真器）走依赖缓存，不进镜像。

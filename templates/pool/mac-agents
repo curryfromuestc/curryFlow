@@ -1,0 +1,68 @@
+#!/bin/sh
+# The pool's beat and executor on a Mac: two launchd agents of the login session, what the two cron lines are on Linux.
+#
+# usage: mac-agents install NAME    write and start com.curryflow.beat and com.curryflow.executor for machine NAME
+#        mac-agents remove          stop and delete them (jobs that run keep running; their conclusions wait)
+#        mac-agents status          whether they are loaded and running
+#
+# Run from the clone of the pool repository (~/curryflow/machines). macOS has no flock: launchd runs one instance of
+# an agent at a time, which is what the cron lines take the lock for. beat runs every minute; the executor is kept
+# running (launchd starts it again within seconds when it ends). The agents belong to the login session (gui/<uid>):
+# they run while this user is logged in at the Mac, as the jobs' own agents (cf.<id>) do.
+set -e
+here=$(cd "$(dirname "$0")" && pwd)
+dir=$HOME/Library/LaunchAgents
+domain=gui/$(id -u)
+labels="com.curryflow.beat com.curryflow.executor"
+
+plist() {  # LABEL ERR KEY ARG...
+    label=$1 err=$2 key=$3
+    shift 3
+    {
+        printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+        printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        printf '<plist version="1.0"><dict>\n'
+        printf '  <key>Label</key><string>%s</string>\n' "$label"
+        printf '  <key>ProgramArguments</key><array>\n    <string>/usr/bin/python3</string>\n'
+        for a in "$@"; do printf '    <string>%s</string>\n' "$a"; done
+        printf '  </array>\n'
+        printf '  <key>WorkingDirectory</key><string>%s</string>\n' "$here"
+        printf '  <key>RunAtLoad</key><true/>\n  %s\n' "$key"
+        printf '  <key>StandardOutPath</key><string>/dev/null</string>\n'
+        printf '  <key>StandardErrorPath</key><string>%s</string>\n' "$err"
+        printf '</dict></plist>\n'
+    } > "$dir/$label.plist"
+}
+
+case ${1:-} in
+install)
+    name=${2:?usage: mac-agents install NAME}
+    grep -q "\"$name\"" "$here/machines.json" || { echo "machines.json has no machine $name" >&2; exit 1; }
+    mkdir -p "$dir" "$HOME/curryflow/exec/$name"
+    plist com.curryflow.beat /dev/null '<key>StartInterval</key><integer>60</integer>' "$here/beat" --machine "$name"
+    plist com.curryflow.executor "$HOME/curryflow/exec/$name/launchd.err" '<key>KeepAlive</key><true/>' \
+        "$here/executor" run --machine "$name"
+    for label in $labels; do
+        launchctl bootout "$domain/$label" 2>/dev/null || true
+        launchctl bootstrap "$domain" "$dir/$label.plist"
+    done
+    echo "installed: $labels (machine $name)"
+    ;;
+remove)
+    for label in $labels; do
+        launchctl bootout "$domain/$label" 2>/dev/null || true
+        rm -f "$dir/$label.plist"
+    done
+    echo "removed: $labels"
+    ;;
+status)
+    for label in $labels; do
+        state=$(launchctl print "$domain/$label" 2>/dev/null | awk '$1 == "state" { print $3; exit }')
+        echo "$label: ${state:-not loaded}"
+    done
+    ;;
+*)
+    sed -n 2,6p "$0" >&2
+    exit 2
+    ;;
+esac

@@ -16,6 +16,9 @@ Every case sets up a situation, says what should happen and records what did. DI
 --baseline runs an older executor and flow from --pool: it adds the line that reads CF_POOL_TUNE to them.
 --measure counts, per fake machine, the hub operations of executor and beat in SECONDS with the real intervals:
 first idle, then with one long job on each machine, then with those jobs and both beats stopped (DIR/ops.tsv).
+
+On macOS the same cases run with that system's commands (no setsid, no date +%N, no touch -d), J9-pin checks the ssh
+command only (no thread is pinned there), and W-memory is added: a job over its slot's memory ends with 137.
 """
 import argparse
 import json
@@ -27,6 +30,11 @@ import subprocess
 import sys
 import time
 
+DARWIN = sys.platform == "darwin"
+# A command in a session of its own, the time with a fraction, and a file's times set ten days back, in sh.
+SETSID = "perl -MPOSIX -e 'setsid();exec @ARGV'" if DARWIN else "setsid"
+NOW = "perl -MTime::HiRes=time -e 'printf(\"%.6f\",time)'" if DARWIN else "date +%s.%N"
+TOUCH_OLD = "touch -t $(date -v-10d +%Y%m%d%H%M)" if DARWIN else 'touch -d "10 days ago"'
 HERE = os.path.dirname(os.path.realpath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 GIT = shutil.which("git")
@@ -137,12 +145,12 @@ exec {GIT} "$@"
 """, 0o755)
         for m in ("t1", "t2"):
             put(f"{w}/bin/up-{m}", f"""#!/bin/sh
-echo "$(date +%s.%N) {m} read" >> {w}/ops.log
+echo "$({NOW}) {m} read" >> {w}/ops.log
 [ -e {mk}/lsfail-{m} ] || [ -e {mk}/down-{m} ] && {{ echo "e2e: no hub for {m}" >&2; exit 1; }}
 exec {GIT} upload-pack "$@"
 """, 0o755)
             put(f"{w}/bin/rp-{m}", f"""#!/bin/sh
-echo "$(date +%s.%N) {m} push" >> {w}/ops.log
+echo "$({NOW}) {m} push" >> {w}/ops.log
 [ -e {mk}/down-{m} ] && {{ echo "e2e: no hub for {m}" >&2; exit 1; }}
 CF_PUSHER={m} exec {GIT} receive-pack "$@"
 """, 0o755)
@@ -166,7 +174,7 @@ exit 0
 """, 0o755)
         put(f"{w}/hub.git/hooks/reference-transaction", f"""#!/bin/sh
 [ "$1" = committed ] || exit 0
-while read old new ref; do echo "$(date +%s.%N) $ref $new" >> {w}/reflog.txt; done
+while read old new ref; do echo "$({NOW}) $ref $new" >> {w}/reflog.txt; done
 """, 0o755)
         sh(GIT, "init", "-q", "-b", "main", "--bare", f"{w}/proj.git")
         put(f"{w}/proj.git/hooks/pre-receive", f"""#!/bin/sh
@@ -369,6 +377,9 @@ def jload(path):
 
 
 def pid_gone(pid):
+    if DARWIN:               # no /proc: gone, or a zombie by ps
+        st = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+        return not st or st.startswith("Z")
     try:
         with open(f"/proc/{pid}/stat") as f:
             return f.read().rsplit(")", 1)[1].split()[0] == "Z"
@@ -462,7 +473,7 @@ def c_window(r):
 def c_leftover(r):
     pf = f"{r.out}/C1.pid"
     rc, out = r.flow("run", "--project", "demo", "--machine", "t1", "--",
-                     f"(setsid sh -c 'trap \"\" TERM; echo $$ > {pf}; exec sleep 300' &); sleep 1; exit 3")
+                     f"({SETSID} sh -c 'trap \"\" TERM; echo $$ > {pf}; exec sleep 300' &); sleep 1; exit 3")
     pid = (lines(pf) or ["0"])[0]
     gone = until(lambda: pid_gone(pid), 10)
     return f"flow 退出码 {rc}，后台进程 {pid} {'不在了' if gone else '还在'}", rc == 3 and gone
@@ -471,7 +482,7 @@ def c_leftover(r):
 @case("C-cancel", "在跑的作业有一个 setsid nohup 起的孙进程，flow cancel", "结论 143（已取消），孙进程被清掉")
 def c_cancel(r):
     pf = f"{r.out}/C2.pid"
-    rid = r.submit("--machine", "t2", "--", f"setsid nohup sleep 300 >/dev/null 2>&1 & echo $! > {pf}; sleep 300")
+    rid = r.submit("--machine", "t2", "--", f"{SETSID} nohup sleep 300 >/dev/null 2>&1 & echo $! > {pf}; sleep 300")
     until(lambda: lines(pf), 30)
     rc, out = r.flow("cancel", rid)
     d = r.done(rid, 30)
@@ -985,7 +996,7 @@ def c_tmpdir(r):
         os.utime(path, (old, old))
     put(os.path.join(tmp, "new.txt"), "x")
     rid = r.submit("--machine", "t1", "--slot", "a0", "--",
-                   'echo hi > "$TMPDIR/mine"; touch -d "10 days ago" "$TMPDIR/mine"; sleep 6; test -e "$TMPDIR/mine"')
+                   f'echo hi > "$TMPDIR/mine"; {TOUCH_OLD} "$TMPDIR/mine"; sleep 6; test -e "$TMPDIR/mine"')
     until(lambda: rid in r.refs("run"), 30)
     rc_b, _ = r.flow("run", "--project", "demo", "--machine", "t1", "--slot", "a1", "--", "true")
     d = r.done(rid, 60)
@@ -1183,6 +1194,9 @@ def c_pin(r):
     rc, out = r.flow("run", "--project", "demo", "--machine", "t1", "--slot", "a1", "--commit", "e2e-j9", "--", "true")
     cpus = (lines(f"{r.marks}/fetch.cpus") or [""])[0].split(":")[-1].strip()
     ssh = (lines(f"{r.marks}/fetch.ssh") or [""])[0]
+    if DARWIN:               # no thread is pinned there
+        return (f"flow 退出码 {rc}，macOS 不钉核，ssh 带 ServerAlive：{'ServerAliveInterval' in ssh}",
+                rc == 0 and "ServerAliveInterval" in ssh)
     return (f"flow 退出码 {rc}，git 的核 {cpus or '?'}（a1 是 {r.cpus['a1']}），ssh 带 ServerAlive：{'ServerAliveInterval' in ssh}",
             rc == 0 and cpus == r.cpus["a1"] and "ServerAliveInterval" in ssh)
 
@@ -1327,6 +1341,49 @@ def c_buildclean(r):
     parts = env_line.split(":")
     ok_env = len(parts) == 3 and parts[1].isdigit() and int(parts[1]) >= 1 and parts[2] == "4"
     return f"{env_line}，普通跑 rc={rc2}，--clean rc={rc3}", rc1 == 0 and ok_env and rc2 == 0 and rc3 == 0
+
+
+@case("N-named", "t2 在 machines.json 里标了 named_only；提交 3 个不点名的作业，再提交 1 个 --machine t2 的作业",
+      "不点名的都在 t1 上跑完，点名的在 t2 上跑完")
+def c_named(r):
+    r.push_conf(lambda c: c["machines"]["t2"].update(named_only=True))
+    r.pull("t1", "t2")
+    time.sleep(3)
+    try:
+        ids = [r.submit("--", "sleep 1") for _ in range(3)]
+        named = r.submit("--machine", "t2", "--", "true")
+        ds = [r.done(i, 90) for i in ids]
+        dn = r.done(named, 60)
+        return (f"不点名的在 {[d and d['machine'] for d in ds]}（{[d and d['code'] for d in ds]}），"
+                f"点名的在 {dn and dn['machine']}（{dn and dn['code']}）",
+                all(d and d["code"] == 0 and d["machine"] == "t1" for d in ds)
+                and bool(dn) and dn["code"] == 0 and dn["machine"] == "t2")
+    finally:
+        r.push_conf(lambda c: c["machines"]["t2"].pop("named_only", None))
+        r.pull("t1", "t2")
+        time.sleep(3)
+
+
+if DARWIN:
+    @case("W-memory", "（macOS）t2/b0 的内存预算改成 200 MiB，作业起一个脱离会话、占 600 MB 的后台进程后睡 60 秒",
+          "监管进程按联盟加出作业的内存，超了就结束它：结论 137，注明超过内存上限，后台进程被清掉")
+    def c_memory(r):
+        r.push_conf(lambda c: c["machines"]["t2"]["slots"]["b0"].update(mem="200MiB"))
+        r.pull("t1", "t2")
+        time.sleep(3)
+        pf = f"{r.out}/W.pid"
+        try:
+            hog = f"import os,time; open('{pf}','w').write(str(os.getpid())); x=bytearray(600<<20); time.sleep(300)"
+            rid = r.submit("--machine", "t2", "--", f"({SETSID} {PY} -c \"{hog}\" &); sleep 60")
+            d = r.done(rid, 60)
+            pid = (lines(pf) or ["0"])[0]
+            gone = until(lambda: pid_gone(pid), 10)
+            return (f"结论 {d and (d['code'], d['note'])}，后台进程{'不在了' if gone else '还在'}",
+                    bool(d) and d["code"] == 137 and "内存上限" in d["note"] and gone)
+        finally:
+            r.push_conf(lambda c: c["machines"]["t2"]["slots"]["b0"].update(mem="4GiB"))
+            r.pull("t1", "t2")
+            time.sleep(3)
 
 
 def main():
