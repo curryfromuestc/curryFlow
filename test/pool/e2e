@@ -887,6 +887,91 @@ def c_pull(r):
     return f"拉不下来时心跳里 {bad and cut(bad)}；之后 {good and cut(good)}", bool(bad) and bool(bad.get("error")) and bool(good)
 
 
+def hub_main(r, name, text):
+    """A commit on top of the project hub's main that writes the file `name`; main is at it then."""
+    pw, e = f"{r.w}/projwork", {**os.environ, **ENV}
+    sh(GIT, "-C", pw, "fetch", "-q", "origin", "main", env=e)
+    sh(GIT, "-C", pw, "checkout", "-q", "--detach", "FETCH_HEAD", env=e)
+    put(f"{pw}/{name}", text)
+    sh(GIT, "-C", pw, "add", "-A", env=e)
+    sh(GIT, "-C", pw, "commit", "-qm", name, env=e)
+    sh(GIT, "-C", pw, "push", "-q", "origin", "HEAD:refs/heads/main")
+    return sh(GIT, "-C", pw, "rev-parse", "HEAD")
+
+
+@case("M5-home", "machines.json 给 demo 登记了两台机器的主目录：t1 的检出 main 且 README 有没提交的改动，t2 的在自己的分支 work 上"
+      "（有提交和没提交的改动）；t1 还登记了一个不存在的目录。中枢的 main 依次前进四次：(1) 加一个文件；(2) t1 的 main 上先有了"
+      "自己的提交；(3) 改 README，这时 t2 已切到 main、README 的本地改动还在，之后撤掉这个改动；(4) beat 取中枢的那次 fetch 卡住",
+      "(1) t1 的工作区快进、README 的改动还在，t2 的 HEAD 和工作区不动、只有 main 分支前进，不存在的目录在心跳里有错误；"
+      "(2) t1 原样不动，心跳里超前 1、落后 1；(3) 有改动挡着时 t2 不动，心跳里落后 1 和 git 的原因，撤掉后快进、错误消失；"
+      "(4) 心跳照常推，里面有这次超时，下一轮恢复")
+def c_home(r):
+    e = {**os.environ, **ENV}
+    h1, h2 = (os.path.join(r.homes[m], "code", "demo") for m in ("t1", "t2"))
+    rev = lambda h, name="HEAD": sh(GIT, "-C", h, "rev-parse", name)
+    read = lambda path: open(path).read() if os.path.exists(path) else None
+    home = lambda m, project="demo": next((h for h in r.hb(m).get("homes") or [] if h.get("project") == project), {})
+    at = lambda m, sha, **kw: (lambda h: h.get("main") == sha[:12] and all(h.get(k) == v for k, v in kw.items()) and h)(home(m))
+    try:
+        for h in (h1, h2):
+            sh(GIT, "clone", "-q", f"{r.w}/proj.git", h)
+        put(f"{h1}/README", "demo, edited on t1\n")
+        sh(GIT, "-C", h2, "checkout", "-q", "-b", "work", env=e)
+        put(f"{h2}/work.txt", "work\n")
+        sh(GIT, "-C", h2, "add", "-A", env=e)
+        sh(GIT, "-C", h2, "commit", "-qm", "work", env=e)
+        put(f"{h2}/README", "demo, edited on t2\n")
+        work = rev(h2)
+        r.push_conf(lambda conf: conf["projects"].update(
+            demo={**conf["projects"]["demo"], "home": {"t1": "~/code/demo", "t2": "~/code/demo"}},
+            absent={"hub": f"{r.w}/proj.git", "home": {"t1": "~/code/absent"}}))
+        for m in ("t1", "t2"):
+            r.beat_off(m)
+            r.beat_on(m, PULL=1, HOME_FETCH=3)
+        # (1) fast-forward: the work tree on main, the branch alone elsewhere
+        c1 = hub_main(r, "one.txt", "one\n")
+        b1 = until(lambda: at("t2", c1, branch="work", behind=0) and at("t1", c1, branch="main", behind=0, ahead=0), 60)
+        absent = until(lambda: home("t1", "absent").get("error"), 30)
+        ok1 = (bool(b1) and rev(h1) == c1 and read(f"{h1}/one.txt") == "one\n" and read(f"{h1}/README") == "demo, edited on t1\n"
+               and rev(h2) == work and rev(h2, "main") == c1 and read(f"{h2}/one.txt") is None
+               and read(f"{h2}/README") == "demo, edited on t2\n" and bool(absent) and not home("t1", "absent").get("main"))
+        # (2) a main with a commit of its own is left alone
+        put(f"{h1}/local.txt", "local\n")
+        sh(GIT, "-C", h1, "add", "local.txt", env=e)
+        sh(GIT, "-C", h1, "commit", "-qm", "local", env=e)
+        local = rev(h1)
+        c2 = hub_main(r, "two.txt", "two\n")
+        b2 = until(lambda: at("t2", c2, behind=0) and at("t1", local, ahead=1, behind=1), 60)
+        ok2 = bool(b2) and rev(h1) == local and read(f"{h1}/two.txt") is None
+        # (3) a local change in the way: git refuses, nothing moves; it goes on once the change is gone
+        sh(GIT, "-C", h2, "checkout", "-q", "main", env=e)
+        c3 = hub_main(r, "README", "demo, changed on the hub\n")
+        b3 = until(lambda: at("t2", c2, branch="main", behind=1) and home("t2").get("error") and home("t2"), 60)
+        refused = bool(b3) and rev(h2) == c2 and read(f"{h2}/README") == "demo, edited on t2\n"
+        sh(GIT, "-C", h2, "checkout", "-q", "--", "README", env=e)
+        b3b = until(lambda: at("t2", c3, behind=0) and not home("t2").get("error"), 60)
+        ok3 = refused and bool(b3b) and rev(h2) == c3 and read(f"{h2}/README") == "demo, changed on the hub\n"
+        # (4) a fetch of the hub that hangs: the run goes on after HOME_FETCH, the heartbeat carries the error once
+        r.mark("slowfetch")
+        hung = until(lambda: next((h for m in ("t1", "t2") for h in [home(m)] if "timed out" in (h.get("error") or "")), None), 60, step=0.3)
+        back = until(lambda: not os.path.exists(os.path.join(r.marks, "slowfetch")) and not home("t2").get("error")
+                     and "timed out" not in (home("t1").get("error") or "") and home("t2").get("main") == c3[:12], 60)
+        ok4 = bool(hung) and bool(back)
+    finally:
+        r.unmark("slowfetch", "fetch.pid")
+        r.push_conf(lambda conf: (conf["projects"]["demo"].pop("home", None), conf["projects"].pop("absent", None)))
+        sh(GIT, "-C", f"{r.w}/projwork", "push", "-q", "-f", "origin", f"{r.main}:refs/heads/main")
+        for m in ("t1", "t2"):
+            r.beat_off(m)
+            r.beat_on(m)
+        r.pull("t1", "t2")
+        for h in (h1, h2):
+            shutil.rmtree(h, ignore_errors=True)
+    return (f"(1) {'快进了，改动都在' if ok1 else '不对'}：t1 {cut(b1)[42:150]}，不存在的目录：{str(absent)[-40:]}；(2) t1 {cut(b2)[42:150] if b2 else b2}；"
+            f"(3) 挡着时 {(b3 or {}).get('error', '')[-70:]!r}，撤掉后 {'快进了' if ok3 else '没有快进'}；(4) {(hung or {}).get('error', '')[-40:]!r}，"
+            f"之后{'恢复' if back else '没恢复'}"), ok1 and ok2 and ok3 and ok4
+
+
 def cut(d):
     return json.dumps(d, ensure_ascii=False)[:160]
 

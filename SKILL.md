@@ -3,7 +3,7 @@ name: curryflow
 description: >-
   多机开发流程的唯一入口。给一个项目引导出流程：探测机器、和人定验收阶段与判据、定存储规矩，生成项目的 ci/accept、
   docs/pages.json、tools/publish-docs、AGENTS.md 和 .gitignore，建中枢 git 仓库和镜像，接入机器池；写清协调器的通用规矩
-  （派任务前问人用哪些机器、本地 subagent 只写代码不建多工作树、合并后主会话统一跑重活、推 main 必出发布件并同步主目录）；
+  （派任务前问人用哪些机器、本地 subagent 只写代码不建多工作树、合并后主会话统一跑重活、推 main 必出发布件）；
   管机器池（machines.git、每分钟心跳 beat、每台机器一个服务所有项目的 executor、拿槽位的 flow run / flow hold、curryPlan 上的
   "机器"页）；管 curryPlan 页面（仓库 docs/*.html 与 curryPlan 同源自动发布、图表与表格优先、禁大段文字）。触发于："用 curryFlow
   引导 X"、"给项目搭多机流程"、"加一台机器"、"看机器负载 / 槽位"、"在机器池上跑个作业 / 占个槽位"、"发到 curryPlan"、
@@ -67,14 +67,15 @@ curryFlow 是多机开发、机器池调度和 curryPlan 文档的统一入口�
    ~/curryflow/machines/flow run --project <项目> --commit <中枢分支或SHA> --machine <机器> --prio gate --no-wait -- ci/accept --stage <阶段>
    ```
    合并只认机器池槽位里跑出的 `accept: PASS`。
-5. **合并、发版与同步（每次推 main 必做四步）。** 验收全绿后，按顺序执行：
+5. **合并与发版（每次推 main 必做三步）。** 验收全绿后，按顺序执行：
    ```
    (1) 推中枢 main        git push hub main
    (2) 推 GitHub main     git push origin main
    (3) 打发布件并上传     在机器池跑 make release，校验 sha256，用 gh release create/upload 传到 GitHub
                           （release/<YYYYMMDD>-<shortsha>；若发现历史 main 提交漏传过发布件，一并补传）
-   (4) 同步宿主主目录     把宿主上的 ~/code/<项目> 切回 main 并快进到最新提交，让人随时看到最新代码
    ```
+   各机器上给人看的主目录（`~/code/<项目>`）不用手工同步：登记在 `machines.json` 的 `projects.<项目>.home` 里，beat 每
+   10 分钟把它的 main 快进到中枢的 main（见“机器池”）。
 
 通用规矩：
 
@@ -135,7 +136,8 @@ curryFlow 是多机开发、机器池调度和 curryPlan 文档的统一入口�
 
 - `machines.json`：每台机器的槽位（钉的核、内存、容器名、有没有 NV 显卡 `gpu`）、要报告的挂载点、`executor: true`、依赖缓存
   `deps_cache`、给作业加的环境变量 `env`；国内机器写 `hub_proxy`（和 `host`）。`projects` 是项目名到中枢地址的表：`seed` 是
-  每台机器上已有的 clone（镜像从它建），`seed_only` 表示不许从中枢全量取（中枢小，大仓库都要写）。
+  每台机器上已有的 clone（镜像从它建），`seed_only` 表示不许从中枢全量取（中枢小，大仓库都要写）；`home` 是每台机器上给人
+  看的主目录（`{"<机器>": "~/code/<项目>"}`），beat 让它的 main 跟着中枢的 main。
 - `beat`、`status`、`executor`、`flow`、`mac-agents` 从 `templates/pool/` 拷来。
 - 状态全是 ref（JSON blob，格式见 `executor` 开头）：`refs/hb/<机器>` 心跳；`refs/q/<id>` 请求；`refs/run/<id>` 认领，用
   "该 ref 必须不存在"的 push 建，只写这一次，两个 executor 抢同一个请求只有一个成功；`refs/done/<id>` 结论（退出码、
@@ -153,7 +155,10 @@ curryFlow 是多机开发、机器池调度和 curryPlan 文档的统一入口�
   ```
   beat 每分钟把本机状态推成心跳：各 NUMA 节点和各槽位的忙线程、内存、磁盘、显卡、incus 容器、谁在占 CPU（容器内进程按
   持有该容器槽位的提交人归属）、每个槽位里的作业或占用；每 10 分钟自己 `git pull`，心跳里带 clone 的版本和上次 pull 的结果
-  （`pull`），机器页上显示版本，pull 失败标红。executor 每 15 秒经一条复用的 ssh 连接看一次队列（取项目的提交另开连接）；
+  （`pull`），机器页上显示版本，pull 失败标红。同样每 10 分钟，beat 对本机登记了 `home` 的项目从中枢取 main（记成
+  `refs/remotes/hub/main`）并快进本地的 main：主目录正检出 main 时连工作区一起快进（有本地改动挡着时 git 拒绝，目录不动），
+  检出的是别的分支时只动 main 这个分支；不切分支、不合并、不回退，main 上有自己的提交就原样留着，子模块不更新。看到的
+  结果在心跳的 `homes` 里（分支、main、落后和超前的提交数、错误），机器页上落后、同步失败或一小时没看过标红。executor 每 15 秒经一条复用的 ssh 连接看一次队列（取项目的提交另开连接）；
   文件变了且手上没有作业时自己换成新版本；被结束了一分钟内由 cron 拉起，接着等在跑的作业，不重跑。beat 停了或卡在慢的探测
   （nvidia-smi、incus）里时，手上有作业的 executor 每 2.5 分钟自己推一次 `refs/alive/<机器>`（它手上的请求 id），作业不会
   因为 beat 坏了被判丢。

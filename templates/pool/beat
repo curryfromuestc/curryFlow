@@ -10,6 +10,14 @@ disks, GPUs, incus containers, who uses the CPUs, and from the machine's executo
 hold in each slot, whether the executor would schedule the slot, and the ids of every request the executor holds
 (flow and the other executors take a run as alive while its machine's heartbeat moves and lists it). Every ten minutes
 it pulls the clone; the heartbeat carries the clone's commit and how the last pull went (pull: ok, error, at).
+
+Every ten minutes it also brings this machine's main directory of each project (machines.json:
+projects.<project>.home.<machine>, the clone people read, e.g. ~/code/<project>) to the main of the project's hub. It
+fetches that branch as refs/remotes/hub/main and fast-forwards the local main: with the work tree when main is checked
+out there (git refuses when a local change is in the way), the branch alone otherwise. It never switches the branch,
+merges or rewinds: a main with commits of its own stays as it is. The heartbeat says what it found (homes: branch,
+main, behind, ahead, at, error), so a directory that falls behind shows on the machines page. Submodules are not
+updated.
 With --probe (e.g. `ssh <host> python3 - --probe < beat`), prints the host's NUMA/L3 topology, memory, GPUs, disks,
 container backend and suggested slot CPU ranges as JSON without reading machines.json.
 
@@ -31,7 +39,11 @@ import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
 PULLED = os.path.join(ROOT, ".git", "cf-pull.json")
+HOMES = os.path.join(ROOT, ".git", "cf-homes.json")
 PULL = 600
+BUDGET = 50              # seconds a run may take (cron ends it after 55): what is left bounds a main directory's fetch
+HOME_FETCH = 30
+START = time.time()
 DARWIN = sys.platform == "darwin"
 
 
@@ -364,45 +376,105 @@ def probe():
     }, ensure_ascii=False, indent=1))
 
 
-def pulled():
+def load(path):
     try:
-        with open(PULLED) as f:
-            p = json.load(f)
+        with open(path) as f:
+            return json.load(f)
     except (OSError, ValueError):
-        p = {}
+        return {}
+
+
+def keep(path, state):
+    with open(path + ".tmp", "w") as f:
+        json.dump(state, f, ensure_ascii=False)
+    os.replace(path + ".tmp", path)
+
+
+def pulled():
+    p = load(PULLED)
     head = run(["git", "-C", ROOT, "rev-parse", "HEAD"]).strip()
     return {"head": head[:12] or None, "ok": p.get("ok"), "at": p.get("at"), "error": p.get("error")}
 
 
 def pull(proxy):
     """git pull every PULL seconds; how it went goes into the heartbeats, so a clone that falls behind shows."""
-    try:
-        with open(PULLED) as f:
-            last = json.load(f)
-    except (OSError, ValueError):
-        last = {}
+    last = load(PULLED)
     if time.time() - last.get("tried", 0) < PULL:
         return
-
-    def keep(st):
-        with open(PULLED + ".tmp", "w") as f:
-            json.dump(st, f, ensure_ascii=False)
-        os.replace(PULLED + ".tmp", PULLED)
-    keep({**last, "tried": time.time()})
+    keep(PULLED, {**last, "tried": time.time()})
     try:
         git("pull", "-q", "--ff-only", proxy=proxy)
-        keep({"tried": time.time(), "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "ok": True})
+        keep(PULLED, {"tried": time.time(), "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "ok": True})
     except (SystemExit, subprocess.TimeoutExpired) as e:
-        keep({"tried": time.time(), "at": last.get("at"), "ok": False, "error": str(e)[-300:]})
+        keep(PULLED, {"tried": time.time(), "at": last.get("at"), "ok": False, "error": str(e)[-300:]})
 
 
-def git(*args, input=None, proxy=None):
+def home_paths(projects, machine):
+    return {p: d["home"][machine] for p, d in projects.items()
+            if isinstance(d, dict) and isinstance(d.get("home"), dict) and machine in d["home"]}
+
+
+def homes(projects, machine):
+    """What the last look at this machine's main directories found, for the heartbeat."""
+    state = load(HOMES)
+    return [{"project": p, "path": path, **{k: v for k, v in state.get(p, {}).items() if k != "tried"}}
+            for p, path in home_paths(projects, machine).items()]
+
+
+def sync_homes(projects, machine, proxy):
+    """Every PULL seconds, each main directory of this machine at its hub's main (sync_home); one that this run has
+    no time left for waits for the next run."""
+    state = load(HOMES)
+    for p, path in home_paths(projects, machine).items():
+        last = state.get(p, {})
+        left = BUDGET - (time.time() - START)
+        if time.time() - last.get("tried", 0) < PULL or left < 10:
+            continue
+        state[p] = {**last, "tried": time.time()}
+        keep(HOMES, state)
+        try:
+            found = sync_home(os.path.expanduser(path), projects[p]["hub"], proxy, min(HOME_FETCH, left - 5))
+            state[p] = {"tried": time.time(), "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), **found}
+        except (SystemExit, subprocess.TimeoutExpired, OSError) as e:
+            state[p] = {**last, "tried": time.time(), "error": str(e)[-300:]}
+        keep(HOMES, state)
+
+
+def sync_home(path, hub, proxy, timeout):
+    """Fetch the hub's main into the clone at `path` and fast-forward its main to it; what the clone is at then."""
+    g = lambda *args, **kw: git(*args, cwd=path, **kw)
+    g("fetch", "-q", "--no-tags", "--no-recurse-submodules", hub, "+refs/heads/main:refs/remotes/hub/main", proxy=proxy,
+      timeout=timeout)
+    branch = g("rev-parse", "--abbrev-ref", "HEAD")           # HEAD when no branch is checked out
+
+    def state():
+        main = g("for-each-ref", "--format=%(objectname)", "refs/heads/main")
+        if not main:
+            return {"branch": branch, "main": None, "error": "the clone has no branch main"}
+        ahead, behind = g("rev-list", "--left-right", "--count", "refs/heads/main...refs/remotes/hub/main").split()
+        return {"branch": branch, "main": main[:12], "behind": int(behind), "ahead": int(ahead)}
+
+    found = state()
+    if found.get("behind") and not found["ahead"]:
+        try:
+            if branch == "main":       # in a session of its own: the work tree's update is not cut short with this run
+                g("merge", "-q", "--ff-only", "refs/remotes/hub/main", timeout=120, detach=True)
+            else:
+                g("fetch", "-q", ".", "refs/remotes/hub/main:refs/heads/main")
+            found = state()
+        except (SystemExit, subprocess.TimeoutExpired) as e:
+            found["error"] = str(e)[-300:]
+    return found
+
+
+def git(*args, input=None, proxy=None, cwd=None, timeout=45, detach=False):
     ssh = ("ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
            " -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPersist=10m -o ControlPath=~/.ssh/cf-%C")
     if proxy:
         ssh += f" -o 'ProxyCommand=nc -X connect -x {proxy} %h %p'"
     env = {**os.environ, "GIT_SSH_COMMAND": ssh, "GIT_TERMINAL_PROMPT": "0"}
-    r = subprocess.run(["git", *args], cwd=ROOT, input=input, capture_output=True, text=True, env=env, timeout=45)
+    r = subprocess.run(["git", *args], cwd=cwd or ROOT, input=input, capture_output=True, text=True, env=env,
+                       timeout=timeout, start_new_session=detach)
     if r.returncode:
         raise SystemExit(f"git {' '.join(args)}: {r.stderr.strip()}")
     return r.stdout.strip()
@@ -419,10 +491,13 @@ def main():
         return probe()
     if not a.machine:
         ap.error("--machine is required (or use --probe)")
-    conf = json.load(open(os.path.join(ROOT, "machines.json")))["machines"].get(a.machine)
+    pool = json.load(open(os.path.join(ROOT, "machines.json")))
+    conf, projects = pool["machines"].get(a.machine), pool.get("projects") or {}
     if conf is None:
         raise SystemExit(f"machines.json has no machine {a.machine}")
     beat = collect(a.machine, conf)
+    if home_paths(projects, a.machine):
+        beat["homes"] = homes(projects, a.machine)
     text = json.dumps(beat, ensure_ascii=False)
     if a.print:
         print(json.dumps(beat, ensure_ascii=False, indent=1))
@@ -431,6 +506,7 @@ def main():
     blob = git("hash-object", "-w", "--stdin", input=text)
     git("push", "-q", "-f", "origin", f"{blob}:refs/hb/{a.machine}", proxy=proxy)
     pull(proxy)
+    sync_homes(projects, a.machine, proxy)
     if time.localtime().tm_min == 7:
         git("gc", "-q", "--prune=10.minutes.ago")      # not now: executor and flow push blobs they have just written
 

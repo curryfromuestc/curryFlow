@@ -125,7 +125,15 @@ svg.sp line { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-s
     const pull = (p.head ? ` · 版本 <span class="mono">${esc(p.head.slice(0, 9))}</span>` : "") + (p.ok === false
       ? ` · <span class="stale" title="${esc(p.error || "")}">git pull 失败（上次成功 ${ago(p.at)}）：${esc((p.error || "").slice(-120))}</span>`
       : p.at && secs(p.at) > 3600 ? ` · <span class="stale">${ago(p.at)}拉过</span>` : "");
-    return `<section class="sec" data-c="m-${esc(m.name)}"><h2>${esc(m.name)} <small>${c.shared ? "共享机" : "独占机"} · ${b.threads} 线程 · 心跳 <span class="${stale ? "stale" : ""}">${ago(b.at)}</span>${ex}${pull}</small></h2>
+    // The main directory of each project on this machine (beat keeps its main at the hub's): red when it is behind,
+    // was not looked at for an hour, or the last look failed.
+    const homes = (b.homes || []).map((h) => {
+      const late = !h.at || secs(h.at) > 3600, bad = h.error || h.behind > 0 || h.main == null || late;
+      const notes = [h.branch && h.branch !== "main" ? `工作区在 ${esc(h.branch)}` : "", h.behind > 0 ? `落后 ${h.behind}` : "",
+        h.ahead > 0 ? `超前 ${h.ahead}` : "", h.error ? "同步失败" : late ? (h.at ? `${ago(h.at)}看过` : "没看过") : ""].filter(Boolean).join("，");
+      return ` · <span class="${bad ? "stale" : ""}" title="${esc(h.path + (h.error ? "：" + h.error : ""))}">${esc(h.project)} main <span class="mono">${esc((h.main || "-").slice(0, 9))}</span>${notes ? `（${notes}）` : ""}</span>`;
+    }).join("");
+    return `<section class="sec" data-c="m-${esc(m.name)}"><h2>${esc(m.name)} <small>${c.shared ? "共享机" : "独占机"} · ${b.threads} 线程 · 心跳 <span class="${stale ? "stale" : ""}">${ago(b.at)}</span>${ex}${pull}${homes}</small></h2>
       <div class="wall">
         <div class="card" data-c="m-${esc(m.name)}-load"><div class="nums">
           <div><b>${b.busy.toFixed(0)}<span class="dim" style="font-size:13px"> / ${b.threads}</span></b><span>忙线程</span></div>
