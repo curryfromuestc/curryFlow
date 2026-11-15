@@ -814,7 +814,10 @@ def prepare(job, say, run, must, check):
         os.rename(tmp, tree)
     clear_locks(tree, os.path.join(tree, ".git"), say, check)
     if not has(tree):
-        must(["git", "-C", tree, "fetch", "-q", "--no-tags", mirror, sha], "工作树从镜像取提交失败")
+        # The tree's submodules are never fetched here (a project's provision supplies them, possibly as a
+        # link at the submodule path); git >= 2.45.1 refuses to recurse into a path that is a symbolic link.
+        must(["git", "-C", tree, "fetch", "-q", "--no-tags", "--no-recurse-submodules", mirror, sha],
+             "工作树从镜像取提交失败")
     must(["git", "-C", tree, "-c", "advice.detachedHead=false", "checkout", "-q", "-f", "--detach", sha], "checkout 失败")
     must(["git", "-C", tree, "clean", "-fdq"], "git clean 失败")
     stamp_path = os.path.join(tree, ".build", ".cf-env.json")
