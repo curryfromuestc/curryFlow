@@ -15,7 +15,7 @@ description: >-
 curryFlow 是多机开发、机器池调度和 curryPlan 文档的统一入口。对人的一切叙述用中文。
 
 ```
-中枢 hub（小 VPS）
+中枢 hub（只放 git 仓库的小服务器，选各台机器直连都稳的位置）
   ├─ machines.git         机器池仓库；心跳 refs/hb/*、队列 refs/q/*、认领 refs/run/*、结论 refs/done/*
   └─ <项目>.git           项目 bare 仓库（带备用中枢 post-receive 镜像）；存 main 和 wip/* 分支
 机器池（每台机器一份 ~/curryflow/machines）
@@ -37,7 +37,7 @@ curryFlow 是多机开发、机器池调度和 curryPlan 文档的统一入口�
 1. **探测机器并配进机器池。** 对新机器跑 `ssh <别名> python3 - --probe < templates/pool/beat`，读输出的 JSON（NUMA 节点、L3 域、内存、GPU、磁盘、incus 容器）：
    - 一个仿真槽位 = 一个 L3 域（8 个物理核加超线程；L3 不足 8 核则拼同一 NUMA 节点相邻的 L3）。
    - 共享机器标 `"shared": true`，只占人给的份额，选最闲的 NUMA 节点；有 incus 的机器用通用容器（钉核、限内存、只读挂依赖缓存），没有容器的机器用裸槽位（`executor` 自动用 `taskset` 钉核 + `systemd-run --user -p MemoryMax=` 限内存）。
-   - 国内连中枢不稳的机器配 `"hub_proxy": "127.0.0.1:7890"`。
+   - 直连中枢不稳的机器配 `"hub_proxy": "127.0.0.1:7890"`。
    - 在 `machines.git` 的 `machines.json` 里登记项目（`projects.<项目>.hub`、大仓库设 `seed_only: true` 和各机 `seed` 路径）和机器槽位，推上中枢。
 2. **定验收（和人一起）。** 列阶段：名字、命令、判据。用例来自真实 bug，按改动文件的风险分级（`TIERS`）填进 `ci/accept`。
    - **共享机资源铁律**：项目的验收和构建脚本（如 `ci/stage.sh`）取 CPU 和内存时，必须用槽位注入的 `$CF_CPUS`、`$CF_THREADS`、`$CF_CORES`（物理核数）、`$CF_MEM_GB`，或读进程自己的 `os.sched_getaffinity(0)` 与当前 cgroup 路径上最小的 `memory.max`；**严禁读整机的 `/proc/meminfo`（`MemTotal`）或全局 `/sys/fs/cgroup/cpuset.cpus.effective`**（在裸槽位上那会读出整机几百 GB 内存和全部核，导致任务越界或被 cgroup OOM 杀死）。
@@ -48,6 +48,8 @@ curryFlow 是多机开发、机器池调度和 curryPlan 文档的统一入口�
    - 从 `templates/project/AGENTS.md` 和 `templates/project/gitignore` 生成 `AGENTS.md`、`.gitignore`
    - 建 `docs/pages.json`、设计文档 `docs/<模块>/index.html` 和待办 `docs/<模块>/todo.html`（格式见 `curryplan.md`），把 `tools/publish-docs --check` 放进 `style` 验收阶段。
 5. **建项目中枢。** 主中枢 `ci` 用户下建 `<项目>.git` bare 仓库，装 `templates/hub/post-receive` 镜像到备用中枢，推 `main`。
+   备用中枢上的同名仓库装 `templates/hub/pre-receive`：只收主中枢的镜像推送，别的推送拒掉并打印主中枢的地址
+   （否则直接推到备用中枢的分支会被下一次镜像删掉）。两个钩子要设的 `git config` 写在各自的文件头里。
 6. **开 curryPlan 自动同步。** 按 `curryplan.md` 注册项目；在 curryPlan 机上建项目的稀疏 clone（只检出 `docs/` 和 `tools/publish-docs`），cron 每分钟拉中枢 `main` 跑 `tools/publish-docs`。
 
 ## 协调：怎么分活与跑完一个任务
@@ -135,7 +137,7 @@ curryFlow 是多机开发、机器池调度和 curryPlan 文档的统一入口�
 中枢上的 `machines.git` 放机器池的全部东西，每台机器 clone 到 `~/curryflow/machines`：
 
 - `machines.json`：每台机器的槽位（钉的核、内存、容器名、有没有 NV 显卡 `gpu`）、要报告的挂载点、`executor: true`、依赖缓存
-  `deps_cache`、给作业加的环境变量 `env`；国内机器写 `hub_proxy`（和 `host`）。`projects` 是项目名到中枢地址的表：`seed` 是
+  `deps_cache`、给作业加的环境变量 `env`；直连中枢不稳的机器写 `hub_proxy`（和 `host`）。`projects` 是项目名到中枢地址的表：`seed` 是
   每台机器上已有的 clone（镜像从它建），`seed_only` 表示不许从中枢全量取（中枢小，大仓库都要写）；`home` 是每台机器上给人
   看的主目录（`{"<机器>": "~/code/<项目>"}`），beat 让它的 main 跟着中枢的 main。
 - `beat`、`status`、`executor`、`flow`、`mac-agents` 从 `templates/pool/` 拷来。
