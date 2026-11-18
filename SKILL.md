@@ -175,6 +175,19 @@ curryFlow 是多机开发、机器池调度和 curryPlan 文档的统一入口�
 - 机器上的布局：`~/curryflow/mirror/<项目>.git` 每个项目一份 bare 镜像，只对中枢增量取；槽位目录是 `~/<容器名>`（有容器，
   容器里同路径）或 `~/curryflow/slots/<槽位>`，里面 `<项目>/` 是工作树，`.cf/<id>/` 是作业目录（`log` 是完整日志）；
   executor 自己的日志和状态在 `~/curryflow/exec/<机器>/`。
+- 每台机器上的数据只分四类，各放一处，不许混放：
+
+  | 类别 | 位置 | 对容器 | 规矩 |
+  |---|---|---|---|
+  | 代码 | `~/code/<项目>`（git 仓库） | 只读挂载 | 只放源码和输入数据，构建输出不写在这里 |
+  | 调度 | `~/curryflow`，只许 `machines`、`mirror`、`exec`、`slots` 四个目录 | 不挂载 | 不放任何别的东西，不放大文件 |
+  | 依赖 | `~/deps`：`cache`（`deps_cache`，即 `$CF_DEPS_CACHE`）和 `tools`（第三方工具） | 只读挂载 | 宿主机上可写；只留各项目 main 的 `deps.json` 引用的条目，下载包装完即删 |
+  | 产物 | 槽位目录 | 唯一可写 | 每个槽位目录不超过 50 GiB（见上面 `.build/` 清理第 3 条） |
+
+  各机器的登录 shell 设 `export CF_DEPS_CACHE=$HOME/deps/cache`，手工跑 provision 也用同一份缓存。
+- curryFlow 本身也是机器池里的项目（`projects.curryFlow`，中枢 `curryFlow.git`），每台机器的 `home` 是 `~/code/curryFlow`，
+  `~/.claude/skills/curryflow` 链接到它；beat 把它快进到中枢 main，机器页上能看到哪台没跟上。改 curryFlow：提交推中枢
+  main 再推 GitHub main，`templates/pool/` 里的脚本同时拷进 `machines.git`（提交说明写 curryFlow 的提交号），两边始终是同一版。
 - curryPlan 机 clone 到 `~/curryflow/machines-status`，cron 每分钟取心跳、队列和结论，`python3 status --history hist.json`
   写出 `/var/www/plan/curryplan/machines/status.json`；页面是 `templates/curryplan/machines/index.html`：槽位表的"作业"列、
   "排队"和"最近完成"两张表。重发这个页面只 scp `index.html` 和 `meta.json`（`bin/planpub` 会清掉目录里的 `status.json`）。
@@ -193,8 +206,10 @@ curryFlow 是多机开发、机器池调度和 curryPlan 文档的统一入口�
   机器标 `"named_only": true`：只接点名给它的请求（`--machine <名>`），因为项目的 Linux 工具链在上面跑不了；不点名的作业和
   占用不会落到它上面。连中枢要走代理的写 `hub_proxy`，作业的 `PATH`、`LANG` 写在 `env` 里（默认的是 Linux 的）。
 
-通用容器（incus 机器）：同一个镜像（基础系统加构建用的包），钉在一个槽位的核上，依赖缓存只读挂入，工作目录是宿主机
-`~/<容器名>` 同路径挂入（`shift=true`，容器里的 uid 和宿主机一一对应）；会变的工具（仿真器）走依赖缓存，不进镜像。
+通用容器（incus 机器）：只负责隔离（运行时环境、钉核与内存上限、文件可见范围），自己不存数据。同一个镜像（基础系统加
+构建用的包，见 `machines.git` 的 `pool-container/`），钉在一个槽位的核上，`~/deps/cache` 同路径只读挂入，`~/deps/tools`
+只读挂到 `/opt/tools`，工作目录是宿主机 `~/<容器名>` 同路径挂入（`shift=true`，容器里的 uid 和宿主机一一对应）；会变的工具
+（仿真器）走依赖缓存，不进镜像；自研工具由作业从 GitHub 取源码在槽位里构建。
 
 ## curryPlan
 
