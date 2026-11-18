@@ -5,4 +5,4 @@
 - 用例来自真实 bug：修一个 bug，就在 <用例目录> 加一个能复现它的用例，写清 why。
 - `docs/` 下的 HTML 就是 curryPlan 上的页面（`docs/pages.json` 列出每份对应哪一页；`docs/*/index.html` 是设计文档，`docs/*/todo.html` 是待办），改文档、改待办都改这份 HTML：合进 `main` 后 curryPlan 机上的 `tools/publish-docs` 自动发布，`style` 阶段用 `tools/publish-docs --check` 检查。
 - 不能改的：<列出，例如"ORT 是用户侧，不改">；错误显式报出，不静默替代。
-- 分支与发布：agent 在 `wip/<id>` 上干活、推中枢；`main` 只由协调器在验收全绿后推，推完中枢 `main` 接着推 GitHub `main`；发布件不跟提交走：版本是仓库根的 `VERSION`（`X.Y.Z`），要发版时在全部验收阶段通过的 `main` 提交上把它升上去，`make release` 传到 GitHub 的 `v<版本>`；各机器上的主目录由机器池的 beat 快进到最新 `main`，不用手工同步。
+- 分支与发布：agent 在 `wip/<id>` 上干活；`main` 只由协调器在验收全绿后推到 GitHub；发布件不跟提交走：版本是仓库根的 `VERSION`（`X.Y.Z`），要发版时在全部验收阶段通过的 `main` 提交上把它升上去，`make release` 传到 GitHub 的 `v<版本>`；各机器上的主目录由机器池的 beat 快进到最新 `main`，不用手工同步。

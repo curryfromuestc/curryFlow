@@ -9,7 +9,7 @@
       the last commit of the page at REV. A page whose files and meta.json are already there is left alone;
       otherwise each file is written to a temporary name and renamed, meta.json last, files that are no longer the
       page's are removed, and ROOT/gen_catalog.py rewrites the home page's catalog (unless --no-catalog). Run from a
-      clone of the repository (curryPlan's cron: a sparse clone of docs/ and this file, on the hub's main).
+      clone of the repository (curryPlan's cron: a sparse clone of docs/ and this file, on GitHub's main).
   tools/publish-docs --check
       Checks the work tree's pages (ci/stage.sh style): every docs/**/*.html is in docs/pages.json and every source
       there exists; each page parses (every element closed in order), has its title and cp-* metas with <title> =

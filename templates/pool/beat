@@ -1,35 +1,35 @@
 #!/usr/bin/env python3
-"""One heartbeat of this machine, pushed to the hub as refs/hb/<machine> (a JSON blob), or --probe to inspect a host.
+"""One heartbeat of this machine, written to the curryPlan machine (machines.json "page": <user@host>, as
+~/curryflow/hb/<machine>.json there, over ssh), or --probe to inspect a host.
 
 usage: beat --machine NAME [--print]
        beat --probe
 
-Run every minute by cron from a clone of the pool repository. machines.json names the machine's slots and the
-mounts to report; everything else is read from the machine: busy threads per NUMA node and per slot, memory,
-disks, GPUs, incus containers, who uses the CPUs, and from the machine's executor (its state.json): the job or
-hold in each slot, whether the executor would schedule the slot, and the ids of every request the executor holds
-(flow and the other executors take a run as alive while its machine's heartbeat moves and lists it). Every ten minutes
-it pulls the clone; the heartbeat carries the clone's commit and how the last pull went (pull: ok, error, at).
+Run every minute (cron on Linux, a launchd daemon on macOS) from a clone of the pool repository. machines.json names
+the machine's slots and the mounts to report; everything else is read from the machine: busy threads per NUMA node
+and per slot, memory, swapping, disks, GPUs, incus containers, who uses the CPUs, and the job in each slot (its run
+directory, see executor).
 
-Every ten minutes it also brings this machine's main directory of each project (machines.json:
-projects.<project>.home.<machine>, the clone people read, e.g. ~/code/<project>) to the main of the project's hub. It
-fetches that branch as refs/remotes/hub/main and fast-forwards the local main: with the work tree when main is checked
-out there (git refuses when a local change is in the way), the branch alone otherwise. It never switches the branch,
-merges or rewinds: a main with commits of its own stays as it is. The heartbeat says what it found (homes: branch,
-main, behind, ahead, at, error), so a directory that falls behind shows on the machines page. Submodules are not
-updated.
+Alerts: a container whose memory is above 90% of its limit, a machine with less than 5% of its memory available, a
+machine that swaps more than SWAP_RATE bytes a second over the last minute. They go into the heartbeat (the machines
+page shows them) and into ~/curryflow/exec/<machine>/alerts.json, which `executor wait` prints to whoever waits for a
+job of this machine; an alert keeps the time it was first seen while it lasts.
 
-Before its first git call it removes the zero-length loose objects of the clone (.git/objects/xx/<38 hex>): what an
-unclean shutdown leaves of the object written last, usually a heartbeat blob, and what every push and fetch of beat
-and of the executor then fails on (111, 2026-11-14: a day without heartbeats or jobs). A finished loose object is
-never empty; a writer's tmp_obj_* file may be and is left alone.
+Every ten minutes it pulls the clone; the heartbeat carries the clone's commit and how the last pull went (pull: ok,
+error, at). Every ten minutes it also brings this machine's main directory of each project (machines.json:
+projects.<project>.home.<machine>, the clone people read, e.g. ~/code/<project>) to the main of the project's GitHub
+repository ("repo"). It fetches that branch as refs/remotes/origin/main and fast-forwards the local main: with the work
+tree when main is checked out there (git refuses when a local change is in the way), the branch alone otherwise. It
+never switches the branch, merges or rewinds: a main with commits of its own stays as it is. The heartbeat says what
+it found (homes: branch, main, behind, ahead, at, error), so a directory that falls behind shows on the machines page.
+Submodules are not updated.
 With --probe (e.g. `ssh <host> python3 - --probe < beat`), prints the host's NUMA/L3 topology, memory, GPUs, disks,
 container backend and suggested slot CPU ranges as JSON without reading machines.json.
 
-macOS (DARWIN) has no /proc and pins no thread: CPU times come from Mach, memory from sysctl and vm_stat, and the
-machine is one node. A slot there has no CPUs of its own (its `cpus` only count its threads), so its busy threads are
-the machine's: what its load takes of the slot's share once the CPUs outside the slot are full, or the whole load up
-to the slot's size while the slot runs a job; its top processes are the machine's.
+macOS (DARWIN) has no /proc and pins no thread: CPU times come from Mach, memory and swapping from sysctl and vm_stat,
+and the machine is one node. A slot there has no CPUs of its own (its `cpus` only count its threads), so its busy
+threads are the machine's: what its load takes of the slot's share once the CPUs outside the slot are full, or the
+whole load up to the slot's size while the slot runs a job; its top processes are the machine's.
 """
 import argparse
 import collections
@@ -45,6 +45,9 @@ import time
 ROOT = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
 PULLED = os.path.join(ROOT, ".git", "cf-pull.json")
 HOMES = os.path.join(ROOT, ".git", "cf-homes.json")
+SWAPPED = os.path.join(ROOT, ".git", "cf-swap.json")
+SWAP_RATE = 4 << 20      # bytes a second swapped in and out, over the last minute, that make an alert
+MEM_USED, MEM_AVAIL = 0.90, 0.05
 PULL = 600
 BUDGET = 50              # seconds a run may take (cron ends it after 55): what is left bounds a main directory's fetch
 HOME_FETCH = 30
@@ -239,8 +242,8 @@ CONTAINER_OWNER = {}
 
 
 def owner_of(pid, uid):
-    """A host user by name; a process in a container by who holds that container's slot (the job's or the hold's
-    requester, from the executor), else "容器 <name>"."""
+    """A host user by name; a process in a container by who runs the job in that container's slot, else
+    "容器 <name>"."""
     try:
         return pwd.getpwuid(uid).pw_name
     except KeyError:
@@ -253,26 +256,89 @@ def owner_of(pid, uid):
     return CONTAINER_OWNER.get(c) or f"容器 {c}"
 
 
-def executor_state(name):
-    """What the machine's executor last wrote (every few seconds while it runs); None when it is not running."""
+def load_json(path):
     try:
-        st = json.load(open(os.path.expanduser(f"~/curryflow/exec/{name}/state.json")))
+        with open(path) as f:
+            return json.load(f)
     except (OSError, ValueError):
         return None
-    return st if time.time() - st.get("at", 0) < 120 else None
+
+
+def slot_job(name, conf):
+    """The job that has the slot (its busy file, see executor), as the page shows it; None when the slot is free."""
+    d = os.path.expanduser(conf.get("dir") or (f"~/{conf['container']}" if conf.get("container")
+                                                else f"~/curryflow/slots/{name}"))
+    try:
+        rid = open(os.path.join(d, ".cf", "busy")).read().strip()
+    except OSError:
+        return None
+    job = load_json(os.path.join(d, ".cf", rid, "job.json")) or {}
+    if not job or os.path.exists(os.path.join(d, ".cf", rid, "exit.json")):
+        return None
+    req = job.get("req", {})
+    return {"id": rid, "who": req.get("who"), "project": req.get("project"), "commit": (req.get("commit") or "")[:12],
+            "cmd": req.get("cmd"), "start": job.get("start")}
+
+
+def mem_bytes(text):
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([KMGT]?)(?:i?B)?\s*", str(text or ""), re.I)
+    return int(float(m.group(1)) * 1024 ** " KMGT".index(m.group(2).upper() or " ")) if m else 0
+
+
+def swapped():
+    """Bytes swapped in and out so far."""
+    if DARWIN:
+        text = run(["vm_stat"])
+        page = int((re.search(r"page size of (\d+) bytes", text) or [0, 16384])[1])
+        return page * sum(int(m.group(1)) for k in ("Swapins", "Swapouts") for m in [re.search(rf"{k}:\s+(\d+)", text)] if m)
+    n = 0
+    for line in open("/proc/vmstat"):
+        k, v = line.split()
+        if k in ("pswpin", "pswpout"):
+            n += int(v)
+    return n * 4096
+
+
+def swap_rate():
+    """Bytes a second swapped in and out since the last run (None on the first)."""
+    now, last = {"t": time.time(), "n": swapped()}, load(SWAPPED)
+    keep(SWAPPED, now)
+    if not last or now["n"] < last.get("n", 0) or now["t"] - last.get("t", 0) > 600:
+        return None
+    return (now["n"] - last["n"]) / max(1, now["t"] - last["t"])
+
+
+def alerts(name, mem, boxes, rate):
+    found = []
+    for c in boxes or []:
+        limit = mem_bytes(c.get("mem_limit"))
+        if limit and (c.get("mem_used") or 0) > MEM_USED * limit:
+            found.append({"what": f"内存 {c['name']}", "text": f"容器 {c['name']} 用了 {c['mem_used'] / 2 ** 30:.1f} GiB，"
+                          f"上限 {limit / 2 ** 30:.0f} GiB"})
+    if mem["total"] and mem["avail"] < MEM_AVAIL * mem["total"]:
+        found.append({"what": "内存", "text": f"可用 {mem['avail'] / 2 ** 30:.1f} GiB，共 {mem['total'] / 2 ** 30:.0f} GiB"})
+    if rate is not None and rate > SWAP_RATE:
+        found.append({"what": "换页", "text": f"最近一分钟每秒换入换出 {rate / 2 ** 20:.0f} MiB"})
+    path = os.path.join(os.path.expanduser("~/curryflow/exec"), name, "alerts.json")
+    since = {a["what"]: a.get("since") for a in (load_json(path) or {}).get("alerts") or []}
+    at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    for a in found:
+        a["since"] = since.get(a["what"]) or at
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    keep(path, {"at": at, "alerts": found})
+    return found
 
 
 def collect(name, conf):
-    ex = executor_state(name)
+    jobs = {sname: j for sname, d in conf.get("slots", {}).items() for j in [slot_job(sname, d)] if j}
     CONTAINER_OWNER.clear()
-    for sname, e in ((ex or {}).get("slots") or {}).items():
-        c, job = (conf.get("slots", {}).get(sname) or {}).get("container"), e.get("job") or {}
+    for sname, job in jobs.items():
+        c = conf["slots"][sname].get("container")
         if c and job.get("who"):
             CONTAINER_OWNER[c] = f"{job['who'].split(':')[0]}（{c}）"
     busy = busy_per_cpu()
     procs = processes()
     total = lambda spec: round(sum(busy.get(c, 0) for c in cpu_list(spec)), 1)
-    jobs = {sname for sname, e in ((ex or {}).get("slots") or {}).items() if e.get("job")}
 
     def slot_busy(sname, spec):
         if not DARWIN:
@@ -290,6 +356,7 @@ def collect(name, conf):
     users = collections.Counter()
     for psr, load, uid, comm in procs:
         users[uid] += load
+    mem, boxes, rate = memory(), containers(), swap_rate()
     if DARWIN:               # for the page: this machine's slots are shares, not CPUs
         conf = {**conf, "slots": {s: {**d, "note": d.get("note") or "macOS：不钉核，槽位是线程数配额"}
                                   for s, d in conf.get("slots", {}).items()}}
@@ -297,20 +364,17 @@ def collect(name, conf):
         "machine": name, "host": os.uname().nodename, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "threads": len(busy), "busy": round(sum(busy.values()), 1), "load": os.getloadavg()[0],
         "nodes": [{"id": i, "cpus": spec, "threads": len(cpu_list(spec)), "busy": total(spec)} for i, spec in numa_nodes()],
-        "mem": memory(), "disks": disks(conf.get("disks", ["/"])), "gpus": gpus(), "containers": containers(),
+        "mem": mem, "disks": disks(conf.get("disks", ["/"])), "gpus": gpus(), "containers": boxes,
         "slots": [{"name": s, "cpus": d["cpus"], "threads": len(cpu_list(d["cpus"])), "busy": slot_busy(s, d["cpus"]),
                    "top": top(d["cpus"]), **{k: d[k] for k in ("mem", "container", "note") if k in d}}
                   for s, d in conf.get("slots", {}).items()],
         "users": [{"user": u, "threads": round(v, 1)} for u, v in users.most_common(6) if v >= 0.5],
-        "executor": ex and {k: ex.get(k) for k in ("at", "poll", "queued", "memcap", "jobs")},
-        "pull": pulled(),
+        "pull": pulled(), "swap_rate": rate,
     }
+    beat["alerts"] = alerts(name, mem, boxes, rate)
     for s in beat["slots"]:
-        e = ((ex or {}).get("slots") or {}).get(s["name"])
-        if e:
-            s["sched"] = e.get("state")
-            if e.get("job"):
-                s["job"] = e["job"]
+        if s["name"] in jobs:
+            s["job"] = jobs[s["name"]]
     for c in beat["containers"] or []:
         if c.get("cpus") and c.get("state") == "Running":
             c["busy"] = total(c["cpus"])
@@ -414,22 +478,6 @@ def pull(proxy):
         keep(PULLED, {"tried": time.time(), "at": last.get("at"), "ok": False, "error": str(e)[-300:]})
 
 
-def drop_empty_objects():
-    """Remove the zero-length loose objects of the clone (see the header); a file that cannot be removed stays."""
-    base = os.path.join(ROOT, ".git", "objects")
-    try:
-        fans = [d.path for d in os.scandir(base) if re.fullmatch(r"[0-9a-f]{2}", d.name)]
-    except OSError:
-        return
-    for fan in fans:
-        try:
-            for f in os.scandir(fan):
-                if re.fullmatch(r"[0-9a-f]{38}", f.name) and f.is_file(follow_symlinks=False) and not f.stat().st_size:
-                    os.unlink(f.path)
-        except OSError:
-            pass
-
-
 def home_paths(projects, machine):
     return {p: d["home"][machine] for p, d in projects.items()
             if isinstance(d, dict) and isinstance(d.get("home"), dict) and machine in d["home"]}
@@ -443,7 +491,7 @@ def homes(projects, machine):
 
 
 def sync_homes(projects, machine, proxy):
-    """Every PULL seconds, each main directory of this machine at its hub's main (sync_home); one that this run has
+    """Every PULL seconds, each main directory of this machine at its GitHub main (sync_home); one that this run has
     no time left for waits for the next run."""
     state = load(HOMES)
     for p, path in home_paths(projects, machine).items():
@@ -454,17 +502,17 @@ def sync_homes(projects, machine, proxy):
         state[p] = {**last, "tried": time.time()}
         keep(HOMES, state)
         try:
-            found = sync_home(os.path.expanduser(path), projects[p]["hub"], proxy, min(HOME_FETCH, left - 5))
+            found = sync_home(os.path.expanduser(path), projects[p]["repo"], proxy, min(HOME_FETCH, left - 5))
             state[p] = {"tried": time.time(), "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), **found}
         except (SystemExit, subprocess.TimeoutExpired, OSError) as e:
             state[p] = {**last, "tried": time.time(), "error": str(e)[-300:]}
         keep(HOMES, state)
 
 
-def sync_home(path, hub, proxy, timeout):
-    """Fetch the hub's main into the clone at `path` and fast-forward its main to it; what the clone is at then."""
+def sync_home(path, repo, proxy, timeout):
+    """Fetch GitHub's main into the clone at `path` and fast-forward its main to it; what the clone is at then."""
     g = lambda *args, **kw: git(*args, cwd=path, **kw)
-    g("fetch", "-q", "--no-tags", "--no-recurse-submodules", hub, "+refs/heads/main:refs/remotes/hub/main", proxy=proxy,
+    g("fetch", "-q", "--no-tags", "--no-recurse-submodules", repo, "+refs/heads/main:refs/remotes/origin/main", proxy=proxy,
       timeout=timeout)
     branch = g("rev-parse", "--abbrev-ref", "HEAD")           # HEAD when no branch is checked out
 
@@ -472,16 +520,16 @@ def sync_home(path, hub, proxy, timeout):
         main = g("for-each-ref", "--format=%(objectname)", "refs/heads/main")
         if not main:
             return {"branch": branch, "main": None, "error": "the clone has no branch main"}
-        ahead, behind = g("rev-list", "--left-right", "--count", "refs/heads/main...refs/remotes/hub/main").split()
+        ahead, behind = g("rev-list", "--left-right", "--count", "refs/heads/main...refs/remotes/origin/main").split()
         return {"branch": branch, "main": main[:12], "behind": int(behind), "ahead": int(ahead)}
 
     found = state()
     if found.get("behind") and not found["ahead"]:
         try:
             if branch == "main":       # in a session of its own: the work tree's update is not cut short with this run
-                g("merge", "-q", "--ff-only", "refs/remotes/hub/main", timeout=120, detach=True)
+                g("merge", "-q", "--ff-only", "refs/remotes/origin/main", timeout=120, detach=True)
             else:
-                g("fetch", "-q", ".", "refs/remotes/hub/main:refs/heads/main")
+                g("fetch", "-q", ".", "refs/remotes/origin/main:refs/heads/main")
             found = state()
         except (SystemExit, subprocess.TimeoutExpired) as e:
             found["error"] = str(e)[-300:]
@@ -516,7 +564,6 @@ def main():
     conf, projects = pool["machines"].get(a.machine), pool.get("projects") or {}
     if conf is None:
         raise SystemExit(f"machines.json has no machine {a.machine}")
-    drop_empty_objects()
     beat = collect(a.machine, conf)
     if home_paths(projects, a.machine):
         beat["homes"] = homes(projects, a.machine)
@@ -524,13 +571,15 @@ def main():
     if a.print:
         print(json.dumps(beat, ensure_ascii=False, indent=1))
         return
-    proxy = conf.get("hub_proxy")
-    blob = git("hash-object", "-w", "--stdin", input=text)
-    git("push", "-q", "-f", "origin", f"{blob}:refs/hb/{a.machine}", proxy=proxy)
+    proxy = conf.get("proxy")
+    target = f"curryflow/hb/{a.machine}.json"
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", pool["page"],
+                        f"mkdir -p curryflow/hb && cat > {target}.tmp && mv {target}.tmp {target}"],
+                       input=text, capture_output=True, text=True, timeout=30)
+    if r.returncode:
+        print(f"beat: heartbeat not written to {pool['page']}: {r.stderr.strip()[-300:]}", file=sys.stderr)
     pull(proxy)
     sync_homes(projects, a.machine, proxy)
-    if time.localtime().tm_min == 7:
-        git("gc", "-q", "--prune=10.minutes.ago")      # not now: executor and flow push blobs they have just written
 
 
 if __name__ == "__main__":

@@ -37,11 +37,8 @@ svg.sp line { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-s
   <div class="top"><h1>机器</h1><span class="sub" id="sub">读取中…</span><span class="dl" id="at"></span></div>
 </header>
 <p class="oneline" id="line" data-c="say"></p>
-<section class="sec" data-c="jobs"><h2>作业 <small id="jobs-sub"></small></h2>
-  <div class="wall">
-    <div class="card wide scroll" data-c="queue"><h3>排队</h3><div id="queue"></div></div>
-    <div class="card wide scroll" data-c="done"><h3>最近完成</h3><div id="done"></div></div>
-  </div>
+<section class="sec" data-c="alerts"><h2>告警 <small id="alerts-sub"></small></h2>
+  <div class="wall"><div class="card wide scroll" data-c="alert-list"><div id="alerts"></div></div></div>
 </section>
 <div id="machines"></div>
 </div>
@@ -59,35 +56,17 @@ svg.sp line { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-s
   const who = (top) => (top || []).map((p) => `${esc(p.user)} <span class="dim mono">${esc(p.cmd)} ×${p.threads}</span>`).join("<br>") || '<span class="dim">-</span>';
   const FREE = 0.1;
   const span = (s) => { s = Math.max(0, Math.round(s)); return s < 120 ? s + " 秒" : s < 7200 ? Math.round(s / 60) + " 分" : (s / 3600).toFixed(1) + " 小时"; };
-  const clock = (t) => { const d = new Date(t * 1000), p = (n) => String(n).padStart(2, "0"); return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`; };
   const cmd = (j) => `<span class="mono cut" title="${esc(j.cmd)}">${esc(j.cmd)}</span>`;
-  const needs = (n) => Object.entries(n || {}).map(([k, v]) => v === true ? k : `${k}=${v}`).join(" ") || "-";
-  // The verdict of a conclusion: exit code 0 passes and 77 skips (the ci/accept convention), anything else failed.
-  function verdict(d) {
-    const r = d.reason, c = d.code;
-    return r === "exit" ? (c === 0 ? ["free", "通过"] : c === 77 ? ["", "跳过"] : ["off", "失败 " + c]) :
-      r === "timeout" ? ["off", "超时"] : r === "cancelled" ? ["", "取消"] : r === "error" ? ["off", "没跑起来"] :
-      r === "lost" ? ["off", "丢了"] : ["", "占用结束"];
-  }
-  // What the pool's executor has in a slot: the run record of the hub, else what the machine's heartbeat carries.
-  // The heartbeat is up to a minute older than the hub's records, so a job it still shows may have ended already.
-  let running = [], ended = new Set();
-  const jobOf = (m, s) => running.find((r) => r.machine === m && r.slot === s.name) || (s.job && !ended.has(s.job.id) ? s.job : null);
+  // The job in a slot, as the machine's heartbeat carries it (the slot's busy file).
   function jobCell(j) {
     if (!j) return '<span class="dim">-</span>';
     const now = Date.now() / 1000;
-    if (j.kind === "hold") return `占用到 <span class="mono">${clock(j.until)}</span><br><span class="dim">${esc(j.who)}</span>`;
-    return `<b>${esc(j.project)}</b> ${cmd(j)}<br><span class="dim">${esc(j.who)} · 已跑 ${span(now - j.start)}</span>`;
+    return `<b>${esc(j.project)}</b> ${cmd(j)}<br><span class="dim mono">${esc(j.id)}</span> <span class="dim">${esc(j.who)} · 已跑 ${span(now - j.start)}</span>`;
   }
-  // A slot's state: the executor's own job or hold first, then whether it would schedule the slot (busy share
-  // under 20%); a machine without an executor falls back to the measured load.
-  function slotState(m, s, box) {
-    const j = jobOf(m, s);
+  function slotState(s, box) {
     if (s.container && !box) return ["off", "没有容器"];
     if (box && box.state !== "Running") return ["off", "容器已停"];
-    if (j) return ["busy", j.kind === "hold" ? "占用" : "作业"];
-    if (s.sched) return { free: ["free", "空闲"], foreign: ["busy", "在用"], warming: ["", "测量中"], claiming: ["busy", "认领中"],
-      job: ["busy", "认领中"], hold: ["busy", "认领中"], off: ["off", "没有容器"] }[s.sched] || ["", s.sched];
+    if (s.job) return ["busy", "作业"];
     return s.busy / s.threads > FREE ? ["busy", "在用"] : ["free", "空闲"];
   }
   function spark(points, of) {
@@ -103,9 +82,9 @@ svg.sp line { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-s
     const stale = secs(b.at) > 200;
     const slots = (b.slots || []).map((s) => {
       const box = s.container && (b.containers || []).find((x) => x.name === s.container);
-      const state = slotState(m.name, s, box);
+      const state = slotState(s, box);
       return row([`<b>${esc(s.name)}</b>${s.note ? ` <span class="dim">${esc(s.note)}</span>` : ""}`, `<span class="v ${state[0]}">${state[1]}</span>`,
-        jobCell(jobOf(m.name, s)), `<span class="mono">${esc(s.cpus)}</span>`, `${bar(s.busy, s.threads)}<span class="mono">${s.busy} / ${s.threads}</span>`,
+        jobCell(s.job), `<span class="mono">${esc(s.cpus)}</span>`, `${bar(s.busy, s.threads)}<span class="mono">${s.busy} / ${s.threads}</span>`,
         box ? `<span class="mono">${gb(box.mem_used)} / ${esc(s.mem || box.mem_limit || "-")}</span>` : `<span class="mono dim">${esc(s.mem || "-")}</span>`, who(s.top)]);
     }).join("");
     const pool = new Set((b.slots || []).map((s) => s.container).filter(Boolean));
@@ -120,12 +99,12 @@ svg.sp line { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-s
       row([`<span class="mono">${esc(d.mount)}</span>`, `${bar(d.total - d.free, d.total)}<span class="mono">${(100 * (d.total - d.free) / d.total).toFixed(0)}%</span>`, `<span class="mono">剩 ${gb(d.free)} / ${gb(d.total)}</span>`])).join("");
     const users = (b.users || []).map((u) => `${esc(u.user)} <span class="mono dim">×${u.threads}</span>`).join(" · ");
     const used = b.mem.total - b.mem.avail;
-    const ex = !c.executor ? "" : b.executor ? " · executor 在跑" : ' · <span class="stale">executor 没在跑</span>';
+    const al = (b.alerts || []).length ? ` · <span class="stale">告警 ${b.alerts.length}</span>` : "";
     const p = b.pull || {};
     const pull = (p.head ? ` · 版本 <span class="mono">${esc(p.head.slice(0, 9))}</span>` : "") + (p.ok === false
       ? ` · <span class="stale" title="${esc(p.error || "")}">git pull 失败（上次成功 ${ago(p.at)}）：${esc((p.error || "").slice(-120))}</span>`
       : p.at && secs(p.at) > 3600 ? ` · <span class="stale">${ago(p.at)}拉过</span>` : "");
-    // The main directory of each project on this machine (beat keeps its main at the hub's): red when it is behind,
+    // The main directory of each project on this machine (beat keeps its main at GitHub's): red when it is behind,
     // was not looked at for an hour, or the last look failed.
     const homes = (b.homes || []).map((h) => {
       const late = !h.at || secs(h.at) > 3600, bad = h.error || h.behind > 0 || h.main == null || late;
@@ -133,12 +112,12 @@ svg.sp line { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-s
         h.ahead > 0 ? `超前 ${h.ahead}` : "", h.error ? "同步失败" : late ? (h.at ? `${ago(h.at)}看过` : "没看过") : ""].filter(Boolean).join("，");
       return ` · <span class="${bad ? "stale" : ""}" title="${esc(h.path + (h.error ? "：" + h.error : ""))}">${esc(h.project)} main <span class="mono">${esc((h.main || "-").slice(0, 9))}</span>${notes ? `（${notes}）` : ""}</span>`;
     }).join("");
-    return `<section class="sec" data-c="m-${esc(m.name)}"><h2>${esc(m.name)} <small>${c.shared ? "共享机" : "独占机"} · ${b.threads} 线程 · 心跳 <span class="${stale ? "stale" : ""}">${ago(b.at)}</span>${ex}${pull}${homes}</small></h2>
+    return `<section class="sec" data-c="m-${esc(m.name)}"><h2>${esc(m.name)} <small>${c.shared ? "共享机" : "独占机"} · ${b.threads} 线程 · 心跳 <span class="${stale ? "stale" : ""}">${ago(b.at)}</span>${al}${pull}${homes}</small></h2>
       <div class="wall">
         <div class="card" data-c="m-${esc(m.name)}-load"><div class="nums">
           <div><b>${b.busy.toFixed(0)}<span class="dim" style="font-size:13px"> / ${b.threads}</span></b><span>忙线程</span></div>
           <div><b>${gb(used)}<span class="dim" style="font-size:13px"> / ${gb(b.mem.total)}</span></b><span>内存</span></div>
-          <div><b>${b.load.toFixed(0)}</b><span>负载</span></div></div>
+          <div><b>${b.swap_rate == null ? "-" : (b.swap_rate / 2 ** 20).toFixed(1)}</b><span>换页 MiB/s</span></div></div>
           ${spark(m.history, b.threads)}
           <p class="say" style="margin-top:8px">${users || "没有占 CPU 的用户"}</p></div>
         <div class="card scroll" data-c="m-${esc(m.name)}-nodes"><table class="t">${head(["NUMA", "核", "忙"])}${nodes}</table></div>
@@ -148,36 +127,29 @@ svg.sp line { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-s
         <div class="card scroll" data-c="m-${esc(m.name)}-disks"><h3>磁盘</h3><table class="t">${head(["挂载点", "已用", "容量"])}${disks}</table></div>
       </div></section>`;
   }
-  function jobs(s) {
-    const now = Date.now() / 1000, q = s.queue || [], d = s.done || [];
-    $("jobs-sub").textContent = `排队 ${q.length} · 在跑 ${running.length} · flow run 提交，flow hold 占用`;
-    $("queue").innerHTML = !q.length ? '<p class="say">没有排队的请求</p>' : `<table class="t">${head(["请求", "优先级", "谁", "项目", "命令", "需求", "等了"])}${q.map((r) =>
-      row([`<span class="mono">${esc(r.id)}</span>`, esc(r.prio), esc(r.who), esc(r.project || "-"), cmd(r), `<span class="mono">${esc(needs(r.need))}</span>`, span(now - r.submitted)])).join("")}</table>`;
-    $("done").innerHTML = !d.length ? '<p class="say">还没有结论</p>' : `<table class="t">${head(["结束", "结论", "项目", "命令", "谁", "机器 / 槽位", "用时", "最后一行"])}${d.map((x) => {
-      const v = verdict(x);
-      return row([`<span class="mono">${clock(x.end)}</span>`, `<span class="v ${v[0]}">${v[1]}</span>`, esc(x.project || "-"), cmd(x), esc(x.who),
-        x.machine ? `${esc(x.machine)} / ${esc(x.slot)}` : '<span class="dim">-</span>', span(x.secs || 0), `<span class="mono dim cut" title="${esc(x.last)}">${esc(x.last)}</span>`]);
-    }).join("")}</table>`;
+  function alerts(ms) {
+    const all = ms.flatMap((m) => m.beat && secs(m.beat.at) <= 200 ? (m.beat.alerts || []).map((a) => ({ ...a, machine: m.name })) : []);
+    $("alerts-sub").textContent = all.length ? `${all.length} 条` : "";
+    $("alerts").innerHTML = !all.length ? '<p class="say">没有告警（容器内存超过上限 90%、机器可用内存不到 5%、每秒换页超过 4 MiB 时出现）</p>' :
+      `<table class="t">${head(["机器", "什么", "情况", "从"])}${all.map((a) => row([esc(a.machine), `<span class="v off">${esc(a.what)}</span>`, esc(a.text), ago(a.since)])).join("")}</table>`;
   }
   function render(s) {
     const ms = s.machines, live = ms.filter((m) => m.beat && secs(m.beat.at) <= 200);
-    running = s.running || [];
-    ended = new Set((s.done || []).map((d) => d.id));
     let free = 0, total = 0;
     ms.forEach((m) => (m.beat ? m.beat.slots : []).forEach((x) => {
       total++;
       const box = x.container && (m.beat.containers || []).find((y) => y.name === x.container);
-      if (slotState(m.name, x, box)[1] === "空闲" && secs(m.beat.at) <= 200) free++;
+      if (slotState(x, box)[1] === "空闲" && secs(m.beat.at) <= 200) free++;
     }));
     $("sub").textContent = `${ms.length} 台 · ${live.length} 台有心跳`;
     $("at").textContent = "数据 " + ago(s.at);
-    $("line").innerHTML = `空闲槽位 <b>${free}</b> / ${total} · 排队 <b>${(s.queue || []).length}</b>` + live.map((m) => ` · ${esc(m.name)} ${m.beat.busy.toFixed(0)}/${m.beat.threads}`).join("");
-    jobs(s);
+    $("line").innerHTML = `空闲槽位 <b>${free}</b> / ${total}` + live.map((m) => ` · ${esc(m.name)} ${m.beat.busy.toFixed(0)}/${m.beat.threads}`).join("");
+    alerts(ms);
     $("machines").innerHTML = ms.map(machine).join("");
   }
   function load() {
     fetch("status.json", { cache: "no-store" }).then((r) => r.json()).then(render)
-      .catch(() => { $("sub").textContent = "读不到 status.json（中枢不通，或定时任务没跑）"; });
+      .catch(() => { $("sub").textContent = "读不到 status.json（定时任务没跑）"; });
   }
   load(); setInterval(load, 30000);
 })();

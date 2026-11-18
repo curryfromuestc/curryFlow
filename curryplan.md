@@ -61,9 +61,9 @@
 ## 发布与自动同步
 
 1. **项目 `docs/` 自动同步（主方式）**
-   在 curryPlan 机上建项目的稀疏 clone，cron 每分钟拉中枢 `main` 并执行 `tools/publish-docs`：
+   在 curryPlan 机上建项目的稀疏 clone（远端是 GitHub），cron 每分钟拉 `main` 并执行 `tools/publish-docs`：
    ```sh
-   ssh "$CURRYPLAN_SSH" 'git clone -q --filter=blob:none --sparse ci@<主中枢>:<项目>.git ~/curryflow/<项目>-docs &&
+   ssh "$CURRYPLAN_SSH" 'git clone -q --filter=blob:none --sparse git@github.com:<组织>/<项目>.git ~/curryflow/<项目>-docs &&
      git -C ~/curryflow/<项目>-docs sparse-checkout set docs tools/publish-docs'
    # crontab 加一行
    * * * * * cd ~/curryflow/<项目>-docs && flock -n .git/pub.lock sh -c "git pull -q --ff-only && python3 tools/publish-docs" >/dev/null 2>&1  # curryPlan <项目> docs

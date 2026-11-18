@@ -2,13 +2,12 @@
 """分阶段验收。每阶段退出码 0 通过、77 跳过、其余失败；最后一行是一行结论。
 
   ci/accept                    按顺序跑全部阶段
-  ci/accept --stage NAME       只跑一个阶段（executor 在固定核的槽位里这样调）
+  ci/accept --stage NAME       只跑一个阶段（机器池的槽位里这样调）
   ci/accept --list [--json]    列出阶段、槽位类和判据
   ci/accept --plan PATH...     按改动的文件给出要跑的阶段（按风险分级）
 
 派生物只准写在 .build/ 下：每个阶段跑前跑后各扫一遍工作区，.build/ 以外多了或改了文件就判这个阶段失败。
-阶段拿到的环境变量：OUT=.build/accept/<阶段>（报告放这里，小的 *.txt/*.json 会随结论推到中枢），
-CF_CACHE_<名字>=共享缓存目录（executor 准备好；本地跑时没有，阶段自己现建到 .build/ 下）。
+阶段拿到的环境变量：OUT=.build/accept/<阶段>（报告放这里）。
 --list 和 --plan 不读工作区：协调器用 `git show <候选>:ci/accept | python3 - --list` 调它。
 """
 import json
@@ -20,8 +19,7 @@ from fnmatch import fnmatch
 
 # ---- 项目填写 -----------------------------------------------------------------------------------------
 # name：阶段名；class：槽位类（sim / synth / gpu / build）；cmd：在仓库根目录用 bash 跑；
-# why：判据，写清通过意味着什么、用例来自哪个真实 bug；cache：{名字: {inputs: [路径], tool: 取工具版本的命令,
-# build: 往 $CF_CACHE_OUT 里建的命令}}，键 = 输入的 git tree hash + 工具版本。
+# why：判据，写清通过意味着什么、用例来自哪个真实 bug。
 STAGES = [
     {"name": "lint", "class": "build", "cmd": "true", "why": "替换成项目的快速检查"},
 ]

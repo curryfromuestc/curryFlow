@@ -1,23 +1,22 @@
 #!/bin/sh
-# The pool's beat and executor on a Mac: two launchd daemons run as this user, what the two cron lines are on Linux.
+# The pool's beat on a Mac: a launchd daemon run as this user every minute, what the cron line is on Linux; and the
+# sudo rule the executor needs for the jobs' own daemons.
 #
-# usage: mac-agents install NAME    write and start com.curryflow.beat and com.curryflow.executor for machine NAME
-#        mac-agents remove          stop and delete them (jobs that run keep running; their conclusions wait)
-#        mac-agents status          whether they are loaded and running
+# usage: mac-agents install NAME    write and start com.curryflow.beat for machine NAME, and the sudo rule
+#        mac-agents remove          stop and delete them
+#        mac-agents status          whether beat is loaded
 #
 # Run from the clone of the pool repository (~/curryflow/machines) as the user the jobs run as; install and remove
-# ask for that user's sudo password once. macOS has no flock: launchd runs one instance of a daemon at a time, which
-# is what the cron lines take the lock for. beat runs every minute; the executor is kept running (launchd starts it
-# again within seconds when it ends). They are daemons of the system domain with UserName set, as the jobs' own
-# daemons (cf.<id>) are: they run without anyone logged in at the Mac. The executor starts and stops those through
-# sudo (a plist there must be owned by root); /etc/sudoers.d/curryflow lets this user do exactly that without a
-# password.
+# ask for that user's sudo password once. beat is a daemon of the system domain with UserName set, as each job's
+# supervisor (cf.<id>, see executor) is: they run without anyone logged in at the Mac. The executor starts and stops
+# those through sudo (a plist there must be owned by root); /etc/sudoers.d/curryflow lets this user do exactly that
+# without a password.
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 dir=/Library/LaunchDaemons
 user=$(id -un)
 group=$(id -gn)
-labels="com.curryflow.beat com.curryflow.executor"
+labels="com.curryflow.beat"
 sudoers=/etc/sudoers.d/curryflow
 
 plist() {  # LABEL ERR KEY ARG...
@@ -55,16 +54,14 @@ install)
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
     plist com.curryflow.beat /dev/null '<key>StartInterval</key><integer>60</integer>' "$here/beat" --machine "$name"
-    plist com.curryflow.executor "$HOME/curryflow/exec/$name/launchd.err" '<key>KeepAlive</key><true/>' \
-        "$here/executor" run --machine "$name"
     printf '%s ALL=(root) NOPASSWD: /bin/launchctl bootstrap system *, /bin/launchctl bootout system/cf.*, %s\n' \
         "$user" "/usr/sbin/chown root\\:wheel $HOME/*/cf.*.plist" > "$tmp/sudoers"
     sudo visudo -cqf "$tmp/sudoers"
     sudo install -m 440 -o root -g wheel "$tmp/sudoers" "$sudoers"
+    # the resident executor of the earlier mac-agents
+    sudo launchctl bootout system/com.curryflow.executor 2>/dev/null || true
+    sudo rm -f "$dir/com.curryflow.executor.plist"
     for label in $labels; do
-        # the login-session agents of the earlier mac-agents
-        launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
-        rm -f "$HOME/Library/LaunchAgents/$label.plist"
         sudo launchctl bootout "system/$label" 2>/dev/null || true
         sudo install -m 644 -o root -g wheel "$tmp/$label.plist" "$dir/$label.plist"
         sudo launchctl bootstrap system "$dir/$label.plist"

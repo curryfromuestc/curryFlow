@@ -1,60 +1,46 @@
 #!/usr/bin/env python3
-"""The executor of one machine of the pool: it hands the machine's slots to the requests queued in the pool repository.
+"""Runs one job in one slot of this machine; flow calls it over ssh. Nothing of it stays resident.
 
-usage: executor run --machine NAME    the loop; cron starts it every minute under flock, so there is one per machine
-       executor _job RUNDIR           (internal) prepare the work tree on the host, then start the supervisor in the slot
-       executor _sup RUNDIR           (internal) the supervisor: runs the command, enforces the timeout and a cancel
-       executor _agent RUNDIR         (internal, macOS) runs the supervisor as a launchd agent and waits for its end
+usage: executor start --machine NAME      a request (JSON on stdin: slot, project, commit, repo, argv, timeout, clean,
+                                          who) becomes a job in its slot; prints {"id", "rundir"} and returns
+       executor wait --machine NAME ID    waits for the job's end; prints the machine's alerts while it runs, then
+                                          the conclusion as one line "CF-END <json>"
+       executor ls --machine NAME         every job of this machine's slots as JSON (newest first)
+       executor log --machine NAME ID [-n N]   the last N lines of a job's log
+       executor cancel --machine NAME ID  ends a job and prints its conclusion like wait
+       executor mirror --project P        the bare mirror of P on this machine (made when missing): flow pushes a
+                                          commit GitHub does not have into it
+       executor _job RUNDIR               (internal) prepare the work tree on the host, then start the supervisor
+       executor _sup RUNDIR               (internal) the supervisor: runs the command, enforces timeout and cancel
+       executor _agent RUNDIR             (internal, macOS) runs the supervisor as a launchd daemon and waits for it
 
-Everything shared is a JSON blob behind a ref of the pool repository (machines.git), like the heartbeats:
-  refs/q/<id>       a request, written by flow: a job (project, commit, command, needs, priority, timeout) or a hold
-  refs/run/<id>     written once by the executor that took the request (machine, slot, start, run directory). It is
-                    created with "this ref must not exist", so of two executors that want the same request one wins
-  refs/done/<id>    the conclusion (exit code, last line, seconds, the last 40 lines of the log, where the log is);
-                    the same push deletes q and run. Swept 7 days after the end
-  refs/cancel/<id>  asks the executor that runs <id> to end it; a request whose q ref is gone is cancelled as well
-  refs/hb/<machine> the machine's heartbeat (beat); it carries the ids the machine's executor holds, so a run is alive
-                    while its machine's heartbeat moves and lists it
-  refs/alive/<m>    pushed by the executor itself while it holds requests and its machine's heartbeat stands still
-                    (beat stopped or stuck in a slow probe): the ids it holds, like the heartbeat
-A job hands a directory to other machines through its project's hub, not the pool's: what a job that ends with 0
-leaves in .build/cf/share/<name>/ of its work tree is pushed there as refs/cf/share/<name>/<id> (a commit without
-parents whose tree is the directory) before its conclusion is pushed, and `flow get` of any machine with access to
-that hub fetches it. A name has one content: the push deletes an earlier job's refs of the same name. Swept 14 days
-after the job.
-A request that is not well formed gets an error conclusion from whichever executor sees it first; so does a request
-that no slot of the pool fits for half an hour, judged only by an executor that runs its clone's version and whose
-machines.json is the hub's (a need it does not know means it cannot run the request). A run whose machine has had
-neither heartbeat nor executor signal, or whose executor has not held it, for ten minutes of this executor reading the
-hub gets a lost conclusion (255); its executor's own conclusion, if it comes later, replaces it, while any other
-conclusion already there (cancelled in the queue, not well formed) ends the run instead. A claim that this executor
-gave up on and that the hub took after all is deleted, so the request is queued again.
+A slot runs one job at a time: start takes <slot dir>/.cf/busy (exclusively; one whose job has ended or whose launcher
+and supervisor are gone is taken over) and the launcher removes it after the conclusion. A slot that is busy is an
+error, not a queue: which job goes where is agreed on before it is started.
 On the machine:
-  ~/curryflow/exec/<machine>/        state.json (what beat reports), executor.log, served.json, abandoned.json
-  ~/curryflow/mirror/<project>.git   the machine's bare mirror of a project; only incremental fetches from its hub
+  ~/curryflow/mirror/<project>.git   the machine's bare mirror of a project: fetches from GitHub (the project's
+                                     "repo" in machines.json) with the host's ssh key, or receives flow's push
   <slot dir>/<project>               the slot's work tree of the project: a clone of the mirror, one checkout per job,
                                      ignored files (.build) stay for incremental builds while the slot dir stays
                                      within SLOT_MAX (cap_slot, before and after each job)
-  <slot dir>/.cf/<id>/               a job's run directory: job.json, log, exit.json, done.json
+  <slot dir>/.cf/<id>/               a job's run directory: job.json, log, exit.json; removed KEEP after the end
+  ~/curryflow/exec/<machine>/alerts.json   what beat found wrong with memory or swapping (wait prints it)
 The slot dir is ~/<container> for a slot with an incus container (the container mounts it at the same path) and
-~/curryflow/slots/<slot> otherwise. Git runs on the host, pinned to the slot's CPUs; the command runs in the slot:
-under taskset in a systemd user scope with MemoryMax (no container), or through incus exec as the host user's uid and
-gid (container). incus kills the process it started when its client goes away, so in a container the supervisor
-forks off that process; the launcher keeps waiting while the supervisor's alive file is fresh.
+~/curryflow/slots/<slot> otherwise. Git runs on the host; the command runs in the slot: through incus exec as the host
+user's uid and gid (container), or (macOS) as a launchd daemon of its own. The job's environment has the machine's
+deps cache (CF_DEPS_CACHE, mounted read-write into the containers) and the GitHub token of
+~/.config/curryflow/github-token (GH_TOKEN, and git rewrites git@github.com: to https with it), so a job fetches its
+dependencies itself where it runs.
 
 A job's processes are run by the supervisor, a child subreaper, so every descendant stays below it. The supervisor
 ends them (timeout, cancel file, or what is left when the command exits) by walking its own process tree and writes
 exit.json last. The launcher creates launch.json itself, exclusively, so a run directory never gets two launchers.
-The executor only reads files of the run directory, so it can be restarted while jobs run.
 
-macOS (DARWIN) has no /proc, no CPU affinity, no cgroups and no child subreaper. The executor asks libproc and Mach
-what it reads from /proc on Linux. A slot there is a number of threads and a memory budget, not CPUs: no thread is
-pinned, and a slot is busy by what the machine's load leaves of its share. Each job's supervisor runs as a launchd
-daemon of its own (cf.<id> in the system domain as this user, started through sudo and awaited by `executor _agent`,
-so no login at the Mac is needed): launchd gives a daemon a coalition, which its
-descendants cannot leave whatever session, process group or parent they end up with, so the processes of the job are
-the processes of that coalition. The supervisor ends them by it and adds up their memory against the slot's (over it,
-the job ends with 137), as the kernel does for a scope's MemoryMax on Linux.
+macOS (DARWIN) has no /proc and no child subreaper. The executor asks libproc and Mach what it reads from /proc on
+Linux. Each job's supervisor runs as a launchd daemon of its own (cf.<id> in the system domain as this user, started
+through sudo and awaited by `executor _agent`, so no login at the Mac is needed): launchd gives a daemon a coalition,
+which its descendants cannot leave whatever session, process group or parent they end up with, so the processes of
+the job are the processes of that coalition, and the supervisor ends them by it.
 """
 import argparse
 import calendar
@@ -78,32 +64,19 @@ import traceback
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DARWIN = sys.platform == "darwin"
 BASE = os.path.expanduser("~/curryflow")
-TICK, POLL, POLL_MAX, SWEEP, REAP = 3, 15, 120, 3600, 300
-BUSY_MAX = 0.20          # a slot whose measured busy share is at or above this is somebody else's
-WINDOW, MIN_WINDOW = 60, 6
-BURST, QUIET = 15, 300   # on a shared machine a slot somebody loaded stays theirs for QUIET seconds after the load stops
-LOST, RUN_GRACE, UNFIT, SELF_BEAT = 600, 180, 1800, 150
-TOUCH, ALIVE, SPAWN, CANCEL_KILL, OVERRUN, LOCK_WAIT = 5, 60, 60, 90, 300, 60
-KEEP, TMP_KEEP, ABANDON_KEEP, TMPDIR_KEEP = 7 * 86400, 3600, 86400, 3 * 86400
-SHARE_KEEP = 14 * 86400        # how long a directory a job shared stays on its project's hub
-HOLD_MAX_HOURS = 8
+TOKEN = os.path.expanduser("~/.config/curryflow/github-token")
+TOUCH, ALIVE, SPAWN, OVERRUN, LOCK_WAIT, WAIT_STEP = 5, 60, 60, 300, 60, 5
+KEEP, TMPDIR_KEEP = 7 * 86400, 3 * 86400
 TIMEOUT_MAX = 86400
-LOG_MAX, LOG_HEAD, EXEC_LOG_MAX = 256 << 20, 1 << 20, 4 << 20
+LOG_MAX, LOG_HEAD = 256 << 20, 1 << 20
 SLOT_MAX = 50 << 30      # a slot dir above this loses whole .build directories of its work trees (cap_slot)
 GIT_TIMEOUT = 60
-PRIO = {"gate": 0, "normal": 1, "night": 2}
-TAGS = {"synth"}
 ID = re.compile(r"\d{6}-\d{6}-[0-9a-f]{3,8}")
 SHA = re.compile(r"[0-9a-f]{40}")
-TMPREF = re.compile(r"refs/cf/tmp/\d{6}-\d{6}-[0-9a-f]{3,8}")
-SHARE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
-SHAREREF = re.compile(r"refs/cf/share/[A-Za-z0-9][A-Za-z0-9._-]{0,99}/(\d{6}-\d{6}-[0-9a-f]{3,8})")
-REF = re.compile(r"(?!.*(?:\.\.|@\{|//|/\.|/-|\.lock(?:/|$)))refs/[^\x00-\x20\x7f~^:?*\[\\]+(?<![./])")
 LOCKS = ("*.lock", "refs/**/*.lock", "logs/**/*.lock")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 CODE_ERROR, CODE_TIMEOUT, CODE_CANCEL, CODE_LOST = 99, 124, 143, 255
-CODE_MEMORY = 137        # (macOS) the job's processes went over the slot's memory: what an OOM kill gives on Linux
 
 
 class GitError(Exception):
@@ -119,9 +92,7 @@ class Cancelled(Exception):
 
 
 def ssh_command(proxy=None, bulk=False):
-    """The machine's one persistent connection to the hub carries the refs of the pool repository. A fetch of a
-    project's commits (bulk) takes a connection of its own for as long as it lasts: on a slow link its data would
-    hold up every poll that shares the connection."""
+    """ssh for git: a fetch of a project's commits (bulk) takes a connection of its own."""
     ssh = ("ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
            " -o ServerAliveInterval=15 -o ServerAliveCountMax=3")
     ssh += (" -o ControlMaster=no -o ControlPath=none" if bulk else
@@ -169,18 +140,6 @@ def cpu_list(spec):
             a, _, b = part.partition("-")
             out += range(int(a), int(b or a) + 1)
     return out
-
-
-def physical_cores(cpus):
-    top = "/sys/devices/system/cpu/cpu%d/topology/"
-    seen = set()
-    for c in cpus:
-        try:
-            seen.add((open(top % c + "physical_package_id").read().strip(),
-                      open(top % c + "core_id").read().strip()))
-        except OSError:
-            pass
-    return len(seen) or len(cpus)
 
 
 def mem_bytes(text):
@@ -271,12 +230,6 @@ if DARWIN:
         me = os.getpid()
         return [p for p in all_pids() if p != me and coalition(p) == cid] if cid else []
 
-    def footprint(pid):
-        """A process's physical footprint in bytes (proc_pid_rusage, RUSAGE_INFO_V0: ri_phys_footprint), what
-        Activity Monitor calls its memory; 0 when it is gone."""
-        buf = (ctypes.c_uint64 * 12)()
-        return buf[9] if LIBPROC.proc_pid_rusage(int(pid), 0, ctypes.byref(buf)) == 0 else 0
-
     def proc_cwd(pid):
         """A process's working directory (PROC_PIDVNODEPATHINFO: pvi_cdir's path); None when it cannot be read."""
         buf = ctypes.create_string_buffer(2352)
@@ -294,13 +247,6 @@ if DARWIN:
         return buf.raw[:size.value]
 
 
-def id_time(rid):
-    try:
-        return calendar.timegm(time.strptime(rid[:13], "%y%m%d-%H%M%S"))
-    except ValueError:
-        return None
-
-
 def tail_lines(path, n=40, cap=65536):
     try:
         with open(path, "rb") as f:
@@ -315,7 +261,7 @@ def tail_lines(path, n=40, cap=65536):
 
 
 def write_exit(rundir, code, reason, note=""):
-    """The job's end, written once: whoever sees the end first (supervisor, launcher, executor) records it."""
+    """The job's end, written once: whoever sees the end first (supervisor, launcher, wait, cancel) records it."""
     path = os.path.join(rundir, "exit.json")
     if os.path.exists(path):
         return
@@ -329,67 +275,6 @@ def write_exit(rundir, code, reason, note=""):
     os.unlink(tmp)
 
 
-def minutes(secs):
-    return f"{int(secs)} 秒" if secs < 120 else f"{int(secs) // 60} 分钟"
-
-
-def num(x, lo, hi):
-    """A JSON number with lo < x <= hi (no bool, NaN or infinity)."""
-    return isinstance(x, (int, float)) and not isinstance(x, bool) and lo < x <= hi
-
-
-def text(x, n=4096):
-    return isinstance(x, str) and 0 < len(x) <= n
-
-
-NEEDS = {"threads": lambda v: isinstance(v, int) and num(v, 0, 4096), "mem_gb": lambda v: num(v, 0, 1 << 20),
-         "gpu": lambda v: isinstance(v, bool), "machine": lambda v: text(v, 100), "slot": lambda v: text(v, 100),
-         "tags": lambda v: isinstance(v, list) and all(text(t, 100) for t in v)}
-
-
-def problem(r, rid):
-    """Why a request cannot be served as written, None when it can."""
-    if not isinstance(r, dict):
-        return "不是 JSON 对象"
-    if r.get("id") != rid or not ID.fullmatch(rid):
-        return "id 和 ref 名对不上"
-    if r.get("kind") not in ("job", "hold"):
-        return f"kind 不认识：{r.get('kind')!r}"
-    if r.get("prio") not in PRIO:
-        return f"prio 不认识：{r.get('prio')!r}"
-    if not text(r.get("who"), 200):
-        return "who 不是字符串"
-    if "submitted" in r and not num(r["submitted"], -1, 1e11):
-        return f"submitted 不是时间：{r['submitted']!r}"
-    need = r.get("need", {})
-    if not isinstance(need, dict):
-        return "need 不是对象"
-    for key, value in need.items():
-        if key in NEEDS and not NEEDS[key](value):
-            return f"need.{key} 的值不对：{value!r}"
-    if r["kind"] == "hold":
-        return None if num(r.get("hours"), 0, HOLD_MAX_HOURS) else f"hours 要在 0 到 {HOLD_MAX_HOURS} 之间：{r.get('hours')!r}"
-    if not text(r.get("project"), 100):
-        return "project 不是字符串"
-    if not (isinstance(r.get("commit"), str) and SHA.fullmatch(r["commit"])):
-        return "commit 不是 40 位的提交"
-    argv = r.get("argv")
-    if not (isinstance(argv, list) and argv and all(isinstance(a, str) for a in argv) and len(json.dumps(argv)) < 65536):
-        return "argv 不是非空的字符串列表"
-    if "cmd" in r and not isinstance(r["cmd"], str):
-        return "cmd 不是字符串"
-    if not num(r.get("timeout"), 0, TIMEOUT_MAX):
-        return f"timeout 要在 0 到 {TIMEOUT_MAX} 秒之间：{r.get('timeout')!r}"
-    ref, tmp = r.get("ref"), r.get("tmp", False)
-    if not isinstance(tmp, bool):
-        return "tmp 不是 true/false"
-    if "clean" in r and not isinstance(r["clean"], bool):
-        return "clean 不是 true/false"
-    if ref is not None and not (isinstance(ref, str) and (TMPREF.fullmatch(ref) or REF.fullmatch(ref) and ".." not in ref)):
-        return f"ref 不对：{ref!r}"
-    if tmp and not (ref and TMPREF.fullmatch(ref)):
-        return f"tmp 的 ref 只能在 refs/cf/tmp/ 下：{ref!r}"
-    return None
 
 
 def git_busy(root):
@@ -499,7 +384,7 @@ def cap_slot(slotdir, project, say, after=False, tick=None):
     """Keeps the slot dir at or below SLOT_MAX: above it, whole .build directories of the slot's work trees go, least
     recently used first by the mtime of .build/.cf-env.json (written when a job starts in the tree; a tree without it
     is the oldest). Before a job its project's .build is not touched; after the job it goes last, so only when it
-    alone keeps the slot above, and then its .build/cf/share stays (finish shares it once exit.json is written).
+    alone keeps the slot above.
     Run directories (.cf) and the container's HOME (.home) count but stay."""
     when = "作业后" if after else "作业前"
     own = os.path.join(slotdir, project, ".build")
@@ -522,21 +407,7 @@ def cap_slot(slotdir, project, say, after=False, tick=None):
     for b in sorted(builds, key=lambda b: (b == own, builds[b])):
         if total <= SLOT_MAX:
             break
-        if b == own:
-            for top, keep in ((b, "cf"), (os.path.join(b, "cf"), "share")):
-                for name in os.listdir(top) if os.path.isdir(top) and not os.path.islink(top) else ():
-                    path = os.path.join(top, name)
-                    if name == keep:
-                        continue
-                    if os.path.isdir(path) and not os.path.islink(path):
-                        shutil.rmtree(path, ignore_errors=True)
-                    else:
-                        try:
-                            os.unlink(path)
-                        except OSError:
-                            pass
-        else:
-            shutil.rmtree(b, ignore_errors=True)
+        shutil.rmtree(b, ignore_errors=True)
         freed = sizes[b] - (usage(b)[0] if os.path.lexists(b) else 0)
         last = time.strftime("上次作业 %m-%d %H:%M", time.localtime(builds[b])) if builds[b] else "没有作业记录"
         say(f"{when}槽位目录 {size_text(total)}，超过上限 {size_text(SLOT_MAX)}：删掉 {os.path.basename(os.path.dirname(b))} 的 "
@@ -682,13 +553,10 @@ def sup_main(rundir, detach=False):
         time.sleep(0.5)
         reap()
         t = time.time()
-        used = 0
         if t - touched >= TOUCH:
             os.utime(alive)
             touched = t
             cap()
-            if DARWIN and job.get("mem"):            # no cgroup holds the job to the slot's memory: add it up
-                used = sum(footprint(p) for p in descendants())
         if killing is None:
             if asked or os.path.exists(cancel):
                 reason, killing = "cancelled", t
@@ -696,9 +564,6 @@ def sup_main(rundir, detach=False):
             elif t - start >= job["req"]["timeout"]:
                 reason, killing = "timeout", t
                 say(f"超时（{job['req']['timeout']} 秒）：结束作业的进程")
-            elif used > job.get("mem", 0) > 0:
-                reason, killing = "memory", t
-                say(f"作业的进程一共占了 {used / 2 ** 30:.1f} GiB，超过槽位的 {job['mem'] / 2 ** 30:g} GiB：结束作业的进程")
             if killing:
                 signal_tree(signal.SIGTERM)
         elif t - killing > 10:
@@ -721,14 +586,13 @@ def sup_main(rundir, detach=False):
     cap_slot(job["dir"], job["req"]["project"], say, after=True, tick=lambda: os.utime(alive))
     cap()
     note = f"日志超过 {LOG_MAX / 2 ** 20:g} MB，中间截掉过 {len(cuts)} 次" if cuts else ""
-    if reason == "memory":
-        return write_exit(rundir, CODE_MEMORY, "exit", f"超过槽位的内存上限 {job['mem'] / 2 ** 30:g} GiB，被结束" +
-                          (f"；{note}" if note else ""))
     final = {"exit": code[0], "timeout": CODE_TIMEOUT, "cancelled": CODE_CANCEL}[reason]
     write_exit(rundir, final, reason, note)
 
 
 # ---- the launcher: runs on the host, one per job, detached from the executor ---------------------------
+
+# ---- the launcher: runs on the host, one per job, detached from whoever started it ---------------------
 
 def job_main(rundir):
     try:
@@ -738,14 +602,16 @@ def job_main(rundir):
     os.write(fd, json.dumps({"pid": os.getpid(), "ticks": proc_stat(os.getpid())[2]}).encode())
     os.close(fd)
     job = jload(os.path.join(rundir, "job.json"))
+    try:
+        launch(job, rundir)
+    finally:
+        release(job)
+
+
+def launch(job, rundir):
     log = open(os.path.join(rundir, "log"), "ab", buffering=0)
     say = lambda text: log.write(f"[cf] {text}\n".encode())
     cancel = os.path.join(rundir, "cancel")
-    if not DARWIN:                                   # macOS pins no thread
-        try:
-            os.sched_setaffinity(0, cpu_list(job["cpus"]))
-        except (OSError, ValueError):
-            say(f"准备阶段没能钉在核 {job['cpus']} 上")
 
     def check():
         if os.path.exists(cancel):
@@ -754,7 +620,7 @@ def job_main(rundir):
     def run(cmd, cwd=None, timeout=1800, quiet=False):
         """A preparation step; it ends when the job is cancelled (SIGTERM first, so git removes its lock files)."""
         p = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE if quiet else log,
-                             stderr=subprocess.STDOUT, env=git_env(job.get("proxy"), bulk=True))
+                             stderr=subprocess.STDOUT, env=git_env(bulk=True))
         t0 = time.time()
         while p.poll() is None:
             if os.path.exists(cancel) or time.time() - t0 > timeout:
@@ -800,21 +666,27 @@ def job_main(rundir):
             say(f"{'incus exec ' if job.get('container') else '监管进程'}返回了（rc={rc}），监管进程还在：接着等它的结论")
             waited = True
         time.sleep(2)
+    if job.get("agent"):     # (macOS) what is left in the job's coalition, and its daemon
+        agent_kill(job, rundir)
     if not os.path.exists(exit_json):
-        if job.get("unit"):
-            subprocess.run(["systemctl", "--user", "stop", job["unit"] + ".scope"], capture_output=True)
-        if job.get("agent"):
-            agent_kill(job, rundir)
         say(f"监管进程没留下结论就退出了（rc={rc}）")
         write_exit(rundir, CODE_LOST, "lost", f"监管进程退出 rc={rc}")
+
+
+def release(job):
+    """The slot is free again: its busy file goes when it is still this job's."""
+    busy = os.path.join(job["dir"], ".cf", "busy")
+    try:
+        if open(busy).read().strip() == job["id"]:
+            os.unlink(busy)
+    except OSError:
+        pass
 
 
 def overrun(job, rundir, p, say):
     """The supervisor has neither concluded nor moved, OVERRUN seconds past the job's timeout (stopped, or its
     container paused): what can be reached of the job goes, and the job is lost."""
-    if job.get("unit"):
-        subprocess.run(["systemctl", "--user", "kill", "--signal=SIGKILL", job["unit"] + ".scope"], capture_output=True)
-    elif job.get("agent"):
+    if job.get("agent"):
         agent_kill(job, rundir)
     elif not job.get("container"):
         try:
@@ -859,12 +731,26 @@ def fresh(path):
         return False
 
 
-def prepare(job, say, run, must, check):
-    """The work tree of (slot, project) at the job's commit: mirror <- hub (only what is missing), tree <- mirror."""
-    req, mirror, tree = job["req"], job["mirror"], job["tree"]
-    sha, hub = req["commit"], job["hub"]
+def ensure_mirror(mirror):
+    if os.path.isdir(mirror):
+        return
     os.makedirs(os.path.dirname(mirror), exist_ok=True)
-    has = lambda repo: run(["git", "-C", repo, "cat-file", "-e", sha + "^{commit}"], quiet=True) == 0
+    tmp = f"{mirror}.tmp{os.getpid()}"
+    shutil.rmtree(tmp, ignore_errors=True)
+    subprocess.run(["git", "init", "-q", "--bare", tmp], check=True)
+    subprocess.run(["git", "-C", tmp, "config", "uploadpack.allowAnySHA1InWant", "true"], check=True)
+    try:
+        os.rename(tmp, mirror)
+    except OSError:          # another job made it first
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def prepare(job, say, run, must, check):
+    """The work tree of (slot, project) at the job's commit: mirror <- GitHub (only what it lacks), tree <- mirror."""
+    req, mirror, tree = job["req"], job["mirror"], job["tree"]
+    sha, repo = req["commit"], req["repo"]
+    has = lambda r: run(["git", "-C", r, "cat-file", "-e", sha + "^{commit}"], quiet=True) == 0
+    ensure_mirror(mirror)
     with open(mirror + ".lock", "w") as lock:
         while True:
             try:
@@ -873,37 +759,19 @@ def prepare(job, say, run, must, check):
             except BlockingIOError:
                 check()
                 time.sleep(1)
-        if not os.path.isdir(mirror):
-            tmp = f"{mirror}.tmp{os.getpid()}"
-            shutil.rmtree(tmp, ignore_errors=True)
-            if job.get("seed"):
-                seed = os.path.expanduser(job["seed"])
-                say(f"建镜像 {mirror}（从本机的 {seed}）")
-                must(["git", "clone", "-q", "--bare", "--no-hardlinks", seed, tmp], f"从 {seed} 建镜像失败")
-            elif job.get("seed_only"):
-                raise JobError(f"这台机器上没有 {req['project']} 的镜像，machines.json 里也没有给这台机器的 seed"
-                               "（本机已有的 clone）；这个项目不从中枢全量取")
-            else:
-                say(f"建镜像 {mirror}（空的，从中枢取）")
-                must(["git", "init", "-q", "--bare", tmp], "git init 失败")
-            must(["git", "-C", tmp, "config", "uploadpack.allowAnySHA1InWant", "true"], "git config 失败")
-            os.rename(tmp, mirror)
         clear_locks(mirror, mirror, say, check)
         if not has(mirror):
-            ref = req.get("ref")
-            if ref:
-                say(f"从中枢取 {ref}")
-                run(["git", "-C", mirror, "fetch", "-q", "--no-tags", hub, f"+{ref}:refs/cf/req/{job['slot']}"])
+            say(f"从 {repo} 取 {sha[:12]}")
+            run(["git", "-C", mirror, "fetch", "-q", "--no-tags", repo, sha])
             if not has(mirror):
-                say("从中枢取全部分支")
-                must(["git", "-C", mirror, "fetch", "-q", "--no-tags", "--prune", hub, "+refs/heads/*:refs/hub/*"],
-                     "从中枢取分支失败")
+                say(f"从 {repo} 取全部分支")
+                must(["git", "-C", mirror, "fetch", "-q", "--no-tags", "--prune", repo, "+refs/heads/*:refs/gh/*"],
+                     f"从 {repo} 取分支失败")
             if not has(mirror):
-                raise JobError(f"中枢 {hub} 上取不到提交 {sha}（先把它推到中枢，或用 flow run --here）")
+                raise JobError(f"{repo} 上取不到提交 {sha}（先推到 GitHub，或在有这个提交的仓库里用 flow run --here）")
         must(["git", "-C", mirror, "update-ref", f"refs/cf/slot/{job['slot']}", sha], "update-ref 失败")
-    if req.get("tmp") and TMPREF.fullmatch(req.get("ref") or ""):
-        if run(["git", "-C", mirror, "push", "-q", hub, ":" + req["ref"]], quiet=True):
-            say(f"删除中枢上的临时 ref {req['ref']} 失败；executor 每小时的清理会再删")
+        for ref in run_out(["git", "-C", mirror, "for-each-ref", "--format=%(refname)", "refs/cf/job/"]).split():
+            run(["git", "-C", mirror, "update-ref", "-d", ref], quiet=True)     # flow's pushes, now kept by the slot ref
     check()
     if not os.path.isdir(os.path.join(tree, ".git")):
         say(f"建工作树 {tree}")
@@ -928,7 +796,7 @@ def prepare(job, say, run, must, check):
         say("清空 .build（--clean）" if req.get("clean") else "清空 .build（deps.json 或槽位环境变了）")
         shutil.rmtree(os.path.join(tree, ".build"), ignore_errors=True)
     else:
-        for sub in ("accept", "synth", "release", "downstream", os.path.join("cf", "share")):
+        for sub in ("accept", "synth", "release", "downstream"):
             shutil.rmtree(os.path.join(tree, ".build", sub), ignore_errors=True)
     os.makedirs(os.path.join(tree, ".build", "tmp"), exist_ok=True)
     jdump(stamp_path, cur_env)
@@ -937,16 +805,17 @@ def prepare(job, say, run, must, check):
     say(f"{req['project']}@{sha[:12]} 在 {job['machine']}/{job['slot']}：{req['cmd']}")
 
 
+def run_out(cmd):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else ""
+
+
 def launch_command(job, rundir, run, say):
     me = os.path.join(rundir, "executor")
     if job.get("agent"):
         return [sys.executable, me, "_agent", rundir]
     if not job.get("container"):
-        cmd = []
-        if job.get("unit"):
-            cap = ["-p", f"MemoryMax={job['mem']}", "-p", "MemorySwapMax=0"] if job.get("mem") else []
-            cmd = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--unit", job["unit"], *cap, "--"]
-        return cmd + ["taskset", "-c", job["cpus"], sys.executable, me, "_sup", rundir]
+        return [sys.executable, me, "_sup", rundir]
     # In the container the job runs as the host user's uid and gid (the work directory is an id-shifted mount, so the
     # files it writes belong to the host user). The container gets a passwd entry for that uid once; when the host
     # user's name is taken there by another uid, the entry is named cf<uid>.
@@ -966,13 +835,12 @@ def launch_command(job, rundir, run, say):
 # ---- macOS: the supervisor as a launchd agent ----------------------------------------------------------
 
 def agent_domain(job, rundir):
-    return (jload(os.path.join(rundir, "agent.json")) or {}).get("domain") or f"gui/{os.getuid()}"
+    return (jload(os.path.join(rundir, "agent.json")) or {}).get("domain") or "system"
 
 
 def launchctl(domain, *args):
     """launchctl for a domain: the system domain only through sudo (mac-agents install allows bootstrap and bootout
-    there, and the chown of the plist to root, without a password); gui/<uid> is what jobs started before 2026-11-18
-    ran in."""
+    there, and the chown of the plist to root, without a password)."""
     return subprocess.run((["sudo", "-n"] if domain == "system" else []) + ["launchctl", *args],
                           capture_output=True, text=True)
 
@@ -1049,989 +917,255 @@ def agent_main(rundir):
 
 
 def wrap(mode, args):
-    """incus as this process can reach it: directly (cron) or through sg (a login older than the group membership)."""
+    """incus as this process can reach it: directly, or through sg (a login older than the group membership)."""
     return ["incus", *args] if mode == "direct" else ["sg", "incus-admin", "-c", shlex.join(["incus", *args])]
 
 
-# ---- the executor ------------------------------------------------------------------------------------
+# ---- the commands flow calls over ssh ------------------------------------------------------------------
 
-class Slot:
-    def __init__(self, name, conf):
-        self.name, self.spec = name, conf["cpus"]
-        self.cpus = cpu_list(conf["cpus"])
-        self.cores = physical_cores(self.cpus)
-        self.mem = mem_bytes(conf.get("mem", "")) or 0
-        self.container = conf.get("container")
-        self.gpu = bool(conf.get("gpu"))
-        self.dir = os.path.expanduser(conf.get("dir") or (f"~/{self.container}" if self.container
-                                                           else f"~/curryflow/slots/{name}"))
-        self.job = None
-        self.clean = 0.0     # busy is measured from here on: the time our own job left the slot
-        self.foreign = 0.0   # the last time somebody else's load was seen on the slot
+def load_conf(machine):
+    conf = json.load(open(os.path.join(ROOT, "machines.json")))
+    if machine not in conf["machines"]:
+        die(f"machines.json 里没有机器 {machine}")
+    return conf, conf["machines"][machine]
 
 
-class Executor:
-    def __init__(self, machine, logpath):
-        self.machine, self.logpath = machine, logpath
-        self.dir = os.path.join(BASE, "exec", machine)
-        os.makedirs(self.dir, exist_ok=True)
-        self.me = os.path.abspath(__file__)
-        self.stamp, self.bad_stamp = self.file_stamp(), None
-        self.source = self.read_source()
-        self.conf_stamp, self.slots = None, {}
-        self.load_conf()
-        self.jobs, self.claiming, self.unreported, self.procs = {}, {}, {}, {}
-        self.blobs, self.bad, self.unfit, self.runs, self.dead, self.ends = {}, set(), {}, {}, {}, {}
-        self.seen, self.run_seen, self.dones = {}, {}, {}
-        self.main, self.alive_at, self.current_key, self.current_ok = None, 0, None, False
-        self.abandoned = jload(os.path.join(self.dir, "abandoned.json"), {})
-        self.samples = collections.deque()
-        self.served = jload(os.path.join(self.dir, "served.json"), {})
-        self.started = time.time()
-        self.last_poll = self.kick = self.last_reap = self.fails = 0
-        self.last_sweep = time.time() - SWEEP + min(300, SWEEP)
-        self.queued = 0
-        self.incus, self.boxes, self.boxes_at = None, set(), 0
-        self.unit_ok = None
-        self.user = pwd.getpwuid(os.getuid()).pw_name
+def die(text):
+    raise SystemExit(f"executor: {text}")
 
-    def log(self, text):
-        print(time.strftime("%m-%d %H:%M:%S"), text, flush=True)
+
+def slot_dir(name, s):
+    return os.path.expanduser(s.get("dir") or (f"~/{s['container']}" if s.get("container") else f"~/curryflow/slots/{name}"))
+
+
+def incus_mode():
+    try:
+        if subprocess.run(["incus", "list", "--format", "csv", "-c", "n"], capture_output=True, timeout=30).returncode == 0:
+            return "direct"
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return "sg"
+
+
+def new_id():
+    return time.strftime("%y%m%d-%H%M%S", time.gmtime()) + "-" + os.urandom(2).hex()[:3]
+
+
+def running(rundir):
+    """Whether the job of a run directory may still run: no conclusion, and its launcher or supervisor is there."""
+    if os.path.exists(os.path.join(rundir, "exit.json")):
+        return False
+    launch = jload(os.path.join(rundir, "launch.json"))
+    if launch is None:
         try:
-            if os.fstat(1).st_size > EXEC_LOG_MAX:
-                open_log(self.logpath)
+            return time.time() - os.stat(os.path.join(rundir, "job.json")).st_mtime < SPAWN
         except OSError:
-            pass
-
-    def file_stamp(self):
-        st = os.stat(self.me)
-        return st.st_mtime_ns, st.st_size
-
-    def read_source(self):
-        """This file, checked like a new version: the launchers of this process's jobs run a copy of it."""
-        for _ in range(30):
-            try:
-                return whole(self.me)
-            except (OSError, SyntaxError, ValueError):
-                time.sleep(1)
-        raise SystemExit(f"{self.me} 读不出完整的内容")
-
-    def load_conf(self):
-        path = os.path.join(ROOT, "machines.json")
-        stamp = os.stat(path).st_mtime_ns
-        if stamp == self.conf_stamp:
-            return
-        conf = jload(path)
-        if not conf or self.machine not in conf.get("machines", {}):
-            if self.conf_stamp is None:
-                raise SystemExit(f"machines.json has no machine {self.machine}")
-            return
-        self.conf_stamp, self.conf = stamp, conf
-        self.mconf = conf["machines"][self.machine]
-        self.projects = conf.get("projects", {})
-        self.proxy = self.mconf.get("hub_proxy")
-        old, self.slots = self.slots, {}
-        for name, c in self.mconf.get("slots", {}).items():
-            s = self.slots[name] = Slot(name, c)
-            if name in old:
-                s.job, s.clean, s.foreign = old[name].job, old[name].clean, old[name].foreign
-        # A machine that is named_only takes only the requests that name it (need.machine): one whose jobs need
-        # what the pool's other machines do not have (macOS: a project's Linux tools do not run there).
-        self.named = {m for m, mc in conf["machines"].items() if isinstance(mc, dict) and mc.get("named_only")}
-        self.pool = []
-        for m, mc in conf["machines"].items():
-            for name, c in (mc.get("slots") or {}).items() if mc.get("executor") else ():
-                try:
-                    self.pool.append((m, Slot(name, c)))
-                except (KeyError, TypeError, ValueError):
-                    self.log(f"machines.json 里 {m}/{name} 的写法不对，不算进机器池")
-
-    def git(self, *args, **kw):
-        return git(ROOT, *args, proxy=self.proxy, **kw)
-
-    def blob(self, obj):
-        return self.git("hash-object", "-w", "--stdin", input=json.dumps(obj, ensure_ascii=False)).strip()
-
-    # -- measuring -------------------------------------------------------------------------------------
-
-    def sample(self):
-        t = time.time()
-        self.samples.append((t, cpu_times()))
-        while self.samples[0][0] < t - WINDOW - TICK:
-            self.samples.popleft()
-        for slot in self.slots.values():
-            if not slot.job and (self.busy(slot, BURST) or 0) >= BUSY_MAX:
-                slot.foreign = t
-
-    def busy(self, slot, window=WINDOW):
-        """Busy share of the slot's threads since our own job left it (at most the last minute); None: too short."""
-        t1, b = self.samples[-1]
-        since = max(t1 - window, slot.clean)
-        first = next((s for s in self.samples if s[0] >= since), None)
-        if first is None or t1 - first[0] < MIN_WINDOW:
-            return None
-        a = first[1]
-        if DARWIN:
-            return self.share_busy(slot, a, b)
-        total = sum(b[c][0] - a[c][0] for c in slot.cpus if c in a and c in b)
-        idle = sum(b[c][1] - a[c][1] for c in slot.cpus if c in a and c in b)
-        return 1 - idle / total if total > 0 else None
-
-    def share_busy(self, slot, a, b):
-        """(macOS) No thread is pinned, so a slot has no CPUs of its own, only a share of the machine's: as many
-        CPUs as it has threads. Its busy share is what the machine's load takes of that share after filling the CPUs
-        outside the slots and the shares of the other slots that run a job."""
-        cpus = [c for c in b if c in a]
-        total = sum(b[c][0] - a[c][0] for c in cpus)
-        idle = sum(b[c][1] - a[c][1] for c in cpus)
-        if total <= 0:
-            return None
-        load = len(cpus) * (1 - idle / total)
-        room = len(cpus) - sum(len(s.cpus) for s in self.slots.values())
-        room += sum(len(s.cpus) for s in self.slots.values() if s is not slot and s.job and s.job["kind"] == "job")
-        return min(1.0, max(0.0, load - max(0, room)) / max(1, len(slot.cpus)))
-
-    def containers(self):
-        if not any(s.container for s in self.slots.values()):
-            return
-        if time.time() - self.boxes_at < 30:
-            return
-        self.boxes_at = time.time()
-        for mode in ([self.incus] if self.incus else []) + ["direct", "sg"]:
-            try:
-                r = subprocess.run(wrap(mode, ["list", "--format", "json"]), capture_output=True, text=True, timeout=30)
-            except (OSError, subprocess.TimeoutExpired):
-                continue
-            if r.returncode == 0:
-                self.incus = mode
-                self.boxes = {c["name"] for c in json.loads(r.stdout) if c.get("status") == "Running"}
-                return
-        self.boxes = set()
-
-    def state(self, slot):
-        if slot.job:
-            return slot.job["kind"]
-        if any(j["slot"] == slot.name for j, _ in self.claiming.values()):
-            return "claiming"
-        if slot.container and slot.container not in self.boxes:
-            return "off"
-        b = self.busy(slot)
-        if b is None:
-            return "warming"
-        # Somebody who runs on the slot's CPUs directly has pauses: a quiet minute does not make the slot free.
-        recent = self.mconf.get("shared") and time.time() - slot.foreign < QUIET
-        return "foreign" if b >= BUSY_MAX or recent else "free"
-
-    def write_state(self):
-        slots = {}
-        for s in self.slots.values():
-            b = self.busy(s)
-            d = slots[s.name] = {"state": self.state(s), "busy": None if b is None else round(b, 3), "dir": s.dir}
-            j = s.job
-            if j:
-                d["job"] = {k: j["req"].get(k) for k in ("id", "kind", "who", "project", "commit", "cmd", "prio")}
-                d["job"].update(start=j["start"], until=j.get("until"))
-        jdump(os.path.join(self.dir, "state.json"),
-              {"machine": self.machine, "at": int(time.time()), "pid": os.getpid(), "poll": int(self.last_poll),
-               "queued": self.queued, "memcap": "container" if any(s.container for s in self.slots.values())
-               else "systemd" if self.unit_ok else "watch" if DARWIN else "none", "slots": slots,
-               "jobs": self.held()})
-
-    def held(self):
-        return sorted(set(self.jobs) | set(self.claiming) | set(self.unreported) | set(self.abandoned))
-
-    # -- the hub ---------------------------------------------------------------------------------------
-
-    def ls(self, *patterns):
-        out = collections.defaultdict(dict)
-        for line in self.git("ls-remote", "origin", *patterns, timeout=40).splitlines():
-            sha, ref = line.split("\t")
-            _, kind, rid = ref.split("/", 2)
-            out[kind][rid] = sha
-        return out
-
-    def request(self, rid, sha):
-        """(request, why it cannot be served or None) of a q blob; GitError when the blob cannot be read now."""
-        if sha not in self.blobs:
-            try:
-                text = self.git("cat-file", "blob", sha)
-            except GitError:
-                self.git("fetch", "-q", "--no-tags", "--no-write-fetch-head", "--prune", "origin", "+refs/q/*:refs/q/*")
-                text = self.git("cat-file", "blob", sha)
-            try:
-                r = json.loads(text)
-                why = problem(r, rid)
-            except Exception as e:
-                r, why = None, f"不是 JSON（{type(e).__name__}）"
-            self.blobs[sha] = (r, why)
-        return self.blobs[sha]
-
-    def fits(self, req, slot):
-        need = req.get("need", {})
-        return (set(need) <= set(NEEDS) and set(need.get("tags", [])) <= TAGS
-                and need.get("slot") in (None, slot.name) and need.get("threads", 0) <= len(slot.cpus)
-                and need.get("mem_gb", 0) * 2 ** 30 <= slot.mem and (not need.get("gpu") or slot.gpu))
-
-    def eligible(self, req):
-        need = req.get("need", {})
-        if need.get("machine") not in (None, self.machine):
             return False
-        if self.machine in self.named and need.get("machine") != self.machine:
-            return False
-        if req["kind"] == "job" and req.get("project") not in self.projects:
-            return False
-        return any(self.fits(req, s) for s in self.slots.values())
+    return pid_alive(launch.get("pid", 0), launch.get("ticks")) or fresh(os.path.join(rundir, "alive"))
 
-    def pool_fits(self, req):
-        if req["kind"] == "job" and req["project"] not in self.projects:
-            return False
-        machine = req.get("need", {}).get("machine")
-        return any((machine == m or machine is None and m not in self.named) and self.fits(req, s)
-                   for m, s in self.pool)
 
-    def current(self):
-        """Whether this executor may judge that the pool has no slot for a request: it runs its clone's version of
-        this file, and the clone's machines.json is the one on the hub's main (a clone behind does not know newer
-        machines and projects)."""
-        path = os.path.join(ROOT, "machines.json")
-        if os.stat(path).st_mtime_ns != self.conf_stamp:
-            # The file changed since load_conf read it (a pull a moment ago): the pool this executor judges by is
-            # the old one, and a request for a machine the new file adds would get a 99. The next round has it.
-            return False
-        key = (self.main, os.stat(path).st_mtime_ns)
-        if key != self.current_key:
-            try:
-                ok = bool(self.main) and (self.git("rev-parse", "-q", "--verify", f"{self.main}:machines.json").strip()
-                                          == self.git("hash-object", path).strip())
-            except GitError:
-                ok = False
-            if not ok and self.current_ok is not None:
-                self.log("本机 clone 的 machines.json 和中枢 main 上的不一样（clone 落后？），先不判排不上的请求")
-            self.current_key, self.current_ok = key, ok
-        return self.current_ok and self.file_stamp() == self.stamp
-
-    def blind(self, secs):
-        """The time this executor could not read the hub is not time another machine was silent."""
-        self.seen = {k: (sha, s + secs) for k, (sha, s) in self.seen.items()}
-        self.run_seen = {rid: s + secs for rid, s in self.run_seen.items()}
-        self.dead = {rid: s + secs for rid, s in self.dead.items()}
-        if self.fails:
-            self.log(f"中枢回来了：{minutes(secs)}没读到它，这段时间不算进别的机器没有心跳的时长")
-
-    def hub(self):
-        refs = self.ls("refs/q/*", "refs/run/*", "refs/cancel/*", "refs/hb/*", "refs/alive/*", "refs/heads/main")
-        q, run, cancel = refs["q"], refs["run"], refs["cancel"]
-        t = time.time()
-        if self.last_poll and t - self.last_poll > 2 * POLL:
-            self.blind(t - self.last_poll - POLL)
-        self.last_poll, self.main = t, refs["heads"].get("main")
-        for kind in ("hb", "alive"):
-            for m, sha in refs[kind].items():
-                if self.seen.get((kind, m), (None,))[0] != sha:
-                    self.seen[(kind, m)] = (sha, t)
-        self.run_seen = {rid: self.run_seen.get(rid, t) for rid in run}
-        for step in (lambda: self.settle(run), lambda: self.follow(q, cancel), self.reports, lambda: self.reclaim(run),
-                     lambda: self.schedule(q, run, cancel), lambda: self.reap(q, run, cancel), self.sweep_due,
-                     lambda: self.alive(t)):
-            try:
-                step()
-            except GitError as e:
-                self.log(f"中枢：{e}")
-            except Exception:
-                self.log(traceback.format_exc())
-        self.blobs = {sha: r for sha, r in self.blobs.items() if sha in q.values()}
-        self.bad &= set(q.values())
-
-    def settle(self, run):
-        """Claims whose push ended without an answer: the hub's ref tells now."""
-        for rid, (job, sha) in list(self.claiming.items()):
-            del self.claiming[rid]
-            if run.get(rid) == sha:
-                self.start(job)
-            else:
-                if rid not in run:
-                    self.abandon(rid, sha)
-                shutil.rmtree(job["rundir"], ignore_errors=True)
-
-    def follow(self, q, cancel):
-        """A request whose q ref is gone: cancelled in the queue, judged not well formed, or judged lost. Only a
-        lost conclusion is replaced by the run's own; otherwise the run ends and the conclusion there stays."""
-        for rid, job in list(self.jobs.items()):
-            if rid in cancel:
-                self.cancel(job)
-            elif rid not in q and "keep" not in job:
-                sha = self.ls(f"refs/done/{rid}")["done"].get(rid)
-                d = self.conclusion(rid, sha) if sha else {}
-                job["keep"] = d.get("reason") == "lost"
-                if job["keep"]:
-                    self.log(f"{rid}：中枢上已经有别人写的结论（判它丢了），作业接着跑完，结论到时候替换它")
-                else:
-                    if sha:
-                        self.log(f"{rid}：中枢上已经有结论（{d.get('reason')}，{d.get('code')}），结束它，那个结论不动")
-                    self.cancel(job)
-
-    def conclusion(self, rid, sha):
-        if sha not in self.dones:
-            try:
-                text = self.git("cat-file", "blob", sha)
-            except GitError:
-                self.git("fetch", "-q", "--no-tags", "--no-write-fetch-head", "origin", f"+refs/done/{rid}:refs/cf/done/{rid}")
-                text = self.git("cat-file", "blob", sha)
-            try:
-                d = json.loads(text)
-            except ValueError:
-                d = None
-            if len(self.dones) > 1000:
-                self.dones.clear()
-            self.dones[sha] = d if isinstance(d, dict) else {}
-        return self.dones[sha]
-
-    def reports(self):
-        for job in list(self.unreported.values()):
-            self.report(job)
-
-    def schedule(self, q, run, cancel):
-        pending, t = [], time.time()
-        self.unfit = {rid: s for rid, s in self.unfit.items() if rid in q}
-        for rid, sha in q.items():
-            if (rid in run or rid in cancel or rid in self.jobs or rid in self.unreported or rid in self.claiming
-                    or sha in self.bad):
-                continue
-            try:
-                req, why = self.request(rid, sha)
-                if (not why and not self.pool_fits(req) and t - self.unfit.setdefault(rid, t) >= UNFIT
-                        and self.current()):
-                    why = "机器池里没有哪个槽位满足它（项目、机器、槽位、线程、内存、显卡）"
-                if why:
-                    self.reject(rid, sha, req, why, cancel)
-                elif self.eligible(req):
-                    pending.append(req)
-            except GitError as e:
-                self.log(f"{rid}：读不了请求，下一轮再看（{e}）")
-            except Exception:
-                self.bad.add(sha)
-                self.log(f"{rid}：处理请求出错，跳过\n" + traceback.format_exc())
-        self.queued = len(pending)
-        if not pending:
-            return
-        self.containers()
-        free = [s for s in self.slots.values() if self.state(s) == "free"]
-        key = lambda r: (PRIO[r["prio"]], self.served.get(r["who"], 0), r.get("submitted", 0), r["id"])
-        synth = lambda r: "synth" in r.get("need", {}).get("tags", [])
-        while free and pending:
-            pending.sort(key=key)
-            busy = any(synth(j["req"]) for j in self.jobs.values()) or any(synth(j["req"]) for j, _ in self.claiming.values())
-            for req in pending:
-                if busy and synth(req):
-                    continue
-                cands = [s for s in free if self.fits(req, s)]
-                if cands:
-                    break
-            else:
-                return
-            pending.remove(req)
-            slot = min(cands, key=lambda s: self.busy(s) or 0)
-            try:
-                if not self.claim(req, slot):
-                    continue
-            except GitError as e:
-                self.log(f"{req['id']}：认领失败（{e}）")
-                continue
-            except Exception:
-                self.log(f"{req['id']}：认领出错\n" + traceback.format_exc())
-                continue
-            free.remove(slot)
-            self.served[req["who"]] = time.time()
-            week = time.time() - KEEP
-            self.served = {w: t for w, t in self.served.items() if t > week}
-            jdump(os.path.join(self.dir, "served.json"), self.served)
-
-    def conclude(self, rid, done, **shas):
-        """A conclusion for a request no executor will report: pushed only while there is none, together with the
-        deletion of the request's refs as they were seen. False when somebody else was first."""
-        args = [f"--force-with-lease=refs/done/{rid}:"]
-        for kind, sha in shas.items():
-            if sha:
-                args.append(f"--force-with-lease=refs/{kind}/{rid}:{sha}")
-        refspecs = [f"{self.blob(done)}:refs/done/{rid}"] + [f":refs/{k}/{rid}" for k, sha in shas.items() if sha]
+def take(slotdir, rid):
+    """The slot's busy file for job rid; an error naming the job that has the slot."""
+    busy = os.path.join(slotdir, ".cf", "busy")
+    for _ in range(3):
         try:
-            self.git("push", "-q", "--atomic", *args, "origin", *refspecs)
-        except GitError as e:
-            if "stale info" in str(e) or "already exists" in str(e):
-                return False
-            raise
-        return True
-
-    def reject(self, rid, sha, r, why, cancel):
-        r = r if isinstance(r, dict) else {}
-        s = lambda k: r[k] if isinstance(r.get(k), str) else None
-        t = int(time.time())
-        d = {k: s(k) for k in ("kind", "project", "commit", "cmd", "prio")}
-        d.update(id=rid, who=s("who") or "?", submitted=r["submitted"] if num(r.get("submitted"), -1, 1e11) else None,
-                 machine=None, slot=None, start=None, end=t, secs=0, code=CODE_ERROR, reason="error",
-                 note=f"请求不合规：{why}（{self.machine} 判的）", last="", tail=[], log=None)
-        if self.conclude(rid, d, q=sha, cancel=cancel.get(rid)):
-            self.log(f"{rid}：请求不合规，记为没跑起来（{CODE_ERROR}）：{why}")
-        self.bad.add(sha)
-
-    def abandon(self, rid, sha):
-        self.abandoned[rid] = [sha, time.time()]
-        jdump(os.path.join(self.dir, "abandoned.json"), self.abandoned)
-
-    def reclaim(self, run):
-        """A claim this executor gave up on that the hub took after all: deleted, so the request is queued again."""
-        changed = False
-        for rid, (sha, t) in list(self.abandoned.items()):
-            if run.get(rid) == sha:
-                try:
-                    self.git("push", "-q", f"--force-with-lease=refs/run/{rid}:{sha}", "origin", f":refs/run/{rid}")
-                    self.log(f"{rid}：放弃了的认领后来落到了中枢上，删掉它，请求回到队列")
-                except GitError as e:
-                    if "stale info" not in str(e):
-                        self.log(f"{rid}：删不掉放弃了的认领，下一轮再删（{e}）")
-                        continue
-            elif time.time() - t < ABANDON_KEEP:
-                continue
-            del self.abandoned[rid]
-            changed = True
-        if changed:
-            jdump(os.path.join(self.dir, "abandoned.json"), self.abandoned)
-
-    def reap(self, q, run, cancel):
-        """Runs that no executor will conclude: of a machine whose heartbeat stopped, that is gone from machines.json
-        or whose executor does not hold them, or of this machine without a run directory. They get a lost conclusion."""
-        t = time.time()
-        mine = set(self.jobs) | set(self.claiming) | set(self.unreported) | set(self.abandoned)
-        odd = [rid for rid in run if rid not in mine and t - self.run_seen[rid] >= RUN_GRACE]
-        self.dead = {rid: s for rid, s in self.dead.items() if rid in odd}
-        if not odd or t - self.last_reap < REAP:
+            fd = os.open(busy, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            os.write(fd, rid.encode())
+            os.close(fd)
             return
-        self.last_reap = t
-        self.git("fetch", "-q", "--no-tags", "--no-write-fetch-head", "--prune", "origin", "+refs/run/*:refs/run/*",
-                 "+refs/hb/*:refs/hb/*", "+refs/alive/*:refs/alive/*")
-        beats = {}
-        for rid in odd:
-            r = self.runs.get(run[rid])
-            if r is None:
-                try:
-                    r = json.loads(self.git("cat-file", "blob", run[rid]))
-                except (GitError, ValueError):
-                    r = None
-                r = self.runs[run[rid]] = r if isinstance(r, dict) else {}
-            why = self.mine(rid, r) if r.get("machine") == self.machine else self.gone(rid, r.get("machine"), t, beats)
-            if why is None:
-                self.dead.pop(rid, None)
-            elif t - why[1] >= LOST:
-                self.lost(rid, r, why[0], q, run, cancel)
-        self.runs = {sha: r for sha, r in self.runs.items() if sha in run.values()}
-
-    def mine(self, rid, r):
-        slot = self.slots.get(r.get("slot"))
-        rundir = r.get("rundir") or (slot and os.path.join(slot.dir, ".cf", rid))
-        if rundir and self.adopt(rundir):
-            self.log(f"{rid}：认领记录指向本机，从 {rundir} 接着管")
-            return None
-        return "认领记录指向本机，本机没有这个作业", 0
-
-    def gone(self, rid, m, t, beats):
-        """(why, since when) a run of another machine looks dead; None while it looks alive. The machine speaks
-        through its heartbeat and, while that stands still, its executor's own signal; a machine this clone's
-        machines.json does not know is judged the same way."""
-        m = m if isinstance(m, str) else "?"
-        name = m if m in self.conf["machines"] else f"{m}（本机的 machines.json 里没有）"
-        live = [(kind, s) for kind in ("hb", "alive") for sha, s in [self.seen.get((kind, m), (None, 0))] if sha]
-        since = max([s for _, s in live] + [self.run_seen[rid]])
-        if t - since >= LOST:
-            return f"认领它的 {name} 已经 {minutes(t - since)}没有心跳", since
-        running = False
-        for kind, s in live:
-            if t - s >= LOST:
-                continue
-            if (kind, m) not in beats:
-                try:
-                    beats[(kind, m)] = json.loads(self.git("cat-file", "blob", f"refs/{kind}/{m}"))
-                except (GitError, ValueError):
-                    beats[(kind, m)] = None
-            b = beats[(kind, m)]
-            ex = b.get("executor") if kind == "hb" and isinstance(b, dict) else b
-            if isinstance(ex, dict):
-                running = True
-                if not isinstance(ex.get("jobs"), list) or rid in ex["jobs"]:
-                    return None
-        why = f"{name} 的 executor 没在管这个作业" if running else f"{name} 的 executor 没在跑"
-        return why, self.dead.setdefault(rid, t)
-
-    def alive(self, t):
-        """While this machine's heartbeat stands still, the executor tells the pool itself what it holds."""
-        held = self.held()
-        if not held or t - self.alive_at < SELF_BEAT:
-            return
-        hb = self.seen.get(("hb", self.machine), (None, self.started))[1]
-        if t - hb < SELF_BEAT:
-            return
-        sha = self.blob({"machine": self.machine, "at": int(t), "pid": os.getpid(), "jobs": held})
-        self.git("push", "-q", "-f", "origin", f"{sha}:refs/alive/{self.machine}")
-        if not self.alive_at or t - self.alive_at > 2 * SELF_BEAT:
-            self.log(f"本机的心跳 {minutes(t - hb)}没动（beat 停了或卡住）：executor 自己推存活信号")
-        self.alive_at = t
-
-    def lost(self, rid, r, why, q, run, cancel):
-        t = int(time.time())
-        d = {k: r.get(k) for k in ("kind", "who", "project", "commit", "cmd", "prio", "submitted", "machine", "slot", "start")}
-        d.update(id=rid, who=d["who"] if isinstance(d["who"], str) else "?", end=t,
-                 secs=t - int(r["start"]) if num(r.get("start"), 0, t) else 0, code=CODE_LOST, reason="lost",
-                 judged_by=self.machine, note=f"{why}；{self.machine} 判它丢了", last="", tail=[],
-                 log={"machine": r["machine"], "path": os.path.join(r["rundir"], "log")}
-                 if r.get("kind") == "job" and isinstance(r.get("rundir"), str) else None)
-        if self.conclude(rid, d, q=q.get(rid), run=run[rid], cancel=cancel.get(rid)):
-            self.log(f"{rid}：{why}，记为丢了（{CODE_LOST}）")
-
-    def run_blob(self, job):
-        req = job["req"]
-        d = {k: req.get(k) for k in ("id", "kind", "who", "project", "commit", "cmd", "prio", "submitted")}
-        d.update(machine=self.machine, slot=job["slot"], cpus=job["cpus"], container=job.get("container"),
-                 dir=job.get("tree") or job["dir"], rundir=job["rundir"], start=job["start"], until=job.get("until"))
-        return self.blob(d)
-
-    def claim(self, req, slot):
-        rid, t = req["id"], int(time.time())
-        rundir = os.path.join(slot.dir, ".cf", rid)
-        job = {"id": rid, "kind": req["kind"], "req": req, "machine": self.machine, "slot": slot.name, "cpus": slot.spec,
-               "container": slot.container, "dir": slot.dir, "rundir": rundir, "start": t}
-        if req["kind"] == "hold":
-            job["until"] = t + int(float(req["hours"]) * 3600)
-        else:
-            p = self.projects[req["project"]]
-            tree = os.path.join(slot.dir, req["project"])
-            home = os.path.join(slot.dir, ".home") if slot.container else os.path.expanduser("~")
-            env = {"HOME": home, "USER": self.user, "LOGNAME": self.user, "SHELL": "/bin/bash", "LANG": "C.UTF-8",
-                   "PATH": PATH, "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": os.path.join(tree, ".build", "tmp"),
-                   "CF_JOB": rid, "CF_MACHINE": self.machine, "CF_SLOT": slot.name, "CF_CPUS": slot.spec,
-                   "CF_THREADS": str(len(slot.cpus)), "CF_CORES": str(slot.cores),
-                   "CF_PROJECT": req["project"], "CF_COMMIT": req["commit"]}
-            if slot.mem:
-                env["CF_MEM_GB"] = str(slot.mem // 2 ** 30)
-            if self.mconf.get("deps_cache"):
-                env["CF_DEPS_CACHE"] = os.path.expanduser(self.mconf["deps_cache"])
-            env.update({k: str(v).replace("~/", os.path.expanduser("~/")) for k, v in self.mconf.get("env", {}).items()})
-            job.update(tree=tree, env=env, hub=p["hub"], seed=(p.get("seed") or {}).get(self.machine),
-                       seed_only=bool(p.get("seed_only")), proxy=self.proxy, uid=os.getuid(), gid=os.getgid(),
-                       mirror=os.path.join(BASE, "mirror", req["project"] + ".git"), mem=slot.mem)
-            if slot.container:
-                job["incus"] = self.incus
-            elif DARWIN:
-                job["agent"] = "cf." + rid       # the supervisor's launchd agent: its coalition is the job's processes
-            elif self.memory_cap():
-                job["unit"] = "cf-" + rid
-        sha = job["run"] = self.run_blob(job)
-        os.makedirs(rundir, exist_ok=True)
-        jdump(os.path.join(rundir, "job.json"), job)
-        try:
-            self.git("push", "-q", f"--force-with-lease=refs/run/{rid}:", "origin", f"{sha}:refs/run/{rid}")
-        except GitError as e:
+        except FileExistsError:
             try:
-                theirs = self.ls(f"refs/run/{rid}")["run"].get(rid)
-            except GitError:
-                self.claiming[rid] = (job, sha)      # no answer either way: the next poll tells
-                self.log(f"{rid}：认领的 push 没有回音，下一轮再看（{e}）")
-                return True
-            if theirs != sha:
-                if theirs is None:
-                    self.abandon(rid, sha)
-                shutil.rmtree(rundir, ignore_errors=True)
-                self.log(f"{rid}：" + ("别的 executor 先认领了" if theirs else f"认领没成（{e}）"))
-                return False
-        self.start(job)
-        return True
-
-    def memory_cap(self):
-        """systemd-run --user --scope gives a job its own cgroup with MemoryMax; without it a job is only pinned."""
-        if DARWIN:               # no cgroups: the supervisor adds the job's memory up itself
-            self.unit_ok = False
-        if self.unit_ok is None:
-            run = f"/run/user/{os.getuid()}"
-            if os.path.isdir(run):
-                os.environ.setdefault("XDG_RUNTIME_DIR", run)
-                os.environ.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={run}/bus")
+                other = open(busy).read().strip()
+            except OSError:
+                continue
+            if ID.fullmatch(other) and running(os.path.join(slotdir, ".cf", other)):
+                die(f"槽位正在跑作业 {other}（flow attach / flow cancel）")
             try:
-                r = subprocess.run(["systemd-run", "--user", "--scope", "--quiet", "--collect", "-p", "MemoryMax=1G",
-                                    "true"], capture_output=True, timeout=20)
-                self.unit_ok = r.returncode == 0
-            except (OSError, subprocess.TimeoutExpired):
-                self.unit_ok = False
-            if not self.unit_ok:
-                self.log("systemd-run --user 用不了：作业只用 taskset 钉核，没有内存上限")
-        return self.unit_ok
+                os.unlink(busy)
+            except OSError:
+                pass
+    die("槽位的 busy 文件拿不到")
 
-    def start(self, job):
-        rid, rundir = job["id"], job["rundir"]
-        slot = self.slots.get(job["slot"])
-        if job["kind"] == "job":
-            path = os.path.join(rundir, "executor")
-            with open(path + ".tmp", "w") as f:
-                f.write(self.source)
-            os.replace(path + ".tmp", path)
-            self.spawn(job)
-        else:
-            jdump(os.path.join(rundir, "launch.json"), {"hold": True})
-        self.jobs[rid] = job
-        if slot:
-            slot.job = job
-        req = job["req"]
-        self.log(f"{rid}：{job['slot']} <- {req['who']} " + (f"占用 {req['hours']} 小时" if job["kind"] == "hold"
-                                                              else f"{req['project']}@{req['commit'][:9]} {req['cmd']}"))
 
-    def spawn(self, job):
-        rundir = job["rundir"]
-        open(os.path.join(rundir, "spawn"), "w").close()
-        with open(os.path.join(rundir, "launch.log"), "ab") as out:
-            self.procs[job["id"]] = subprocess.Popen(
-                [sys.executable, os.path.join(rundir, "executor"), "_job", rundir], cwd=job["dir"],
-                stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+def sweep(slotdir):
+    """Run directories whose job ended more than KEEP ago."""
+    for rundir in glob.glob(os.path.join(slotdir, ".cf", "*")):
+        ex = jload(os.path.join(rundir, "exit.json"))
+        if ID.fullmatch(os.path.basename(rundir)) and ex and time.time() - ex.get("end", 0) > KEEP:
+            shutil.rmtree(rundir, ignore_errors=True)
 
-    def cancel(self, job):
-        if job["kind"] == "hold":
-            return self.finish(job, {"code": 0, "reason": "released", "end": time.time()})
-        path = os.path.join(job["rundir"], "cancel")
-        if not os.path.exists(path):
-            open(path, "w").close()
-            job["cancel_at"] = time.time()
-            self.log(f"{job['id']}：取消")
 
-    # -- watching the jobs (local files only) ------------------------------------------------------------
-
-    def watch(self):
-        t = time.time()
-        for rid, job in list(self.jobs.items()):
-            rundir = job["rundir"]
-            if job["kind"] == "hold":
-                if t >= job["until"]:
-                    self.finish(job, {"code": 0, "reason": "expired", "end": t})
-                continue
-            p = self.procs.get(rid)
-            if p:
-                p.poll()
-            ex = jload(os.path.join(rundir, "exit.json"))
-            if ex:
-                self.finish(job, ex)
-                continue
-            launch = jload(os.path.join(rundir, "launch.json"))
-            if not launch:
-                try:
-                    age = t - os.stat(os.path.join(rundir, "spawn")).st_mtime
-                except OSError:
-                    age = SPAWN
-                if p and p.returncode is None or age < SPAWN:
-                    continue
-                if not p and not job.get("respawned"):
-                    job["respawned"] = True
-                    self.log(f"{rid}：没有启动进程的记录（executor 在起它的时候被结束了），再起一个")
-                    self.spawn(job)
-                    continue
-                self.log(f"{rid}：启动进程没起来")
-                write_exit(rundir, CODE_LOST, "lost", "启动进程没起来")
-                continue
-            if not fresh(os.path.join(rundir, "alive")) and not pid_alive(launch.get("pid", 0), launch.get("ticks")):
-                self.log(f"{rid}：启动进程和监管进程都不在了，也没有结论")
-                write_exit(rundir, CODE_LOST, "lost", "启动进程和监管进程都不在了")
-            elif t - job.get("cancel_at", t) > CANCEL_KILL:
-                # The supervisor did not act on the cancel file: end the launcher, by its own PID.
-                if p and p.returncode is None:
-                    p.kill()
-                elif pid_alive(launch.get("pid", 0), launch.get("ticks")):
-                    os.kill(launch["pid"], signal.SIGKILL)
-                else:
-                    continue
-                self.log(f"{rid}：取消 {CANCEL_KILL} 秒后还在，结束启动进程")
-                job["cancel_at"] = t
-
-    def finish(self, job, ex):
-        rid, req, rundir = job["id"], job["req"], job["rundir"]
-        tail = tail_lines(os.path.join(rundir, "log")) if job["kind"] == "job" else []
-        done = {k: req.get(k) for k in ("id", "kind", "who", "project", "commit", "cmd", "prio", "submitted")}
-        done.update(machine=self.machine, slot=job["slot"], start=job["start"], end=int(ex["end"]),
-                    secs=int(ex["end"] - job["start"]), code=ex["code"], reason=ex["reason"], note=ex.get("note", ""),
-                    last=next((x for x in reversed(tail) if x.strip()), ""), tail=tail,
-                    log={"machine": self.machine, "path": os.path.join(rundir, "log")} if job["kind"] == "job" else None)
-        if job["kind"] == "job" and ex["code"] == 0:
-            done["share"] = self.share(job)
-        jdump(os.path.join(rundir, "done.json"), done)
-        if job.get("agent"):     # (macOS) what a job that lost its supervisor left in its coalition, and its agent
-            agent_kill(job, rundir)
-        del self.jobs[rid]
-        self.procs.pop(rid, None)
-        slot = self.slots.get(job["slot"])
-        if slot and slot.job is job:
-            slot.job, slot.clean = None, time.time()
-            self.sample()                      # the slot's busy window starts with this sample
-        self.kick = time.time() + MIN_WINDOW + 0.5
-        self.unreported[rid] = job
-        self.log(f"{rid}：结束，{done['reason']}，退出码 {done['code']}，{done['secs']} 秒")
-        self.report(job)
-
-    def share(self, job):
-        """What a job that ended with 0 left for other machines: every directory NAME of <tree>/.build/cf/share
-        becomes a commit without parents in the project's mirror (the directory is its tree), kept there by
-        refs/cf/share/NAME/<id>, and the directory goes. report pushes the commits to the project's hub under the
-        same refs, where `flow get` finds them. Returns {NAME: commit}."""
-        rid, mirror, shared = job["id"], job["mirror"], {}
-        root = os.path.join(job["tree"], ".build", "cf", "share")
+def cmd_start(a):
+    conf, m = load_conf(a.machine)
+    req = json.load(sys.stdin)
+    s = m.get("slots", {}).get(req.get("slot"))
+    if not s:
+        die(f"{a.machine} 上没有槽位 {req.get('slot')}（有 {'、'.join(m.get('slots', {}))}）")
+    if not (isinstance(req.get("commit"), str) and SHA.fullmatch(req["commit"])):
+        die("commit 不是 40 位的提交")
+    argv = req.get("argv")
+    if not (isinstance(argv, list) and argv and all(isinstance(x, str) for x in argv)):
+        die("argv 不是非空的字符串列表")
+    if not (isinstance(req.get("timeout"), int) and 0 < req["timeout"] <= TIMEOUT_MAX):
+        die(f"timeout 要在 1 到 {TIMEOUT_MAX} 秒之间")
+    slot, slotdir, project = req["slot"], slot_dir(req["slot"], s), req["project"]
+    os.makedirs(os.path.join(slotdir, ".cf"), exist_ok=True)
+    sweep(slotdir)
+    rid = new_id()
+    take(slotdir, rid)
+    try:
+        rundir = os.path.join(slotdir, ".cf", rid)
+        tree = os.path.join(slotdir, project)
+        user = pwd.getpwuid(os.getuid()).pw_name
+        home = os.path.join(slotdir, ".home") if s.get("container") else os.path.expanduser("~")
+        env = {"HOME": home, "USER": user, "LOGNAME": user, "SHELL": "/bin/bash", "LANG": "C.UTF-8", "PATH": PATH,
+               "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": os.path.join(tree, ".build", "tmp"),
+               "CF_JOB": rid, "CF_MACHINE": a.machine, "CF_SLOT": slot, "CF_CPUS": s["cpus"],
+               "CF_THREADS": str(len(cpu_list(s["cpus"]))), "CF_PROJECT": project, "CF_COMMIT": req["commit"]}
+        if s.get("mem"):
+            env["CF_MEM_GB"] = str(mem_bytes(s["mem"]) // 2 ** 30)
+        if m.get("deps_cache"):
+            env["CF_DEPS_CACHE"] = os.path.expanduser(m["deps_cache"])
         try:
-            names = sorted(os.listdir(root))
+            token = open(TOKEN).read().strip()
         except OSError:
-            return shared
-        index = os.path.join(job["rundir"], "share.index")
-        who = {f"GIT_{role}_{key}": value for role in ("AUTHOR", "COMMITTER")
-               for key, value in (("NAME", "curryflow"), ("EMAIL", "curryflow@localhost"))}
-        for name in names:
-            path = os.path.join(root, name)
-            if not SHARE.fullmatch(name) or os.path.islink(path) or not os.path.isdir(path):
-                self.log(f"{rid}：.build/cf/share/{name} 不是一个名字合规的目录，不共享")
-                continue
-            env = {**who, "GIT_DIR": mirror, "GIT_WORK_TREE": path, "GIT_INDEX_FILE": index}
-            try:
-                if os.path.exists(index):
-                    os.remove(index)
-                git(path, "add", "-A", "-f", ".", env=env, timeout=600)
-                tree = git(path, "write-tree", env=env, timeout=600).strip()
-                commit = git(path, "commit-tree", tree, "-m", f"{name} (job {rid} on {self.machine})", env=env).strip()
-                git(mirror, "update-ref", f"refs/cf/share/{name}/{rid}", commit)
-                shared[name] = commit
-            except (GitError, OSError) as e:
-                self.log(f"{rid}：.build/cf/share/{name} 没能做成提交，不共享（{e}）")
-        shutil.rmtree(root, ignore_errors=True)
-        return shared
-
-    def push_share(self, job, shared):
-        """The commits of share to the project's hub; an earlier job's directory of the same name goes with the same
-        push (here and on the hub): a name has one content."""
-        rid, mirror, hub = job["id"], job["mirror"], job["hub"]
-        mine = {f"refs/cf/share/{name}/{rid}" for name in shared}
-        there = git(mirror, "ls-remote", hub, *[f"refs/cf/share/{name}/*" for name in shared], proxy=self.proxy)
-        older = [ref for ref in (line.split("\t")[1] for line in there.splitlines())
-                 if SHAREREF.fullmatch(ref) and ref not in mine]
-        git(mirror, "push", "-q", "-f", hub, *[f"{commit}:refs/cf/share/{name}/{rid}" for name, commit in shared.items()],
-            *[f":{ref}" for ref in older], proxy=self.proxy, bulk=True, timeout=1800)
-        for line in git(mirror, "for-each-ref", "--format=%(refname)",
-                        *[f"refs/cf/share/{name}/" for name in shared]).splitlines():
-            if line not in mine:
-                git(mirror, "update-ref", "-d", line)
-        self.log(f"{rid}：共享了 {' '.join(sorted(shared))}（项目中枢的 refs/cf/share/<名字>/{rid}）")
-
-    def report(self, job):
-        """The conclusion replaces nothing but a lost one; a conclusion already there otherwise stays. What the job
-        shared is on the project's hub before its conclusion is on the pool's."""
-        rid, rundir = job["id"], job["rundir"]
+            token = ""
+        if token:             # what provision fetches from GitHub, where the job runs (no ssh key in a container)
+            env.update({"GH_TOKEN": token, "GIT_CONFIG_COUNT": "2",
+                        "GIT_CONFIG_KEY_0": f"url.https://x-access-token:{token}@github.com/.insteadOf",
+                        "GIT_CONFIG_VALUE_0": "git@github.com:",
+                        "GIT_CONFIG_KEY_1": f"url.https://x-access-token:{token}@github.com/.insteadOf",
+                        "GIT_CONFIG_VALUE_1": "ssh://git@github.com/"})
+        env.update({k: str(v).replace("~/", os.path.expanduser("~/")) for k, v in m.get("env", {}).items()})
+        job = {"id": rid, "machine": a.machine, "slot": slot, "cpus": s["cpus"], "container": s.get("container"),
+               "dir": slotdir, "tree": tree, "rundir": rundir, "start": int(time.time()), "env": env,
+               "uid": os.getuid(), "gid": os.getgid(), "mirror": os.path.join(BASE, "mirror", project + ".git"),
+               "req": {k: req.get(k) for k in ("project", "commit", "repo", "argv", "timeout", "clean", "who")}}
+        job["req"]["cmd"] = argv[0] if len(argv) == 1 else shlex.join(argv)
+        if s.get("container"):
+            job["incus"] = incus_mode()
+        elif DARWIN:
+            job["agent"] = "cf." + rid       # the supervisor's launchd daemon: its coalition is the job's processes
+        os.makedirs(rundir)
+        old = os.umask(0o077)                # job.json carries the token
         try:
-            shared = (jload(os.path.join(rundir, "done.json")) or {}).get("share")
-            if shared and not os.path.exists(os.path.join(rundir, "shared")):
-                self.push_share(job, shared)
-                open(os.path.join(rundir, "shared"), "w").close()
-            refs = self.ls(f"refs/q/{rid}", f"refs/run/{rid}", f"refs/cancel/{rid}", f"refs/done/{rid}")
-            old = refs["done"].get(rid)
-            gone = [f":refs/{kind}/{rid}" for kind in ("q", "run", "cancel") if rid in refs[kind]]
-            if old and self.conclusion(rid, old).get("reason") != "lost":
-                if gone:
-                    self.git("push", "-q", "--atomic", "origin", *gone)
-                self.log(f"{rid}：中枢上已经有结论，留着它，不推自己的")
-            else:
-                sha = self.blob(jload(os.path.join(rundir, "done.json")))
-                self.git("push", "-q", "--atomic", f"--force-with-lease=refs/done/{rid}:{old or ''}", "origin",
-                         f"{sha}:refs/done/{rid}", *gone)
-        except GitError as e:
-            return self.log(f"{rid}：结论没推上去，下一轮再推（{e}）")
-        open(os.path.join(rundir, "reported"), "w").close()
-        del self.unreported[rid]
-
-    def adopt(self, rundir):
-        """A run directory an earlier executor process left: a running job, a hold, an unreported end or a claim."""
-        job = jload(os.path.join(rundir, "job.json"))
-        if not job or job.get("machine") != self.machine or os.path.exists(os.path.join(rundir, "reported")):
-            return False
-        rid, slot = job["id"], self.slots.get(job["slot"])
-        if rid in self.jobs or rid in self.claiming or rid in self.unreported:
-            return True
-        if os.path.exists(os.path.join(rundir, "done.json")):
-            self.unreported[rid] = job
-        elif any(os.path.exists(os.path.join(rundir, f)) for f in ("launch.json", "spawn")):
-            self.jobs[rid] = job
-            if slot:
-                slot.job = job
-            self.log(f"{rid}：接着等（{job['slot']}）")
-        else:
-            self.claiming[rid] = (job, job["run"])
-        return True
-
-    def recover(self):
-        for slot in self.slots.values():
-            for path in glob.glob(os.path.join(slot.dir, ".cf", "*", "job.json")):
-                self.adopt(os.path.dirname(path))
-
-    def sweep_due(self):
-        if time.time() - self.last_sweep >= SWEEP:
-            self.last_sweep = time.time()
-            self.sweep()
-
-    def sweep(self):
-        """Conclusions and run directories 7 days after the end, cancel refs nobody will read, temporary refs of the
-        project hubs that no request needs any more."""
-        refs = self.ls("refs/q/*", "refs/run/*", "refs/cancel/*", "refs/done/*")
-        t = time.time()
-        old = t - KEEP
-        own = {}
-        for slot in self.slots.values():
-            for mark in glob.glob(os.path.join(slot.dir, ".cf", "*", "reported")):
-                rundir = os.path.dirname(mark)
-                end = jload(os.path.join(rundir, "done.json"), {}).get("end")
-                own[os.path.basename(rundir)] = (rundir, end if num(end, 0, 1e11) else os.stat(mark).st_mtime)
-        later = [rid for rid, sha in refs["done"].items()
-                 if rid not in own and sha not in self.ends and (id_time(rid) or 0) < old]
-        if later:
-            self.git("fetch", "-q", "--no-tags", "--no-write-fetch-head", "--prune", "origin",
-                     "+refs/done/*:refs/cf/done/*")
-            for rid in later:
-                try:
-                    end = json.loads(self.git("cat-file", "blob", refs["done"][rid])).get("end")
-                except (GitError, ValueError, AttributeError):
-                    end = None
-                self.ends[refs["done"][rid]] = end if num(end, 0, 1e11) else id_time(rid) or 0
-        self.ends = {sha: e for sha, e in self.ends.items() if sha in refs["done"].values()}
-        gone, swept = [], set()
-        for rid, sha in refs["done"].items():
-            if (own[rid][1] if rid in own else self.ends.get(sha, t)) < old:
-                gone += [f"--force-with-lease=refs/done/{rid}:{sha}", f":refs/done/{rid}"]
-                swept.add(rid)
-        gone += [f":refs/cancel/{rid}" for rid in refs["cancel"]
-                 if rid not in refs["q"] and rid not in refs["run"] and (rid not in refs["done"] or rid in swept)]
-        for i in range(0, len(gone), 100):
-            try:
-                self.git("push", "-q", "origin", *gone[i:i + 100])
-            except GitError as e:
-                self.log(f"清理没推上去：{e}")
-        for rid, (rundir, end) in own.items():
-            if end < old:
-                shutil.rmtree(rundir, ignore_errors=True)
-        self.sweep_tmp(refs)
-
-    def sweep_tmp(self, refs):
-        keep = set(refs["q"]) | set(refs["run"])
-        keep |= {r.get("ref") for r, _ in self.blobs.values() if isinstance(r, dict)}
-        for name, p in self.projects.items():
-            try:
-                out = git(ROOT, "ls-remote", p["hub"], "refs/cf/tmp/*", "refs/cf/share/*", proxy=self.proxy)
-                stale = []
-                for line in out.splitlines():
-                    sha, ref = line.split("\t")
-                    rid = ref[len("refs/cf/tmp/"):]
-                    share = SHAREREF.fullmatch(ref)
-                    if TMPREF.fullmatch(ref) and rid not in keep and ref not in keep and (
-                            id_time(rid) or 0) < time.time() - TMP_KEEP:
-                        stale.append((ref, sha))
-                    elif share and (id_time(share.group(1)) or 0) < time.time() - SHARE_KEEP:
-                        stale.append((ref, sha))
-                if stale:
-                    git(ROOT, "push", "-q", *[f"--force-with-lease={ref}:{sha}" for ref, sha in stale], p["hub"],
-                        *[f":{ref}" for ref, _ in stale], proxy=self.proxy)
-                    self.log(f"清掉项目 {name} 中枢上没人用的临时 ref 和过期的共享目录：{' '.join(ref for ref, _ in stale)}")
-            except (GitError, KeyError, TypeError, ValueError) as e:
-                self.log(f"清理项目 {name} 的临时 ref 没成：{e}")
-
-    # -- the loop --------------------------------------------------------------------------------------
-
-    def reexec(self):
-        """A new version of this file takes over when no job is running (holds are picked up from their directory)."""
-        if any(j["kind"] == "job" for j in self.jobs.values()) or self.claiming or self.unreported:
-            return
-        stamp = None
-        try:
-            stamp = self.file_stamp()
-            if stamp == self.stamp or time.time() - stamp[0] / 1e9 < 5:
-                return
-            whole(self.me)
-        except (OSError, SyntaxError, ValueError) as e:
-            if stamp != self.bad_stamp:
-                self.bad_stamp = stamp
-                self.log(f"新版本先不换：{e}")
-            return
-        self.log("文件变了，重新执行")
-        sys.stdout.flush()
-        os.execv(sys.executable, [sys.executable, self.me, *sys.argv[1:]])
-
-    def run(self):
-        self.log(f"executor {self.machine} 启动，pid {os.getpid()}")
-        if any(not s.container for s in self.slots.values()):
-            self.memory_cap()
-        self.sample()
-        self.recover()
-        next_poll = 0
-        while True:
-            t = time.time()
-            try:
-                self.load_conf()
-                self.sample()
-                self.containers()
-                self.watch()
-                kicked = self.kick and t >= self.kick and not self.fails   # a slot was left a moment ago
-                if t >= next_poll or kicked:
-                    if kicked:
-                        self.kick = 0
-                    try:
-                        self.hub()
-                        self.fails, next_poll = 0, t + POLL
-                    except GitError as e:
-                        self.fails += 1
-                        next_poll = t + min(POLL_MAX, POLL * 2 ** self.fails)
-                        self.log(f"中枢：{e}（{int(next_poll - t)} 秒后再试）")
-                self.write_state()
-                self.reexec()
-            except Exception:
-                self.log(traceback.format_exc())
-            time.sleep(max(0.2, TICK - (time.time() - t)))
+            jdump(os.path.join(rundir, "job.json"), job)
+        finally:
+            os.umask(old)
+        shutil.copy(os.path.abspath(__file__), os.path.join(rundir, "executor"))
+        subprocess.Popen([sys.executable, os.path.join(rundir, "executor"), "_job", rundir], cwd=slotdir,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except BaseException:
+        release({"id": rid, "dir": slotdir})
+        raise
+    print(json.dumps({"id": rid, "rundir": rundir}))
 
 
-def whole(path):
-    """The text of a version of this file that is complete: it compiles and ends where this file ends."""
-    with open(path) as f:
-        src = f.read()
-    compile(src, path, "exec")
-    if not src.endswith('\nif __name__ == "__main__":\n    main()\n'):
-        raise ValueError("文件不完整（结尾不对）")
-    return src
+def find(m, rid):
+    for name, s in m.get("slots", {}).items():
+        rundir = os.path.join(slot_dir(name, s), ".cf", rid)
+        if os.path.isfile(os.path.join(rundir, "job.json")):
+            return rundir
+    die(f"这台机器上没有作业 {rid}")
 
 
-def open_log(path):
-    if os.path.exists(path) and os.path.getsize(path) > EXEC_LOG_MAX:
-        os.replace(path, path + ".1")
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-    os.dup2(fd, 1)
-    os.dup2(fd, 2)
-    os.close(fd)
+def summary(rundir, n=40):
+    job, ex = jload(os.path.join(rundir, "job.json")) or {}, jload(os.path.join(rundir, "exit.json"))
+    req = job.get("req", {})
+    d = {"id": job.get("id"), "machine": job.get("machine"), "slot": job.get("slot"), "project": req.get("project"),
+         "commit": req.get("commit"), "cmd": req.get("cmd"), "who": req.get("who"), "start": job.get("start"),
+         "log": os.path.join(rundir, "log")}
+    tail = tail_lines(d["log"], n)
+    d["last"] = next((x for x in reversed(tail) if x.strip()), "")
+    if ex:
+        d.update(code=ex["code"], reason=ex["reason"], note=ex.get("note", ""), end=int(ex["end"]),
+                 secs=int(ex["end"] - job.get("start", ex["end"])), tail=tail)
+    else:
+        d["running"] = running(rundir)
+    return d
+
+
+def alerts(machine):
+    return (jload(os.path.join(BASE, "exec", machine, "alerts.json")) or {}).get("alerts") or []
+
+
+def cmd_wait(a):
+    conf, m = load_conf(a.machine)
+    rundir = find(m, a.id)
+    exit_json, seen = os.path.join(rundir, "exit.json"), set()
+    while not os.path.exists(exit_json):
+        for al in alerts(a.machine):
+            key = (al.get("what"), al.get("since"))
+            if key not in seen:
+                seen.add(key)
+                print("CF-ALERT " + json.dumps(al, ensure_ascii=False), flush=True)
+        if not running(rundir):
+            write_exit(rundir, CODE_LOST, "lost", "启动进程和监管进程都不在了，也没有结论")
+            break
+        time.sleep(WAIT_STEP)
+    print("CF-END " + json.dumps(summary(rundir), ensure_ascii=False), flush=True)
+
+
+def cmd_cancel(a):
+    conf, m = load_conf(a.machine)
+    rundir = find(m, a.id)
+    if not os.path.exists(os.path.join(rundir, "exit.json")):
+        open(os.path.join(rundir, "cancel"), "w").close()
+        t0 = time.time()
+        while not os.path.exists(os.path.join(rundir, "exit.json")) and time.time() - t0 < 150:
+            if not running(rundir):
+                write_exit(rundir, CODE_CANCEL, "cancelled", "取消时启动进程和监管进程都已不在")
+            time.sleep(1)
+    print("CF-END " + json.dumps(summary(rundir), ensure_ascii=False), flush=True)
+
+
+def cmd_ls(a):
+    conf, m = load_conf(a.machine)
+    out = []
+    for name, s in m.get("slots", {}).items():
+        for rundir in glob.glob(os.path.join(slot_dir(name, s), ".cf", "*")):
+            if ID.fullmatch(os.path.basename(rundir)) and os.path.isfile(os.path.join(rundir, "job.json")):
+                d = summary(rundir, 5)
+                d.pop("tail", None)
+                out.append(d)
+    out.sort(key=lambda d: d["id"] or "", reverse=True)
+    print(json.dumps({"machine": a.machine, "jobs": out, "alerts": alerts(a.machine)}, ensure_ascii=False))
+
+
+def cmd_log(a):
+    conf, m = load_conf(a.machine)
+    for line in tail_lines(os.path.join(find(m, a.id), "log"), a.n, cap=max(65536, a.n * 400)):
+        print(line)
+
+
+def cmd_mirror(a):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", a.project):
+        die(f"项目名不对：{a.project!r}")
+    mirror = os.path.join(BASE, "mirror", a.project + ".git")
+    ensure_mirror(mirror)
+    print(mirror)
 
 
 def main():
-    globals().update(json.loads(os.environ.get("CF_POOL_TUNE") or "{}"))
-    ap = argparse.ArgumentParser()
+    if len(sys.argv) == 3 and sys.argv[1] in ("_job", "_sup", "_agent"):
+        return {"_job": job_main, "_sup": sup_main, "_agent": agent_main}[sys.argv[1]](sys.argv[2])
+    if len(sys.argv) == 4 and sys.argv[1] == "_sup" and sys.argv[2] == "--detach":
+        return sup_main(sys.argv[3], detach=True)
+    ap = argparse.ArgumentParser(prog="executor", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    r = sub.add_parser("run")
-    r.add_argument("--machine", required=True)
-    sub.add_parser("_job").add_argument("rundir")
-    s = sub.add_parser("_sup")
-    s.add_argument("--detach", action="store_true")
-    s.add_argument("rundir")
-    sub.add_parser("_agent").add_argument("rundir")
+    for name in ("start", "wait", "ls", "log", "cancel"):
+        p = sub.add_parser(name)
+        p.add_argument("--machine", required=True)
+        if name in ("wait", "log", "cancel"):
+            p.add_argument("id")
+        if name == "log":
+            p.add_argument("-n", type=int, default=40)
+    sub.add_parser("mirror").add_argument("--project", required=True)
     a = ap.parse_args()
-    if a.cmd == "_job":
-        return job_main(a.rundir)
-    if a.cmd == "_agent":
-        sys.exit(agent_main(a.rundir))
-    if a.cmd == "_sup":
-        return sup_main(a.rundir, a.detach)
-    d = os.path.join(BASE, "exec", a.machine)
-    os.makedirs(d, exist_ok=True)
-    path = os.path.join(d, "executor.log")
-    open_log(path)
-    Executor(a.machine, path).run()
+    return {"start": cmd_start, "wait": cmd_wait, "ls": cmd_ls, "log": cmd_log, "cancel": cmd_cancel,
+            "mirror": cmd_mirror}[a.cmd](a)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

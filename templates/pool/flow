@@ -1,69 +1,47 @@
 #!/usr/bin/env python3
-"""A slot of the machine pool in two commands: run a job and wait for its conclusion, or hold a slot for some hours.
+"""Runs a job in a slot that was agreed on beforehand: over ssh, on the machine's executor; nothing is queued.
 
-usage: flow run --project P [--commit REV | --here] [--threads N] [--mem G] [--gpu] [--machine M] [--slot S]
-                [--prio gate|normal|night] [--timeout SECONDS] [--tag synth] [--clean] [--no-wait] -- COMMAND...
-       flow hold --hours N [--machine M] [--slot S] [--threads N] [--mem G] [--gpu] [--no-wait]
-       flow release ID | flow cancel ID [--no-wait]
-       flow ls [--all] [--json]
-       flow wait ID
-       flow get --project P NAME DIR
+usage: flow run --machine M --slot S --project P [--commit REV | --here] [--timeout SECONDS] [--clean] [--no-wait]
+                -- COMMAND...
+       flow wait [M:]ID          (also: flow attach) follow a job to its end
+       flow cancel [M:]ID
+       flow log [M:]ID [-n N]
+       flow ls [--machine M]...
 
-run    queues COMMAND for the project at a commit: REV is a commit, a branch or a ref of the project's hub (default
-       main), or anything the current repository resolves; it is sent as a full commit id;
-       --here takes the current repository's HEAD and, when no branch of the hub ends there, pushes it to a temporary
-       ref of the hub (no branch is created; the executor deletes the ref once it has the commit). A COMMAND of one
-       word is run by bash -c, so "make -j && ctest" works. flow waits for the conclusion, prints the last 40 lines of
-       the log and exits with the job's exit code (124 timeout, 143 cancelled, 99 the executor could not start it or
-       the request was not well formed, 255 lost); with --no-wait it prints the id and returns. When it fails before the
-       request is queued (or is interrupted), it deletes the temporary ref it pushed.
-hold   takes a slot out of scheduling for N hours (at most 8) and prints machine, slot, CPUs, container and
-       directory; the slot comes back at release or when the hours are over.
-ls     the queue, what runs, the latest conclusions.
-wait   follows a request to its conclusion. While an executor has it, the heartbeat of that machine (or, while beat
-       is stopped, its executor's own signal) has to move and list the request; without that for 20 minutes of this
-       client reading the hub, wait gives up with exit code 254 (the job may still run, its conclusion comes back with
-       the machine).
+run    starts COMMAND in slot S of machine M for project P at a commit and waits for its end: it prints the machine's
+       alerts (memory, swapping) as they come, then the last 40 lines of the log, and exits with the job's exit code
+       (124 timeout, 143 cancelled, 99 it could not be started, 255 lost). A slot runs one job: a busy slot is an
+       error. REV is a commit, or a branch or tag of the project's GitHub repository (default main); --here takes the
+       current repository's HEAD and pushes it straight into the machine's mirror (no branch on GitHub is needed).
+       A COMMAND of one word is run by bash -c, so "make -j && ctest" works. With --no-wait it prints M:ID and
+       returns; the job does not depend on this command or its ssh connection.
+wait   follows a job again (after --no-wait, or when the connection broke); interrupting it leaves the job running.
+ls     the jobs of each machine's slots (running and the latest ended) and the machines' alerts.
+An ID without "M:" is looked for on every machine.
 
-get    fetches what a job shared into the new directory DIR: a job that ends with 0 and leaves directories in
-       .build/cf/share of its work tree has each of them, by its name, on the project's hub before its conclusion
-       (the executor pushes them; a name has one content, the latest job's; they stay 14 days). Exit code 3 when the
-       hub has no NAME. It needs this machine's access to the hub, which a slot in a container does not have.
-
-It runs from a clone of the pool repository (machines.git, on every machine in ~/curryflow/machines): requests are
-JSON blobs behind refs/q/<id> there, the executors answer with refs/run/<id> and refs/done/<id> (see executor).
-Who asks is $CF_WHO, else user@host:branch.
+It runs from a clone of the pool repository (~/curryflow/machines): machines.json names the machines (each reached by
+`ssh <name>`, or the ssh host its "ssh" names for the machine flow runs on, so this host's ~/.ssh/config has an
+entry for each) and the projects (their GitHub "repo"). On the machine itself it calls the executor directly. Who asks is $CF_WHO, else user@host.
 """
 import argparse
-import datetime
+import concurrent.futures
 import getpass
 import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import unicodedata
 
 ROOT = os.path.dirname(os.path.realpath(__file__))
 SHA = re.compile(r"[0-9a-f]{40}")
-REF = re.compile(r"(?!.*(?:\.\.|@\{|//|/\.|/-|\.lock(?:/|$)))refs/[^\x00-\x20\x7f~^:?*\[\\]+(?<![./])")
-HOLD_MAX_HOURS = 8
 TIMEOUT_MAX = 86400
-HB_LOST, HB_CHECK, WAIT_STEP = 1200, 120, 4
-CODE_GONE = 254
-CODE_NONE = 3
-SHARE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
-SHAREREF = re.compile(r"refs/cf/share/[A-Za-z0-9][A-Za-z0-9._-]{0,99}/(\d{6}-\d{6}-[0-9a-f]{3,8})")
-VERDICT = {"exit": "结束", "timeout": "超时", "cancelled": "已取消", "error": "没跑起来", "lost": "丢了",
-           "expired": "占用到期", "released": "占用已放"}
-
-
-class GitError(Exception):
-    pass
+RETRY = 15
+VERDICT = {"exit": "结束", "timeout": "超时", "cancelled": "已取消", "error": "没跑起来", "lost": "丢了"}
+SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15",
+       "-o", "ServerAliveCountMax=4"]
 
 
 def die(text):
@@ -74,241 +52,122 @@ def note(text):
     print(f"[flow] {text}", file=sys.stderr, flush=True)
 
 
-def git(*args, cwd=ROOT, input=None, timeout=90, bulk=False):
-    # The pool's refs go over the machine's one persistent connection to the hub (shared with beat and the executor);
-    # a push of commits (bulk) takes its own connection, so it does not hold up the others on a slow link.
-    ssh = ("ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
-           " -o ServerAliveInterval=15 -o ServerAliveCountMax=3")
-    ssh += (" -o ControlMaster=no -o ControlPath=none" if bulk else
-            " -o ControlMaster=auto -o ControlPersist=10m -o ControlPath=~/.ssh/cf-%C")
-    if PROXY:
-        ssh += f" -o 'ProxyCommand=nc -X connect -x {PROXY} %h %p'"
-    env = {**os.environ, "GIT_SSH_COMMAND": ssh, "GIT_TERMINAL_PROMPT": "0"}
+def machine_conf(name):
+    m = CONF["machines"].get(name)
+    if not m:
+        die(f"machines.json 里没有机器 {name}（有 {'、'.join(CONF['machines'])}）")
+    return m
+
+
+def local(name):
+    return machine_conf(name).get("host") == os.uname().nodename
+
+
+def route(name):
+    """How this host reaches machine NAME by ssh: machines.json "ssh" ({launcher machine: ssh host}), else NAME."""
+    r = machine_conf(name).get("ssh")
+    return r.get(LAUNCHER, name) if isinstance(r, dict) else r or name
+
+
+def remote(name, args, input=None, capture=True, timeout=None):
+    """executor ARGS on machine NAME: (exit code, stdout)."""
+    cmd = ["python3", "curryflow/machines/executor", *args]
+    if local(name):
+        cmd = [sys.executable, os.path.join(ROOT, "executor"), *args]
+    else:
+        cmd = [*SSH, route(name), "cd && " + shlex.join(cmd)]
     try:
-        r = subprocess.run(["git", *args], cwd=cwd, input=input, capture_output=True, text=True, env=env, timeout=timeout)
+        r = subprocess.run(cmd, input=input, text=True, stdout=subprocess.PIPE if capture else None, timeout=timeout)
     except subprocess.TimeoutExpired:
-        raise GitError(f"git {' '.join(args[:2])}：{timeout} 秒没有回音")
-    if r.returncode:
-        raise GitError(f"git {' '.join(args)}：{r.stderr.strip()[-400:]}")
-    return r.stdout
-
-
-def patient(fn, *args, tries=4):
-    """A call to the hub, again after a network error."""
-    for i in range(tries):
-        try:
-            return fn(*args)
-        except GitError as e:
-            if i == tries - 1:
-                die(str(e))
-            time.sleep(3)
-
-
-def cpu_count(spec):
-    n = 0
-    for part in str(spec).replace(" ", "").split(","):
-        if part:
-            a, _, b = part.partition("-")
-            n += int(b or a) - int(a) + 1
-    return n
-
-
-def mem_gb(text):
-    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([KMGT]?)(?:i?B)?\s*", str(text), re.I)
-    return float(m.group(1)) * 1024 ** (" KMGT".index(m.group(2).upper() or " ") - 3) if m else 0
+        return 255, ""
+    return r.returncode, r.stdout or ""
 
 
 def who():
-    if os.environ.get("CF_WHO"):
-        return os.environ["CF_WHO"]
-    name = f"{getpass.getuser()}@{os.uname().nodename}"
-    try:
-        branch = git("rev-parse", "--abbrev-ref", "HEAD", cwd=os.getcwd()).strip()
-    except GitError:
-        branch = ""
-    return f"{name}:{branch}" if branch and branch != "HEAD" else name
+    return os.environ.get("CF_WHO") or f"{getpass.getuser()}@{os.uname().nodename}"
 
 
-def new_id():
-    return time.strftime("%y%m%d-%H%M%S", time.gmtime()) + "-" + os.urandom(2).hex()[:3]
+def git(*args, cwd=None, timeout=120):
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    if r.returncode:
+        die(f"git {' '.join(args[:3])}：{r.stderr.strip()[-300:]}")
+    return r.stdout.strip()
 
 
-def blob(obj):
-    return git("hash-object", "-w", "--stdin", input=json.dumps(obj, ensure_ascii=False)).strip()
-
-
-def state(rid, machine=None):
-    """{kind: sha} of the refs a request has now, and the heartbeat of a machine (hb)."""
-    out = {}
-    hb = [f"refs/hb/{machine}", f"refs/alive/{machine}"] if machine else []
-    for line in git("ls-remote", "origin", *[f"refs/{k}/{rid}" for k in ("q", "run", "done", "cancel")], *hb).splitlines():
-        sha, ref = line.split("\t")
-        out[ref.split("/")[1]] = sha
-    return out
-
-
-def read(kind, rid):
-    local = f"refs/flow/tmp/{os.getpid()}"
-    git("fetch", "-q", "--no-tags", "--no-write-fetch-head", "origin", f"+refs/{kind}/{rid}:{local}")
-    text = git("cat-file", "blob", local)
-    git("update-ref", "-d", local)
-    return json.loads(text)
-
-
-def need_of(a):
-    if a.threads is not None and a.threads < 1:
-        die("--threads 至少是 1")
-    if a.mem is not None and not 0 < a.mem < float("inf"):
-        die("--mem 要大于 0")
-    need = {}
-    for key, value in (("threads", a.threads), ("mem_gb", a.mem), ("gpu", a.gpu), ("machine", a.machine),
-                       ("slot", a.slot), ("tags", getattr(a, "tag", None))):
-        if value:
-            need[key] = value
-    machines = CONF["machines"]
-    if a.machine and a.machine not in machines:
-        die(f"machines.json 里没有机器 {a.machine}（有 {'、'.join(machines)}）")
-    if a.machine and not machines[a.machine].get("executor"):
-        die(f"{a.machine} 上没有 executor")
-    fit = [f"{m}/{s}" for m, c in machines.items() if c.get("executor") and a.machine in (None, m)
-           for s, d in c.get("slots", {}).items()
-           if a.slot in (None, s) and (a.threads or 0) <= cpu_count(d["cpus"]) and (a.mem or 0) <= mem_gb(d.get("mem", ""))
-           and (not a.gpu or d.get("gpu"))]
-    if not fit:
-        die(f"没有哪个槽位满足这些需求：{json.dumps(need, ensure_ascii=False)}")
-    return need
-
-
-def submit(req):
-    err = None
-    for _ in range(5):
-        try:
-            git("push", "-q", f"--force-with-lease=refs/q/{req['id']}:", "origin", f"{blob(req)}:refs/q/{req['id']}")
-            return req["id"]
-        except GitError as e:
-            err = e
-            if "stale info" in str(e):          # the id is taken
-                req["id"] = new_id()
-            else:
-                time.sleep(3)
-    die(f"请求没推上去：{err}")
-
-
-def commit_of(a, hub, rid, pushed):
-    """(commit, a ref of the hub that leads to it or None, whether that ref is a temporary one); a temporary ref is
-    added to pushed before it is pushed."""
-    refs = {}
-    for line in patient(git, "ls-remote", hub).splitlines():
-        sha, ref = line.split("\t")
-        refs[ref] = sha
+def resolve(a, repo):
+    """(commit, whether this repository has it and pushes it to the machine)."""
     here = os.getcwd()
-
-    def local(rev):
-        try:
-            return git("rev-parse", "--verify", "-q", rev + "^{commit}", cwd=here).strip()
-        except GitError:
-            return None
-
     if a.here:
-        sha = local("HEAD") or die("--here：当前目录不在 git 仓库里")
-        try:
-            if git("--no-optional-locks", "status", "--porcelain", "--untracked-files=no", cwd=here).strip():
-                note("工作区有没提交的改动，作业跑的是 HEAD，不带这些改动")
-        except GitError:
-            pass
-    else:
-        rev, sha = a.commit or "main", None
-        if SHA.fullmatch(rev):
-            sha = rev
-        else:
-            for name in (rev, f"refs/heads/{rev}", f"refs/tags/{rev}"):
-                if name in refs:
-                    sha = refs.get(name + "^{}", refs[name])
-                    if REF.fullmatch(name):
-                        return sha, name, False
-                    break
-        sha = sha or local(rev) or die(f"中枢 {hub} 上没有 {rev}，当前目录的仓库也解析不了它")
-    tips = sorted(r for r, s in refs.items() if s == sha and r.startswith("refs/heads/") and REF.fullmatch(r))
-    if tips:
-        return sha, tips[0], False
-    if local(sha) != sha:
-        return sha, None, False               # the executor looks for it in the hub's branches
-    tmp = f"refs/cf/tmp/{rid}"
-    pushed.append(tmp)
-    patient(lambda: git("push", "-q", hub, f"{sha}:{tmp}", cwd=here, timeout=600, bulk=True))
-    return sha, tmp, True
+        sha = git("rev-parse", "--verify", "HEAD^{commit}", cwd=here)
+        if git("--no-optional-locks", "status", "--porcelain", "--untracked-files=no", cwd=here):
+            note("工作区有没提交的改动，作业跑的是 HEAD，不带这些改动")
+        return sha, True
+    rev = a.commit or "main"
+    if SHA.fullmatch(rev):
+        return rev, False
+    out = git("ls-remote", repo, rev, f"refs/heads/{rev}", f"refs/tags/{rev}")
+    refs = {ref: sha for sha, ref in (line.split("\t") for line in out.splitlines())}
+    for name in (f"refs/heads/{rev}", f"refs/tags/{rev}^{{}}", f"refs/tags/{rev}", rev):
+        if name in refs:
+            return refs[name], False
+    r = subprocess.run(["git", "rev-parse", "--verify", "-q", rev + "^{commit}"], cwd=here, capture_output=True, text=True)
+    if r.returncode == 0:
+        return r.stdout.strip(), True
+    die(f"{repo} 上没有 {rev}，当前目录的仓库也解析不了它")
+
+
+def push(machine, project, sha):
+    """The commit into the machine's mirror of the project, under refs/cf/job/<sha> (prepare drops it)."""
+    code, out = remote(machine, ["mirror", "--project", project])
+    if code:
+        die(f"{machine} 上建不了 {project} 的镜像")
+    mirror = out.strip()
+    url = mirror if local(machine) else f"{route(machine)}:{mirror}"
+    env = {**os.environ, "GIT_SSH_COMMAND": shlex.join(SSH)}
+    r = subprocess.run(["git", "push", "-q", "-f", url, f"{sha}:refs/cf/job/{sha}"], env=env,
+                       capture_output=True, text=True, timeout=1800)
+    if r.returncode:
+        die(f"提交推不到 {machine} 的镜像：{r.stderr.strip()[-300:]}")
 
 
 def show(d):
     for line in d.get("tail") or []:
         print(line)
-    where = f"，{d['machine']}/{d['slot']}" if d.get("machine") else ""
-    print(f"[flow] {d['id']} {VERDICT.get(d.get('reason'), d.get('reason'))}：退出码 {d.get('code')}，{d.get('secs', 0)} 秒{where}"
-          + (f"；{d['note']}" if d.get("note") else "") + (f"；最后一行：{d['last']}" if d.get("last") else ""))
-    if d.get("log"):
-        print(f"[flow] 完整日志 {d['log']['machine']}:{d['log']['path']}")
+    print(f"[flow] {d['machine']}:{d['id']} {VERDICT.get(d.get('reason'), d.get('reason'))}：退出码 {d.get('code')}，"
+          f"{span(d.get('secs') or 0)}，{d['machine']}/{d['slot']}" + (f"；{d['note']}" if d.get("note") else "")
+          + (f"；最后一行：{d['last']}" if d.get("last") else ""))
+    print(f"[flow] 完整日志 {d['machine']}:{d['log']}")
     sys.stdout.flush()
 
 
-def holds(b, kind, rid):
-    ex = b.get("executor") if kind == "hb" and isinstance(b, dict) else b
-    return isinstance(ex, dict) and (not isinstance(ex.get("jobs"), list) or rid in ex["jobs"])
+def alert_text(al):
+    return f"告警 {al.get('machine', '')} {al.get('what', '')}：{al.get('text', '')}"
 
 
-def wait(rid, until="done", limit=None, old=None):
-    """Follow a request to its conclusion (or, until="run", to the moment an executor takes it). The time this
-    client could not read the hub does not count as time the machine was silent."""
-    t0, seen, missing, machine, run = time.time(), None, 0, None, None
-    hb, moved, checked, away, ok, failed = None, t0, 0, None, t0, False
-    try:
-        while True:
-            try:
-                st = state(rid, machine)
-                t = time.time()
-                if failed or t - ok > 8 * WAIT_STEP:
-                    moved += t - ok
-                    away = away and away + t - ok
-                ok, failed = t, False
-                if "done" in st and st["done"] != old:
-                    return read("done", rid)
-                missing = 0 if set(st) - {"hb", "alive"} else missing + 1
-                if missing >= 3:
-                    die(f"{rid}：中枢上没有这个请求（已取消，或结论已过期）")
-                if "run" in st and st["run"] != run:
-                    seen, run, r = "run", st["run"], read("run", rid)
-                    if until == "run":
-                        return r
-                    machine, hb, moved, checked, away = r.get("machine"), None, t, 0, None
-                    note(f"{rid} 在 {machine}/{r.get('slot')} 上开始")
-                elif "q" in st and seen is None:
-                    seen = "q"
-                    note(f"{rid} 排队中")
-                if machine and "run" in st:
-                    if (st.get("hb"), st.get("alive")) != hb:
-                        hb, moved = (st.get("hb"), st.get("alive")), t
-                    if any(hb) and t - checked >= HB_CHECK:
-                        checked = t
-                        held = any(holds(read(kind, machine), kind, rid) for kind in ("hb", "alive") if st.get(kind))
-                        away = None if held else away or t
-                    why = None
-                    if t - moved >= HB_LOST:
-                        why = f"认领它的 {machine} 已经 {span(t - moved)}没有心跳（机器或网络断了）"
-                    elif away and t - away >= HB_LOST:
-                        why = f"{machine} 的 executor 已经 {span(t - away)}没在管它"
-                    if why:
-                        note(f"{rid}：{why}。作业也许还在跑，机器回来后结论照常回来：flow wait {rid} 接着等，"
-                             f"flow cancel {rid} 撤掉")
-                        sys.exit(CODE_GONE)
-            except GitError as e:
-                failed = True
-                note(f"中枢暂时读不到，接着等（{e}）")
-            if limit and time.time() - t0 > limit:
-                return None
-            age = time.time() - t0
-            time.sleep(WAIT_STEP if age < 60 else 2 * WAIT_STEP if age < 900 else 4 * WAIT_STEP)
-    except KeyboardInterrupt:
-        note(f"不等了；作业不受影响：flow wait {rid} 接着等，flow cancel {rid} 取消")
-        sys.exit(130)
+def follow(machine, rid, args=("wait",)):
+    """executor wait (or cancel) on the machine until its CF-END line; a broken connection is tried again."""
+    while True:
+        cmd = ["python3", "curryflow/machines/executor", *args, "--machine", machine, rid]
+        if local(machine):
+            cmd = [sys.executable, os.path.join(ROOT, "executor"), *cmd[2:]]
+        else:
+            cmd = [*SSH, route(machine), "cd && " + shlex.join(cmd)]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+        try:
+            for line in p.stdout:
+                if line.startswith("CF-ALERT "):
+                    note(alert_text({**json.loads(line[9:]), "machine": machine}))
+                elif line.startswith("CF-END "):
+                    p.wait()
+                    return json.loads(line[7:])
+        except KeyboardInterrupt:
+            p.kill()
+            note(f"不等了；作业不受影响：flow wait {machine}:{rid} 接着等，flow cancel {machine}:{rid} 结束")
+            sys.exit(130)
+        if p.wait() != 255:              # 255: ssh lost the connection; anything else is the executor's answer
+            die(f"{machine} 上的 executor {args[0]} 没给出结论（见上面它的话）")
+        note(f"和 {machine} 的连接断了，{RETRY} 秒后接着等（作业不受影响）")
+        time.sleep(RETRY)
 
 
 def code_of(d):
@@ -316,165 +175,75 @@ def code_of(d):
     return c if isinstance(c, int) and 0 <= c <= 255 else 1
 
 
+def target(text):
+    """[M:]ID -> (machine, id); without M every machine is asked."""
+    if ":" in text:
+        machine, rid = text.split(":", 1)
+        machine_conf(machine)
+        return machine, rid
+    for machine, out in listing(list(CONF["machines"])):
+        if any(j["id"] == text for j in (out or {}).get("jobs", [])):
+            return machine, text
+    die(f"哪台机器上都没有作业 {text}")
+
+
 def cmd_run(a):
     if not a.command:
         die("-- 后面要有命令")
-    if a.project not in CONF.get("projects", {}):
-        die(f"machines.json 里没有项目 {a.project}（有 {'、'.join(CONF.get('projects', {}))}）")
+    m = machine_conf(a.machine)
+    if a.slot not in m.get("slots", {}):
+        die(f"{a.machine} 上没有槽位 {a.slot}（有 {'、'.join(m.get('slots', {})) or '无'}）")
+    project = CONF.get("projects", {}).get(a.project) or die(
+        f"machines.json 里没有项目 {a.project}（有 {'、'.join(CONF.get('projects', {}))}）")
     if not 0 < a.timeout <= TIMEOUT_MAX:
         die(f"--timeout 要在 1 到 {TIMEOUT_MAX} 秒之间")
-    if len(json.dumps(a.command)) >= 65536:
-        die("命令太长（JSON 不能超过 64 KB）：放进脚本里")
-    if len(who()) > 200:
-        die("提交人超过 200 个字符：设一个短些的 CF_WHO")
-    need, rid, hub, pushed = need_of(a), new_id(), CONF["projects"][a.project]["hub"], []
-    try:
-        sha, ref, tmp = commit_of(a, hub, rid, pushed)
-        req = {"id": rid, "kind": "job", "submitted": round(time.time(), 3), "who": who(), "project": a.project,
-               "commit": sha, "argv": a.command, "cmd": a.command[0] if len(a.command) == 1 else shlex.join(a.command),
-               "need": need, "prio": a.prio, "timeout": a.timeout}
-        if ref:
-            req["ref"] = ref
-            req["tmp"] = tmp
-        if a.clean:
-            req["clean"] = True
-        rid = submit(req)
-    except (SystemExit, KeyboardInterrupt):
-        for ref in pushed:
-            try:
-                git("push", "-q", hub, ":" + ref, timeout=60, bulk=True)
-                note(f"请求没交上，删掉了刚推的临时 ref {ref}")
-            except (GitError, KeyboardInterrupt) as e:
-                note(f"临时 ref {ref} 没删掉（executor 的清理过一小时会删）：{e}")
-        raise
+    sha, mine = resolve(a, project["repo"])
+    if mine:
+        push(a.machine, a.project, sha)
+    req = {"slot": a.slot, "project": a.project, "commit": sha, "repo": project["repo"], "argv": a.command,
+           "timeout": a.timeout, "clean": a.clean, "who": who()}
+    code, out = remote(a.machine, ["start", "--machine", a.machine], input=json.dumps(req), timeout=300)
+    if code:
+        die(f"{a.machine}/{a.slot} 上没起来（见上面 executor 的话）")
+    rid = json.loads(out)["id"]
     if a.no_wait:
-        print(rid)
+        print(f"{a.machine}:{rid}")
         return 0
-    note(f"{rid} {a.project}@{sha[:12]} {req['cmd']}")
-    d = wait(rid)
+    note(f"{a.machine}:{rid} {a.project}@{sha[:12]} 在 {a.slot}：{req['argv'][0] if len(a.command) == 1 else shlex.join(a.command)}")
+    d = follow(a.machine, rid)
     show(d)
     return code_of(d)
 
 
-def cmd_hold(a):
-    if not 0 < a.hours <= HOLD_MAX_HOURS:
-        die(f"--hours 要在 0 到 {HOLD_MAX_HOURS} 之间")
-    req = {"id": new_id(), "kind": "hold", "submitted": round(time.time(), 3), "who": who(), "hours": a.hours,
-           "need": need_of(a), "prio": a.prio, "cmd": f"占用 {a.hours:g} 小时"}
-    rid = submit(req)
-    if a.no_wait:
-        print(rid)
-        return 0
-    r = wait(rid, until="run")
-    if r.get("reason"):                    # ended before any executor gave it a slot
-        show(r)
-        return 1
-    print(f"占用 {rid}\n  机器 {r['machine']}\n  槽位 {r['slot']}\n  核   {r['cpus']}\n  容器 {r.get('container') or '-'}\n"
-          f"  目录 {r['dir']}\n  到期 {time.strftime('%Y-%m-%d %H:%M', time.localtime(r['until']))}"
-          f"（到期自动放；提前放：flow release {rid}）")
-    return 0
+def cmd_wait(a):
+    machine, rid = target(a.id)
+    d = follow(machine, rid)
+    show(d)
+    return code_of(d)
 
 
 def cmd_cancel(a):
-    rid = a.id
-    st = patient(state, rid)
-    if "q" not in st and "run" not in st:
-        if "done" not in st:
-            die(f"{rid}：没有这个请求")
-        if not patient(read, "done", rid).get("judged_by"):
-            die(f"{rid}：已经结束了")
-        return cancel_lost(a, rid, st["done"])
-    if "run" not in st:
-        req = patient(read, "q", rid)
-        try:
-            git("push", "-q", f"--force-with-lease=refs/q/{rid}:{st['q']}", "origin", f":refs/q/{rid}")
-        except GitError:
-            pass
-        if req.get("tmp") and req.get("ref") and req.get("project") in CONF.get("projects", {}):
-            try:
-                git("push", "-q", CONF["projects"][req["project"]]["hub"], ":" + req["ref"])
-            except GitError:
-                pass
-        t = int(time.time())
-        d = {k: req.get(k) for k in ("id", "kind", "who", "project", "commit", "cmd", "prio", "submitted")}
-        d.update(machine=None, slot=None, start=None, end=t, secs=0, code=143, reason="cancelled", note="排队时取消",
-                 last="", tail=[], log=None)
-        for i in range(5):
-            st = patient(state, rid)
-            if "run" in st or "done" in st:
-                break
-            try:
-                git("push", "-q", f"--force-with-lease=refs/done/{rid}:", "origin", f"{blob(d)}:refs/done/{rid}")
-                show(d)
-                return 0
-            except GitError as e:
-                if i == 4:
-                    die(f"排队时取消的结论没推上去：{e}")
-                time.sleep(1)
-        if "run" not in st:
-            show(patient(read, "done", rid))
-            return 0
-    if "run" in st and "cancel" not in st:
-        try:
-            git("push", "-q", f"--force-with-lease=refs/cancel/{rid}:", "origin",
-                f"{blob({'id': rid, 'who': who(), 'at': int(time.time())})}:refs/cancel/{rid}")
-        except GitError as e:
-            if "stale info" not in str(e):
-                die(str(e))
-    if a.no_wait:
-        note(f"{rid}：已请求取消")
-        return 0
-    d = wait(rid, limit=180)
-    if d is None:
-        die(f"{rid}：请求了取消，180 秒内没等到结论（flow ls 看 executor 的心跳）")
+    machine, rid = target(a.id)
+    d = follow(machine, rid, ("cancel",))
     show(d)
     return 0
 
 
-def cancel_lost(a, rid, lost):
-    """A run judged lost may still run: the cancel ref reaches its executor when the machine is back, and that
-    executor's conclusion replaces the 255."""
-    try:
-        git("push", "-q", f"--force-with-lease=refs/cancel/{rid}:", "origin",
-            f"{blob({'id': rid, 'who': who(), 'at': int(time.time())})}:refs/cancel/{rid}")
-    except GitError as e:
-        if "stale info" not in str(e):
-            die(str(e))
-    note(f"{rid} 被判丢了，也许还在跑：已请求取消，跑它的机器看到后结束它，它的结论替换 255")
-    if a.no_wait:
-        return 0
-    d = wait(rid, limit=180, old=lost)
-    if d is None:
-        die(f"{rid}：180 秒内跑它的机器没回音（它回来后会结束这个作业；flow wait {rid} 等它的结论）")
-    show(d)
-    return 0
+def cmd_log(a):
+    machine, rid = target(a.id)
+    code, _ = remote(machine, ["log", "--machine", machine, rid, "-n", str(a.n)], capture=False)
+    return code
 
 
-def snapshot():
-    """Every request, run, conclusion and heartbeat of the hub: {kind: [blob, ...]}."""
-    patient(lambda: git("fetch", "-q", "--no-tags", "--no-write-fetch-head", "--prune", "origin",
-                        "+refs/q/*:refs/flow/q/*", "+refs/run/*:refs/flow/run/*", "+refs/done/*:refs/flow/done/*",
-                        "+refs/hb/*:refs/flow/hb/*", "+refs/alive/*:refs/flow/alive/*"))
-    refs = [line.split() for line in git("for-each-ref", "--format=%(objectname) %(refname)", "refs/flow/q", "refs/flow/run",
-                                         "refs/flow/done", "refs/flow/hb", "refs/flow/alive").splitlines()]
-    p = subprocess.run(["git", "cat-file", "--batch"], cwd=ROOT, input="".join(s + "\n" for s, _ in refs).encode(),
-                       capture_output=True)
-    out, data, pos = {"q": [], "run": [], "done": [], "hb": [], "alive": []}, p.stdout, 0
-    for sha, ref in refs:
-        end = data.index(b"\n", pos)
-        head = data[pos:end].split()
-        pos = end + 1
-        if len(head) != 3:
-            continue
-        size = int(head[2])
+def listing(machines):
+    def one(name):
+        code, out = remote(name, ["ls", "--machine", name], timeout=60)
         try:
-            d = json.loads(data[pos:pos + size])
-            if isinstance(d, dict) and isinstance(d.get("machine" if ref.split("/")[2] in ("hb", "alive") else "id"), str):
-                out[ref.split("/")[2]].append(d)
+            return name, json.loads(out) if code == 0 else None
         except ValueError:
-            pass
-        pos += size + 1
-    return out
+            return name, None
+    with concurrent.futures.ThreadPoolExecutor(len(machines) or 1) as ex:
+        return list(ex.map(one, machines))
 
 
 def width(text):
@@ -501,104 +270,39 @@ def cut(text, n):
     return text if len(text) <= n else text[:n - 1] + "…"
 
 
-def beat_of(beats, alives, r, t):
-    """How the heartbeat of a run's machine looks: its age, and whether its executor holds the run; while beat is
-    stopped, the executor's own signal stands in for it."""
-    b, a = beats.get(r.get("machine")) or {}, alives.get(r.get("machine")) or {}
-    if not b and not a:
-        return "没有心跳"
-    try:
-        at = datetime.datetime.strptime(b["at"], "%Y-%m-%dT%H:%M:%S%z").timestamp() if b else 0
-    except (KeyError, TypeError, ValueError):
-        return "?"
-    own = a.get("at") if isinstance(a.get("at"), (int, float)) and a["at"] > at else 0
-    age = t - max(at, own)
-    held = (holds(a if own else b, "alive" if own else "hb", r["id"])
-            or isinstance(r.get("start"), (int, float)) and r["start"] >= max(at, own) - 60)
-    return (span(age) + "前" + ("（beat 停了，executor 自报）" if own else "") + ("（停了？）" if age > 200 else "")
-            + ("" if held else "（executor 没在管它）"))
-
-
 def cmd_ls(a):
-    s = snapshot()
-    taken = {r["id"] for r in s["run"]}
-    queue = sorted((r for r in s["q"] if r["id"] not in taken), key=lambda r: r["id"])
-    running = sorted(s["run"], key=lambda r: r["id"])
-    done = sorted(s["done"], key=lambda d: d["end"] if isinstance(d.get("end"), (int, float)) else 0, reverse=True)
+    machines = a.machine or [m for m, c in CONF["machines"].items() if c.get("slots")]
+    res = listing(machines)
     t = time.time()
-    lost = [d for d in done if d.get("reason") == "lost" and d.get("judged_by")
-            and isinstance(d.get("start"), (int, float)) and t - d["start"] < TIMEOUT_MAX]
-    if not a.all:
-        done = done[:10]
+    run, done, alerts, gone = [], [], [], []
+    for machine, out in res:
+        if out is None:
+            gone.append(machine)
+            continue
+        alerts += [{**al, "machine": machine} for al in out["alerts"]]
+        for j in out["jobs"]:
+            (run if "reason" not in j else done).append(j)
     if a.json:
-        print(json.dumps({"queue": queue, "running": running, "lost": lost, "done": done}, ensure_ascii=False, indent=1))
+        print(json.dumps({"running": run, "done": done, "alerts": alerts, "unreachable": gone}, ensure_ascii=False,
+                         indent=1))
         return 0
-    needs = lambda n: " ".join(f"{k}={','.join(v) if isinstance(v, list) else v}" for k, v in n.items()) or "-"
-    beats, alives = {b["machine"]: b for b in s["hb"]}, {b["machine"]: b for b in s["alive"]}
-    when = lambda x: x if isinstance(x, (int, float)) else t
-    table("排队", ["id", "优先级", "谁", "项目", "命令", "等了", "需求"],
-          [[r["id"], r.get("prio"), r.get("who"), r.get("project") or "-", cut(r.get("cmd"), 48),
-            span(t - when(r.get("submitted"))), needs(r["need"]) if isinstance(r.get("need"), dict) else "?"]
-           for r in queue])
-    table("在跑", ["id", "机器/槽位", "谁", "项目", "命令", "已跑", "机器心跳"],
-          [[r["id"], f"{r.get('machine')}/{r.get('slot')}", r.get("who"), r.get("project") or "-", cut(r.get("cmd"), 48),
-            span(t - when(r.get("start"))), beat_of(beats, alives, r, t)] for r in running])
-    table("判丢了（也许还在跑；flow cancel 能结束它，它的结论回来会替换 255）", ["id", "机器/槽位", "谁", "项目", "命令", "开始于", "为什么"],
-          [[d["id"], f"{d.get('machine')}/{d.get('slot')}", d.get("who"), d.get("project") or "-", cut(d.get("cmd"), 48),
-            span(t - d["start"]) + "前", cut(d.get("note"), 60)] for d in lost])
-    table("最近完成", ["id", "结论", "退出码", "用时", "机器/槽位", "谁", "项目", "命令", "最后一行"],
-          [[d["id"], VERDICT.get(d.get("reason"), d.get("reason")), d.get("code"), span(d.get("secs") or 0),
-            f"{d['machine']}/{d['slot']}" if d.get("machine") else "-", d.get("who"), d.get("project") or "-",
-            cut(d.get("cmd"), 40), cut(d.get("last"), 60)] for d in done])
+    if gone:
+        print(f"连不上：{'、'.join(gone)}")
+    for al in alerts:
+        print(alert_text(al))
+    table("在跑", ["id", "机器/槽位", "谁", "项目", "命令", "已跑", "最后一行"],
+          [[f"{j['machine']}:{j['id']}", f"{j['machine']}/{j['slot']}", j.get("who"), j.get("project"),
+            cut(j.get("cmd"), 48), span(t - (j.get("start") or t)) + ("" if j.get("running") else "（进程不在了）"),
+            cut(j.get("last"), 50)] for j in sorted(run, key=lambda j: j["id"])])
+    done.sort(key=lambda j: j.get("end") or 0, reverse=True)
+    table("最近结束", ["id", "结论", "退出码", "用时", "机器/槽位", "项目", "命令", "最后一行"],
+          [[f"{j['machine']}:{j['id']}", VERDICT.get(j["reason"], j["reason"]), j.get("code"), span(j.get("secs") or 0),
+            f"{j['machine']}/{j['slot']}", j.get("project"), cut(j.get("cmd"), 40), cut(j.get("last"), 60)]
+           for j in done[:a.n]])
     return 0
 
 
-def cmd_wait(a):
-    d = wait(a.id)
-    show(d)
-    return code_of(d)
-
-
-def cmd_get(a):
-    project = CONF.get("projects", {}).get(a.project)
-    if not project:
-        die(f"machines.json 里没有项目 {a.project}")
-    if not SHARE.fullmatch(a.name):
-        die(f"共享目录的名字不合规：{a.name!r}")
-    if os.path.lexists(a.dir):
-        die(f"{a.dir} 已经存在")
-    hub = project["hub"]
-    for attempt in (1, 2):         # an executor that shares the name again deletes the one listed here
-        refs = [line.split("\t")[1] for line in patient(git, "ls-remote", hub, f"refs/cf/share/{a.name}/*").splitlines()]
-        refs = sorted((ref for ref in refs if SHAREREF.fullmatch(ref)), key=lambda ref: ref.rsplit("/", 1)[1])
-        if not refs:
-            note(f"项目 {a.project} 的中枢上没有共享目录 {a.name}")
-            return CODE_NONE
-        tmp = tempfile.mkdtemp(prefix="cf-get-")
-        try:
-            git("init", "-q", "--bare", tmp)
-            try:
-                git("fetch", "-q", "--no-tags", "--depth", "1", hub, refs[-1], cwd=tmp, bulk=True, timeout=1800)
-            except GitError:
-                if attempt == 2:
-                    raise
-                continue
-            out = a.dir + f".tmp{os.getpid()}"
-            os.makedirs(out)
-            archive = subprocess.Popen(["git", "archive", "--format=tar", "FETCH_HEAD"], cwd=tmp, stdout=subprocess.PIPE)
-            untar = subprocess.run(["tar", "-x", "-f", "-", "-C", out], stdin=archive.stdout)
-            if archive.wait() or untar.returncode:
-                shutil.rmtree(out, ignore_errors=True)
-                die(f"{refs[-1]} 没能解到 {a.dir}")
-            os.rename(out, a.dir)
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
-        print(f"{a.name}：作业 {refs[-1].rsplit('/', 1)[1]} 共享的，在 {a.dir}")
-        return 0
-
-
 def main():
-    globals().update(json.loads(os.environ.get("CF_POOL_TUNE") or "{}"))
     argv = sys.argv[1:]
     command = []
     if "--" in argv:
@@ -606,53 +310,37 @@ def main():
         argv, command = argv[:i], argv[i + 1:]
     ap = argparse.ArgumentParser(prog="flow", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-
-    def needs(p):
-        p.add_argument("--threads", type=int, help="至少这么多线程的槽位")
-        p.add_argument("--mem", type=float, help="至少这么多 GiB 内存的槽位")
-        p.add_argument("--gpu", action="store_true", help="要 NV 显卡")
-        p.add_argument("--machine")
-        p.add_argument("--slot")
-        p.add_argument("--prio", choices=["gate", "normal", "night"], default="normal")
-        p.add_argument("--no-wait", action="store_true")
-
     r = sub.add_parser("run")
+    r.add_argument("--machine", required=True)
+    r.add_argument("--slot", required=True)
     r.add_argument("--project", required=True)
     g = r.add_mutually_exclusive_group()
     g.add_argument("--commit")
     g.add_argument("--here", action="store_true")
     r.add_argument("--timeout", type=int, default=14400, help="秒，默认 4 小时")
-    r.add_argument("--tag", action="append", choices=["synth"], help="synth：同一台机器同时只跑一个")
     r.add_argument("--clean", action="store_true", help="跑之前清空槽位工作树的 .build/")
-    needs(r)
-    h = sub.add_parser("hold")
-    h.add_argument("--hours", type=float, required=True)
-    needs(h)
-    for name in ("release", "cancel"):
-        c = sub.add_parser(name)
-        c.add_argument("id")
-        c.add_argument("--no-wait", action="store_true")
+    r.add_argument("--no-wait", action="store_true")
+    for name in ("wait", "attach", "cancel"):
+        sub.add_parser(name).add_argument("id")
+    lg = sub.add_parser("log")
+    lg.add_argument("id")
+    lg.add_argument("-n", type=int, default=100)
     ls = sub.add_parser("ls")
-    ls.add_argument("--all", action="store_true")
+    ls.add_argument("--machine", action="append")
+    ls.add_argument("-n", type=int, default=10, help="列多少个最近结束的")
     ls.add_argument("--json", action="store_true")
-    sub.add_parser("wait").add_argument("id")
-    get = sub.add_parser("get")
-    get.add_argument("--project", required=True)
-    get.add_argument("name")
-    get.add_argument("dir")
     a = ap.parse_args(argv)
     a.command = command
-    return {"run": cmd_run, "hold": cmd_hold, "release": cmd_cancel, "cancel": cmd_cancel, "ls": cmd_ls,
-            "wait": cmd_wait, "get": cmd_get}[a.cmd](a)
+    return {"run": cmd_run, "wait": cmd_wait, "attach": cmd_wait, "cancel": cmd_cancel, "log": cmd_log,
+            "ls": cmd_ls}[a.cmd](a)
 
 
 try:
     CONF = json.load(open(os.path.join(ROOT, "machines.json")))
 except (OSError, ValueError) as e:
-    raise SystemExit(f"flow: 读不了 {ROOT}/machines.json（flow 要放在 machines.git 的 clone 里）：{e}")
-# A machine that reaches the hub through a proxy says so in machines.json (hub_proxy, with its host name).
-PROXY = os.environ.get("CF_HUB_PROXY") or next((c.get("hub_proxy") for c in CONF["machines"].values()
-                                                if c.get("host") == os.uname().nodename), None)
+    raise SystemExit(f"flow: 读不了 {ROOT}/machines.json（flow 要放在 machines 仓库的 clone 里）：{e}")
+
+LAUNCHER = next((n for n, c in CONF["machines"].items() if c.get("host") == os.uname().nodename), None)
 
 if __name__ == "__main__":
     sys.exit(main())
