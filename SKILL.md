@@ -105,9 +105,11 @@ flow ls [--machine aimax]             # 各机器在跑的、最近结束的作�
   作为 system 域的 launchd daemon 起监管进程。监管进程管超时、取消和收尾：作业结束时把它留下的进程全部结束（Linux 按
   child subreaper 的进程树，Mac 按 launchd 给的联盟），写 `exit.json`，最后放掉 busy。作业目录留 7 天。
 - 作业的环境：工作目录是槽位里该项目的常驻工作树（checkout 到指定提交，未跟踪文件清掉）；`CF_DEPS_CACHE`、
-  `GH_TOKEN`（并让 git 把 `git@github.com:` 改走带 token 的 https），作业在哪跑就在哪自己取依赖；`TMPDIR=<工作树>/.build/tmp`、
+  `GH_TOKEN`（只给 release 下载用），作业在哪跑就在哪自己取依赖；git 一律走 ssh：宿主机直接用自己的 key，
+  容器里用只读挂在 `/opt/cf-ssh` 的宿主机 `~/.ssh`（`GIT_SSH_COMMAND` 指向它）；`TMPDIR=<工作树>/.build/tmp`、
   `CF_JOB`、`CF_MACHINE`、`CF_SLOT`、`CF_CPUS`、`CF_THREADS`、`CF_MEM_GB`；容器里 `HOME` 是 `<槽位目录>/.home`。
-- `.build/` 清理：每次作业前清 `accept`、`synth`、`release`、`downstream`；`deps.json` 或槽位环境变了（记在
+- `.build/` 里的东西归项目自己清：`ci/accept` 每个阶段开跑前清掉自己的 `.build/accept/<阶段>`，其余产物由项目的
+  脚本和 `make clean` 负责，产物只许写在 `.build/` 里。executor 只做与项目无关的：`deps.json` 或槽位环境变了（记在
   `.build/.cf-env.json`）或带 `--clean` 时整个清空；整个槽位目录不超过 50 GiB，作业前后各量一次，超了按 `.cf-env.json`
   的时间从旧到新删各工作树的 `.build/`（作业前不删本作业项目的）。
 - **告警**：beat 每分钟看容器内存是否超过上限 90%、机器可用内存是否不到 5%、最近一分钟每秒换页是否超过 4 MiB。告警写进

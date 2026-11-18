@@ -3,7 +3,7 @@
 
   ci/accept                    按顺序跑全部阶段
   ci/accept --stage NAME       只跑一个阶段（机器池的槽位里这样调）
-  ci/accept --list [--json]    列出阶段、槽位类和判据
+  ci/accept --list [--json]    列出阶段和判据
   ci/accept --plan PATH...     按改动的文件给出要跑的阶段（按风险分级）
 
 派生物只准写在 .build/ 下：每个阶段跑前跑后各扫一遍工作区，.build/ 以外多了或改了文件就判这个阶段失败。
@@ -12,16 +12,17 @@
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
 from fnmatch import fnmatch
 
 # ---- 项目填写 -----------------------------------------------------------------------------------------
-# name：阶段名；class：槽位类（sim / synth / gpu / build）；cmd：在仓库根目录用 bash 跑；
+# name：阶段名；cmd：在仓库根目录用 bash 跑；
 # why：判据，写清通过意味着什么、用例来自哪个真实 bug。
 STAGES = [
-    {"name": "lint", "class": "build", "cmd": "true", "why": "替换成项目的快速检查"},
+    {"name": "lint", "cmd": "true", "why": "替换成项目的快速检查"},
 ]
 # 按风险分级：每个改动的文件取第一条匹配的规则，要跑的阶段取并集。
 TIERS = [
@@ -60,7 +61,8 @@ def snapshot(root):
 
 def run(stage, root):
     out = os.path.join(root, ".build", "accept", stage["name"])
-    os.makedirs(out, exist_ok=True)
+    shutil.rmtree(out, ignore_errors=True)       # the stage's output is this run's alone
+    os.makedirs(out)
     log = os.path.join(root, ".build", "accept", stage["name"] + ".log")
     before = snapshot(root)
     t0 = time.time()
@@ -88,7 +90,7 @@ def main(argv):
             print(json.dumps(STAGES, ensure_ascii=False))
         else:
             for s in STAGES:
-                print(f"{s['name']:<10}{s['class']:<7}{s['why']}")
+                print(f"{s['name']:<10}{s['why']}")
         return 0
     if "--plan" in argv:
         print(" ".join(plan(argv[argv.index("--plan") + 1:])))

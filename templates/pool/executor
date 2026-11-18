@@ -22,15 +22,17 @@ On the machine:
                                      "repo" in machines.json) with the host's ssh key, or receives flow's push
   <slot dir>/<project>               the slot's work tree of the project: a clone of the mirror, one checkout per job,
                                      ignored files (.build) stay for incremental builds while the slot dir stays
-                                     within SLOT_MAX (cap_slot, before and after each job)
+                                     within SLOT_MAX (cap_slot, before and after each job); what is in .build is
+                                     the project's to clean (its ci/accept, its make clean)
   <slot dir>/.cf/<id>/               a job's run directory: job.json, log, exit.json; removed KEEP after the end
   ~/curryflow/exec/<machine>/alerts.json   what beat found wrong with memory or swapping (wait prints it)
 The slot dir is ~/<container> for a slot with an incus container (the container mounts it at the same path) and
 ~/curryflow/slots/<slot> otherwise. Git runs on the host; the command runs in the slot: through incus exec as the host
 user's uid and gid (container), or (macOS) as a launchd daemon of its own. The job's environment has the machine's
 deps cache (CF_DEPS_CACHE, mounted read-write into the containers) and the GitHub token of
-~/.config/curryflow/github-token (GH_TOKEN, and git rewrites git@github.com: to https with it), so a job fetches its
-dependencies itself where it runs.
+~/.config/curryflow/github-token (GH_TOKEN, for release downloads through api.github.com), so a job fetches its
+dependencies itself where it runs. Git reaches GitHub over ssh with the host's key: on the host directly, in a
+container through the host's ~/.ssh mounted read-only at /opt/cf-ssh (GIT_SSH_COMMAND names it).
 
 A job's processes are run by the supervisor, a child subreaper, so every descendant stays below it. The supervisor
 ends them (timeout, cancel file, or what is left when the command exits) by walking its own process tree and writes
@@ -65,6 +67,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 DARWIN = sys.platform == "darwin"
 BASE = os.path.expanduser("~/curryflow")
 TOKEN = os.path.expanduser("~/.config/curryflow/github-token")
+SSH_MOUNT = "/opt/cf-ssh"            # the host's ~/.ssh in a container, read-only (make-container.sh)
 TOUCH, ALIVE, SPAWN, OVERRUN, LOCK_WAIT, WAIT_STEP = 5, 60, 60, 300, 60, 5
 KEEP, TMPDIR_KEEP = 7 * 86400, 3 * 86400
 TIMEOUT_MAX = 86400
@@ -795,14 +798,20 @@ def prepare(job, say, run, must, check):
     if req.get("clean") or (old_env is not None and old_env != cur_env):
         say("清空 .build（--clean）" if req.get("clean") else "清空 .build（deps.json 或槽位环境变了）")
         shutil.rmtree(os.path.join(tree, ".build"), ignore_errors=True)
-    else:
-        for sub in ("accept", "synth", "release", "downstream"):
-            shutil.rmtree(os.path.join(tree, ".build", sub), ignore_errors=True)
     os.makedirs(os.path.join(tree, ".build", "tmp"), exist_ok=True)
     jdump(stamp_path, cur_env)
     sweep_tmpdir(os.path.join(tree, ".build", "tmp"), say)
     cap_slot(job["dir"], req["project"], say, tick=check)
     say(f"{req['project']}@{sha[:12]} 在 {job['machine']}/{job['slot']}：{req['cmd']}")
+
+
+def container_ssh():
+    """ssh in a container: the host's keys from its ~/.ssh, mounted read-only at SSH_MOUNT (make-container.sh). The
+    host's ssh config is left out (it may name a proxy or control sockets that do not exist in the container)."""
+    keys = [k for k in ("id_ed25519", "id_ecdsa", "id_rsa") if os.path.isfile(os.path.expanduser(f"~/.ssh/{k}"))]
+    return shlex.join(["ssh", "-F", "none", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+                       "-o", f"UserKnownHostsFile={SSH_MOUNT}/known_hosts", "-o", "StrictHostKeyChecking=accept-new",
+                       *[a for k in keys for a in ("-i", f"{SSH_MOUNT}/{k}")]])
 
 
 def run_out(cmd):
@@ -1030,12 +1039,10 @@ def cmd_start(a):
             token = open(TOKEN).read().strip()
         except OSError:
             token = ""
-        if token:             # what provision fetches from GitHub, where the job runs (no ssh key in a container)
-            env.update({"GH_TOKEN": token, "GIT_CONFIG_COUNT": "2",
-                        "GIT_CONFIG_KEY_0": f"url.https://x-access-token:{token}@github.com/.insteadOf",
-                        "GIT_CONFIG_VALUE_0": "git@github.com:",
-                        "GIT_CONFIG_KEY_1": f"url.https://x-access-token:{token}@github.com/.insteadOf",
-                        "GIT_CONFIG_VALUE_1": "ssh://git@github.com/"})
+        if token:             # provision's gh: downloads
+            env["GH_TOKEN"] = token
+        if s.get("container"):
+            env["GIT_SSH_COMMAND"] = container_ssh()
         env.update({k: str(v).replace("~/", os.path.expanduser("~/")) for k, v in m.get("env", {}).items()})
         job = {"id": rid, "machine": a.machine, "slot": slot, "cpus": s["cpus"], "container": s.get("container"),
                "dir": slotdir, "tree": tree, "rundir": rundir, "start": int(time.time()), "env": env,
