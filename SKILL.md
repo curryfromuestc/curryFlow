@@ -3,7 +3,7 @@ name: curryflow
 description: >-
   多机开发流程的唯一入口。给一个项目引导出流程：探测机器、和人定验收阶段与判据、定存储规矩，生成项目的 ci/accept、
   docs/pages.json、tools/publish-docs、AGENTS.md 和 .gitignore，建中枢 git 仓库和镜像，接入机器池；写清协调器的通用规矩
-  （派任务前问人用哪些机器、本地 subagent 只写代码不建多工作树、合并后主会话统一跑重活、推 main 必出发布件）；
+  （派任务前问人用哪些机器、本地 subagent 只写代码不建多工作树、合并后主会话统一跑重活、发布件按版本号发、不跟提交走）；
   管机器池（machines.git、每分钟心跳 beat、每台机器一个服务所有项目的 executor、拿槽位的 flow run / flow hold、curryPlan 上的
   "机器"页）；管 curryPlan 页面（仓库 docs/*.html 与 curryPlan 同源自动发布、图表与表格优先、禁大段文字）。触发于："用 curryFlow
   引导 X"、"给项目搭多机流程"、"加一台机器"、"看机器负载 / 槽位"、"在机器池上跑个作业 / 占个槽位"、"发到 curryPlan"、
@@ -69,13 +69,18 @@ curryFlow 是多机开发、机器池调度和 curryPlan 文档的统一入口�
    ~/curryflow/machines/flow run --project <项目> --commit <中枢分支或SHA> --machine <机器> --prio gate --no-wait -- ci/accept --stage <阶段>
    ```
    合并只认机器池槽位里跑出的 `accept: PASS`。
-5. **合并与发版（每次推 main 必做三步）。** 验收全绿后，按顺序执行：
+5. **合并（每次推 main 两步）。** 验收全绿后，按顺序执行：
    ```
    (1) 推中枢 main        git push hub main
    (2) 推 GitHub main     git push origin main
-   (3) 打发布件并上传     在机器池跑 make release，校验 sha256，用 gh release create/upload 传到 GitHub
-                          （release/<YYYYMMDD>-<shortsha>；若发现历史 main 提交漏传过发布件，一并补传）
    ```
+   **发版不跟提交走。** main 上的提交不必出发布件；版本是仓库根的 `VERSION` 文件（`X.Y.Z`）。要发版时：
+   ```
+   (1) 在 main 上提交一个把 VERSION 升上去的提交，全部验收阶段在它上面通过（不只是 --plan 算出的那几个）
+   (2) 在机器池跑 make release，校验 sha256
+   (3) gh release create v<版本>，传 <名字>-<版本>-<平台>.tar.gz、.sha256、.manifest.json
+   ```
+   下游仓库在 `deps.json` 里钉版本和 sha256，没有新版本就继续用旧的；发布件不替换，改了就升版本。
    各机器上给人看的主目录（`~/code/<项目>`）不用手工同步：登记在 `machines.json` 的 `projects.<项目>.home` 里，beat 每
    10 分钟把它的 main 快进到中枢的 main（见“机器池”）。
 
