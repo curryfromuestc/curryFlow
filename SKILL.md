@@ -124,9 +124,10 @@ curryFlow 是多机开发、机器池调度和 curryPlan 文档的统一入口�
   结束它的全部进程。排队时撤掉和 executor 认领撞上时，认领的 executor 看到中枢上已有的结论（取消、不合规）就结束作业、
   不推自己的结论；只有已有的结论是"丢了"时才接着跑。
 - 作业的环境与 `.build/` 清理规则：工作目录是这个槽位里该项目的常驻工作树，checkout 到指定提交；未跟踪文件清掉。
-  `.build/` 的清理分两层：
+  `.build/` 的清理分三层：
   1. 每次作业开始前，executor 必清 `.build/accept`、`.build/synth`、`.build/release`、`.build/downstream`，防止复用上一个候选留下的报告、综合网表或发布包；
-  2. executor 在 `.build/.cf-env.json` 记录当前 `deps.json` 内容与槽位环境（`$CF_DEPS_CACHE`、容器名）；只要 `deps.json` 或槽位环境变了，或者 `flow run` 带了 `--clean`，整个 `.build/` 全部清空；一致时保留其余编译目录做增量构建。
+  2. executor 在 `.build/.cf-env.json` 记录当前 `deps.json` 内容与槽位环境（`$CF_DEPS_CACHE`、容器名）；只要 `deps.json` 或槽位环境变了，或者 `flow run` 带了 `--clean`，整个 `.build/` 全部清空；一致时保留其余编译目录做增量构建；
+  3. 整个槽位目录不超过 50 GiB：作业准备好后和结束后各量一次，超了就按 `.cf-env.json` 的修改时间从旧到新整个删掉各工作树的 `.build/`（没有这个文件的最先删），降到 50 GiB 以内为止。作业前不删本作业项目的；作业后它排最后，只有它自己就让槽位超限时才删（要共享的 `.build/cf/share` 留着）。`.cf/`、`.home/` 算在总量里但不删；删完还超只在作业日志里记警告，作业照常跑。
   环境变量有 `CF_DEPS_CACHE`、`PYTHONDONTWRITEBYTECODE=1`、`TMPDIR=<工作树>/.build/tmp`、`CF_SLOT`、`CF_CPUS`、
   `CF_THREADS`（逻辑线程数）、`CF_CORES`（物理核数）、`CF_MEM_GB`（槽位内存上限 GiB）、`CF_JOB`；`HOME` 在容器里是
   `<槽位目录>/.home`，不用容器时是真实的家目录。没有容器的机器上是 `taskset` 钉核加带内存上限的 systemd 用户 scope；

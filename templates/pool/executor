@@ -33,7 +33,8 @@ On the machine:
   ~/curryflow/exec/<machine>/        state.json (what beat reports), executor.log, served.json, abandoned.json
   ~/curryflow/mirror/<project>.git   the machine's bare mirror of a project; only incremental fetches from its hub
   <slot dir>/<project>               the slot's work tree of the project: a clone of the mirror, one checkout per job,
-                                     ignored files (.build) stay for incremental builds
+                                     ignored files (.build) stay for incremental builds while the slot dir stays
+                                     within SLOT_MAX (cap_slot, before and after each job)
   <slot dir>/.cf/<id>/               a job's run directory: job.json, log, exit.json, done.json
 The slot dir is ~/<container> for a slot with an incus container (the container mounts it at the same path) and
 ~/curryflow/slots/<slot> otherwise. Git runs on the host, pinned to the slot's CPUs; the command runs in the slot:
@@ -86,6 +87,7 @@ SHARE_KEEP = 14 * 86400        # how long a directory a job shared stays on its 
 HOLD_MAX_HOURS = 8
 TIMEOUT_MAX = 86400
 LOG_MAX, LOG_HEAD, EXEC_LOG_MAX = 256 << 20, 1 << 20, 4 << 20
+SLOT_MAX = 50 << 30      # a slot dir above this loses whole .build directories of its work trees (cap_slot)
 GIT_TIMEOUT = 60
 PRIO = {"gate": 0, "normal": 1, "night": 2}
 TAGS = {"synth"}
@@ -450,6 +452,99 @@ def clear_locks(root, gitdir, say, check):
             pass
 
 
+def usage(top, parts=(), tick=None):
+    """(bytes allocated under top, {part: bytes under it} for the directories of parts below top), counted as du
+    does: st_blocks, symlinks not followed, a file with several links once. tick is called every 1000 entries."""
+    seen, share, n = set(), dict.fromkeys(parts, 0), 0
+    try:
+        total = os.lstat(top).st_blocks * 512
+    except OSError:
+        return 0, share
+    todo = [(top, None)]
+    while todo:
+        path, part = todo.pop()
+        try:
+            with os.scandir(path) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        for e in entries:
+            n += 1
+            if tick and n % 1000 == 0:
+                tick()
+            try:
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            sub = e.path if e.path in share else part
+            if e.is_dir(follow_symlinks=False):
+                todo.append((e.path, sub))
+            elif st.st_nlink > 1:
+                if (st.st_dev, st.st_ino) in seen:
+                    continue
+                seen.add((st.st_dev, st.st_ino))
+            total += st.st_blocks * 512
+            if sub:
+                share[sub] += st.st_blocks * 512
+    return total, share
+
+
+def size_text(n):
+    return f"{n / 2 ** 30:.1f} GiB" if n >= 2 ** 30 else f"{n / 2 ** 20:.1f} MiB"
+
+
+def cap_slot(slotdir, project, say, after=False, tick=None):
+    """Keeps the slot dir at or below SLOT_MAX: above it, whole .build directories of the slot's work trees go, least
+    recently used first by the mtime of .build/.cf-env.json (written when a job starts in the tree; a tree without it
+    is the oldest). Before a job its project's .build is not touched; after the job it goes last, so only when it
+    alone keeps the slot above, and then its .build/cf/share stays (finish shares it once exit.json is written).
+    Run directories (.cf) and the container's HOME (.home) count but stay."""
+    when = "作业后" if after else "作业前"
+    own = os.path.join(slotdir, project, ".build")
+    try:
+        names = sorted(os.listdir(slotdir))
+    except OSError as e:
+        return say(f"{when}量不了槽位目录：{e}")
+    builds = {}
+    for name in names:
+        b = os.path.join(slotdir, name, ".build")
+        if name.startswith(".") or b == own and not after or not os.path.isdir(b) or os.path.islink(b):
+            continue
+        try:
+            builds[b] = os.stat(os.path.join(b, ".cf-env.json")).st_mtime
+        except OSError:
+            builds[b] = 0
+    total, sizes = usage(slotdir, builds, tick)
+    if total <= SLOT_MAX:
+        return
+    for b in sorted(builds, key=lambda b: (b == own, builds[b])):
+        if total <= SLOT_MAX:
+            break
+        if b == own:
+            for top, keep in ((b, "cf"), (os.path.join(b, "cf"), "share")):
+                for name in os.listdir(top) if os.path.isdir(top) and not os.path.islink(top) else ():
+                    path = os.path.join(top, name)
+                    if name == keep:
+                        continue
+                    if os.path.isdir(path) and not os.path.islink(path):
+                        shutil.rmtree(path, ignore_errors=True)
+                    else:
+                        try:
+                            os.unlink(path)
+                        except OSError:
+                            pass
+        else:
+            shutil.rmtree(b, ignore_errors=True)
+        freed = sizes[b] - (usage(b)[0] if os.path.lexists(b) else 0)
+        last = time.strftime("上次作业 %m-%d %H:%M", time.localtime(builds[b])) if builds[b] else "没有作业记录"
+        say(f"{when}槽位目录 {size_text(total)}，超过上限 {size_text(SLOT_MAX)}：删掉 {os.path.basename(os.path.dirname(b))} 的 "
+            f".build（{last}），腾出 {size_text(freed)}，剩 {size_text(total - freed)}")
+        total -= freed
+    if total > SLOT_MAX:
+        say(f"警告：{when}槽位目录 {slotdir} 还有 {size_text(total)}，超过上限 {size_text(SLOT_MAX)}；能删的 .build 都删了"
+            f"（{'' if after else f'{project} 的要给这个作业用，'}作业目录 .cf 和 .home 不删）")
+
+
 # ---- the supervisor: runs in the slot (in the container when the slot has one) ------------------------
 
 JOB_COALITION = None     # (macOS) the supervisor's own coalition, when launchd gave it one: the job's processes
@@ -620,6 +715,8 @@ def sup_main(rundir, detach=False):
         if time.time() - t0 > 5:
             signal_tree(signal.SIGKILL)
         time.sleep(0.2)
+    # Still before exit.json, so the slot is not handed to the next job while its work trees are measured.
+    cap_slot(job["dir"], job["req"]["project"], say, after=True, tick=lambda: os.utime(alive))
     cap()
     note = f"日志超过 {LOG_MAX / 2 ** 20:g} MB，中间截掉过 {len(cuts)} 次" if cuts else ""
     if reason == "memory":
@@ -834,6 +931,7 @@ def prepare(job, say, run, must, check):
     os.makedirs(os.path.join(tree, ".build", "tmp"), exist_ok=True)
     jdump(stamp_path, cur_env)
     sweep_tmpdir(os.path.join(tree, ".build", "tmp"), say)
+    cap_slot(job["dir"], req["project"], say, tick=check)
     say(f"{req['project']}@{sha[:12]} 在 {job['machine']}/{job['slot']}：{req['cmd']}")
 
 

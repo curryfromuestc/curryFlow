@@ -29,6 +29,7 @@ import signal
 import subprocess
 import sys
 import time
+import types
 
 DARWIN = sys.platform == "darwin"
 # A command in a session of its own, the time with a fraction, and a file's times set ten days back, in sh.
@@ -213,8 +214,8 @@ exit 0
             sh(GIT, "-C", self.clone(m), "config", "remote.origin.uploadpack", f"{w}/bin/up-{m}")
             sh(GIT, "-C", self.clone(m), "config", "remote.origin.receivepack", f"{w}/bin/rp-{m}")
 
-    def start(self, m):
-        self.procs[m] = subprocess.Popen([PY, "executor", "run", "--machine", m], cwd=self.clone(m), env=self.env(m),
+    def start(self, m, **env):
+        self.procs[m] = subprocess.Popen([PY, "executor", "run", "--machine", m], cwd=self.clone(m), env=self.env(m, **env),
                                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def stop(self, m, sig=signal.SIGKILL):
@@ -1561,6 +1562,101 @@ if DARWIN:
             r.push_conf(lambda c: c["machines"]["t2"]["slots"]["b0"].update(mem="4GiB"))
             r.pull("t1", "t2")
             time.sleep(3)
+
+
+def load_executor(r):
+    path = os.path.join(r.pool, "executor")
+    mod = types.ModuleType("cf_executor")
+    mod.__file__ = path
+    with open(path) as f:
+        exec(compile(f.read(), path, "exec"), mod.__dict__)
+    return mod
+
+
+def blob(path, mib, stamp=None):
+    """A file of mib MiB of data; stamp: also .build/.cf-env.json beside it, with that mtime."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(b"\1" * (mib << 20))
+    if stamp is not None:
+        s = os.path.join(os.path.dirname(path), ".cf-env.json")
+        put(s, "{}")
+        os.utime(s, (stamp, stamp))
+
+
+@case("T-slotcap", "假槽位目录：old/.build（没有 .cf-env.json）、mid、new、cur 的 .build 各 3 MiB，按 .cf-env.json 的时间从旧到新；"
+      ".cf、.home 各 1 MiB；cur/.build 里还有一个硬链接、一个指向槽位外 20 MiB 文件的符号链接和 1 MiB 的 cf/share/pack。直接调 usage 和 cap_slot",
+      "usage 和 du -sB1 一样；作业前（项目 cur）先删 old 再删 mid，够了就停；上限再低时删 new、不删 cur 并记警告；"
+      "作业后 cur 排最后（即使它的时间比别的旧），只有它自己就超限时才删（它的 .build/cf/share 留着），删完还超再记警告；.cf、.home 和 .build 以外的文件一直在")
+def c_slotcap(r):
+    ex = load_executor(r)
+    d = os.path.join(r.w, "capslot")
+    shutil.rmtree(d, ignore_errors=True)
+    now = time.time()
+    blob(os.path.join(d, ".cf", "1", "log"), 1)
+    blob(os.path.join(d, ".home", "cache"), 1)
+    blob(os.path.join(d, "old", "src"), 1)
+    blob(os.path.join(d, "old", ".build", "x"), 3)
+    blob(os.path.join(d, "mid", ".build", "x"), 3, now - 2 * 86400)
+    blob(os.path.join(d, "new", ".build", "x"), 3, now - 86400)
+    blob(os.path.join(d, "cur", ".build", "x"), 3, now)
+    blob(os.path.join(d, "cur", ".build", "cf", "share", "pack", "f"), 1)
+    os.link(os.path.join(d, "cur", ".build", "x"), os.path.join(d, "cur", ".build", "x2"))
+    blob(os.path.join(r.w, "outside"), 20)
+    os.symlink(os.path.join(r.w, "outside"), os.path.join(d, "cur", ".build", "out"))
+    said = []
+    gone = lambda: [n for n in ("old", "mid", "new", "cur") if not os.path.exists(os.path.join(d, n, ".build", "x"))]
+    total = ex.usage(d)[0]
+    du = int(sh("du", "-s", "-B1", d).split()[0])
+    ex.SLOT_MAX = total - (4 << 20)
+    ex.cap_slot(d, "cur", said.append)
+    step1 = gone()
+    ex.SLOT_MAX = 1 << 20
+    ex.cap_slot(d, "cur", said.append)
+    step2 = gone()
+    warned = sum("警告" in x for x in said)
+    blob(os.path.join(d, "new", ".build", "x"), 3, now - 86400)
+    os.utime(os.path.join(d, "cur", ".build", ".cf-env.json"), (now - 3 * 86400, now - 3 * 86400))
+    ex.SLOT_MAX = ex.usage(d)[0] - (2 << 20)
+    ex.cap_slot(d, "cur", said.append, after=True)
+    step3 = gone()
+    ex.SLOT_MAX = 1 << 20
+    ex.cap_slot(d, "cur", said.append, after=True)
+    step4 = gone()
+    kept = all(os.path.exists(os.path.join(d, p)) for p in (".cf/1/log", ".home/cache", "old/src", "cur/.build/cf/share/pack/f"))
+    logged = len(said) == 7 and all(n in said[i] for i, n in enumerate(["old", "mid", "new", "警告", "new", "cur", "警告"]))
+    return (f"usage {total}，du {du}；作业前删了 {step1}，上限 1 MiB 时 {step2}（警告 {warned} 条）；作业后 {step3}，"
+            f"上限 1 MiB 时 {step4}；.cf/.home/old/src/cur 的 cf/share {'都在' if kept else '少了'}；日志 {said}"), (
+        total == du and step1 == ["old", "mid"] and step2 == ["old", "mid", "new"] and warned == 1
+        and step3 == ["old", "mid", "new"] and step4 == ["old", "mid", "new", "cur"] and kept and logged)
+
+
+@case("T-slotcap-job", "t1 的 executor 以「a0 现在的大小 + 6 MiB」为槽位上限重启；a0 里放两个别的项目的 .build 各 4 MiB"
+      "（x1 没有 .cf-env.json，x2 的是一小时前）；a0 上跑一个往 demo 的 .build 写 4 MiB 的作业",
+      "作业前删 x1，作业后删 x2，demo 的 .build 留着；两次删除都在作业日志里，作业以 0 结束")
+def c_slotcap_job(r):
+    ex = load_executor(r)
+    r.flow("run", "--project", "demo", "--machine", "t1", "--slot", "a0", "--", "true")
+    a0 = r.slotdir("t1", "a0")
+    base = ex.usage(a0)[0]
+    blob(os.path.join(a0, "x1", ".build", "x"), 4)
+    blob(os.path.join(a0, "x2", ".build", "x"), 4, time.time() - 3600)
+    r.stop("t1")
+    r.start("t1", CF_POOL_TUNE=json.dumps({**r.tune, "SLOT_MAX": base + (6 << 20)}))
+    try:
+        rc, out = r.flow("run", "--project", "demo", "--machine", "t1", "--slot", "a0", "--",
+                         "head -c 4194304 /dev/zero > .build/out")
+    finally:
+        r.stop("t1")
+        r.start("t1")
+    left = [n for n in ("x1", "x2") if os.path.exists(os.path.join(a0, n, ".build"))]
+    kept = os.path.exists(os.path.join(a0, "demo", ".build", "out"))
+    pre = any("作业前" in x and "x1" in x for x in out.splitlines())
+    post = any("作业后" in x and "x2" in x for x in out.splitlines())
+    shutil.rmtree(os.path.join(a0, "x1"), ignore_errors=True)
+    shutil.rmtree(os.path.join(a0, "x2"), ignore_errors=True)
+    return (f"rc={rc}；还在的 .build {left}；demo/.build/out {'在' if kept else '不在'}；日志里作业前删 x1 {pre}，作业后删 x2 {post}"), (
+        rc == 0 and not left and kept and pre and post)
 
 
 def main():
