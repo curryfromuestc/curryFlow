@@ -199,9 +199,9 @@ curryFlow 是多机开发、机器池调度和 curryPlan 文档的统一入口�
   |---|---|---|
   | 槽位 | 一组钉住的核 | 线程数配额加内存预算：`cpus` 写 `0-<N-1>`，只算个数 |
   | 槽位空闲 | 槽位那几个核的忙线程不到 20% | 整机负载占满槽位以外的核之后，伸进槽位份额的部分不到 20% |
-  | 作业的进程 | 监管进程（child subreaper）的进程树 | 监管进程是独立的 launchd agent `cf.<id>`，作业的进程 = 它那个联盟（coalition）里的进程，脱离会话的也跑不出去 |
+  | 作业的进程 | 监管进程（child subreaper）的进程树 | 监管进程是 system 域里以本用户运行的独立 launchd daemon `cf.<id>`（executor 经 sudo 加载，`/etc/sudoers.d/curryflow` 免密只放行这两条 launchctl），作业的进程 = 它那个联盟（coalition）里的进程，脱离会话的也跑不出去 |
   | 内存上限 | systemd scope 的 `MemoryMax` 或容器 | 监管进程每几秒加一次联盟里进程的内存，超了结束作业，结论 137 并注明 |
-  | 常驻 | 两行 cron + `flock` | 两个 LaunchAgent（`mac-agents install`）：beat 每分钟一次，executor 常驻；只在这个用户登录着时跑 |
+  | 常驻 | 两行 cron + `flock` | 两个 LaunchDaemon，`UserName` 是本用户（`mac-agents install`，要输一次 sudo 密码）：beat 每分钟一次，executor 常驻；不需要有人登录着，FileVault 重启后要先在本机解锁一次 |
 
   机器标 `"named_only": true`：只接点名给它的请求（`--machine <名>`），因为项目的 Linux 工具链在上面跑不了；不点名的作业和
   占用不会落到它上面。连中枢要走代理的写 `hub_proxy`，作业的 `PATH`、`LANG` 写在 `env` 里（默认的是 Linux 的）。

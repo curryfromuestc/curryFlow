@@ -1,19 +1,24 @@
 #!/bin/sh
-# The pool's beat and executor on a Mac: two launchd agents of the login session, what the two cron lines are on Linux.
+# The pool's beat and executor on a Mac: two launchd daemons run as this user, what the two cron lines are on Linux.
 #
 # usage: mac-agents install NAME    write and start com.curryflow.beat and com.curryflow.executor for machine NAME
 #        mac-agents remove          stop and delete them (jobs that run keep running; their conclusions wait)
 #        mac-agents status          whether they are loaded and running
 #
-# Run from the clone of the pool repository (~/curryflow/machines). macOS has no flock: launchd runs one instance of
-# an agent at a time, which is what the cron lines take the lock for. beat runs every minute; the executor is kept
-# running (launchd starts it again within seconds when it ends). The agents belong to the login session (gui/<uid>):
-# they run while this user is logged in at the Mac, as the jobs' own agents (cf.<id>) do.
+# Run from the clone of the pool repository (~/curryflow/machines) as the user the jobs run as; install and remove
+# ask for that user's sudo password once. macOS has no flock: launchd runs one instance of a daemon at a time, which
+# is what the cron lines take the lock for. beat runs every minute; the executor is kept running (launchd starts it
+# again within seconds when it ends). They are daemons of the system domain with UserName set, as the jobs' own
+# daemons (cf.<id>) are: they run without anyone logged in at the Mac. The executor starts and stops those through
+# sudo (a plist there must be owned by root); /etc/sudoers.d/curryflow lets this user do exactly that without a
+# password.
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
-dir=$HOME/Library/LaunchAgents
-domain=gui/$(id -u)
+dir=/Library/LaunchDaemons
+user=$(id -un)
+group=$(id -gn)
 labels="com.curryflow.beat com.curryflow.executor"
+sudoers=/etc/sudoers.d/curryflow
 
 plist() {  # LABEL ERR KEY ARG...
     label=$1 err=$2 key=$3
@@ -23,6 +28,14 @@ plist() {  # LABEL ERR KEY ARG...
         printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
         printf '<plist version="1.0"><dict>\n'
         printf '  <key>Label</key><string>%s</string>\n' "$label"
+        printf '  <key>UserName</key><string>%s</string>\n' "$user"
+        printf '  <key>GroupName</key><string>%s</string>\n' "$group"
+        printf '  <key>EnvironmentVariables</key><dict>\n'
+        printf '    <key>HOME</key><string>%s</string>\n' "$HOME"
+        printf '    <key>USER</key><string>%s</string>\n' "$user"
+        printf '    <key>LOGNAME</key><string>%s</string>\n' "$user"
+        printf '    <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin</string>\n'
+        printf '  </dict>\n'
         printf '  <key>ProgramArguments</key><array>\n    <string>/usr/bin/python3</string>\n'
         for a in "$@"; do printf '    <string>%s</string>\n' "$a"; done
         printf '  </array>\n'
@@ -31,33 +44,44 @@ plist() {  # LABEL ERR KEY ARG...
         printf '  <key>StandardOutPath</key><string>/dev/null</string>\n'
         printf '  <key>StandardErrorPath</key><string>%s</string>\n' "$err"
         printf '</dict></plist>\n'
-    } > "$dir/$label.plist"
+    } > "$tmp/$label.plist"
 }
 
 case ${1:-} in
 install)
     name=${2:?usage: mac-agents install NAME}
     grep -q "\"$name\"" "$here/machines.json" || { echo "machines.json has no machine $name" >&2; exit 1; }
-    mkdir -p "$dir" "$HOME/curryflow/exec/$name"
+    mkdir -p "$HOME/curryflow/exec/$name"
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
     plist com.curryflow.beat /dev/null '<key>StartInterval</key><integer>60</integer>' "$here/beat" --machine "$name"
     plist com.curryflow.executor "$HOME/curryflow/exec/$name/launchd.err" '<key>KeepAlive</key><true/>' \
         "$here/executor" run --machine "$name"
+    printf '%s ALL=(root) NOPASSWD: /bin/launchctl bootstrap system *, /bin/launchctl bootout system/cf.*, %s\n' \
+        "$user" "/usr/sbin/chown root\\:wheel $HOME/*/cf.*.plist" > "$tmp/sudoers"
+    sudo visudo -cqf "$tmp/sudoers"
+    sudo install -m 440 -o root -g wheel "$tmp/sudoers" "$sudoers"
     for label in $labels; do
-        launchctl bootout "$domain/$label" 2>/dev/null || true
-        launchctl bootstrap "$domain" "$dir/$label.plist"
+        # the login-session agents of the earlier mac-agents
+        launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+        rm -f "$HOME/Library/LaunchAgents/$label.plist"
+        sudo launchctl bootout "system/$label" 2>/dev/null || true
+        sudo install -m 644 -o root -g wheel "$tmp/$label.plist" "$dir/$label.plist"
+        sudo launchctl bootstrap system "$dir/$label.plist"
     done
-    echo "installed: $labels (machine $name)"
+    echo "installed: $labels (machine $name, user $user)"
     ;;
 remove)
     for label in $labels; do
-        launchctl bootout "$domain/$label" 2>/dev/null || true
-        rm -f "$dir/$label.plist"
+        sudo launchctl bootout "system/$label" 2>/dev/null || true
+        sudo rm -f "$dir/$label.plist"
     done
+    sudo rm -f "$sudoers"
     echo "removed: $labels"
     ;;
 status)
     for label in $labels; do
-        state=$(launchctl print "$domain/$label" 2>/dev/null | sed -n 's/^[[:space:]]*state = //p' | head -1)
+        state=$(launchctl print "system/$label" 2>/dev/null | sed -n 's/^[[:space:]]*state = //p' | head -1)
         echo "$label: ${state:-not loaded}"
     done
     ;;

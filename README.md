@@ -17,7 +17,7 @@ templates/
   pool/status            把心跳、队列和结论汇成机器页的 status.json
   pool/executor          机器级 executor：每台机器一个，管这台机器的槽位，服务所有项目
   pool/flow              拿槽位的命令：flow run（提交作业并等结论）、flow hold（占用槽位）、ls、cancel、release
-  pool/mac-agents        Mac 上代替两行 cron 的两个 LaunchAgent（beat、executor）：install <名>、remove、status
+  pool/mac-agents        Mac 上代替两行 cron 的两个 LaunchDaemon（beat、executor，以本用户运行）：install <名>、remove、status
 bin/planpub              把一个独立页面目录发布到 curryPlan
 test/pool/e2e            机器池的端到端测试：本机上的假中枢、两台假机器，跑完写出 results.tsv
 curryplan.md             curryPlan 的排版铁律、同源自动发布、注册项目、通知

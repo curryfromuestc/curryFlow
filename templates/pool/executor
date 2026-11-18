@@ -50,7 +50,8 @@ The executor only reads files of the run directory, so it can be restarted while
 macOS (DARWIN) has no /proc, no CPU affinity, no cgroups and no child subreaper. The executor asks libproc and Mach
 what it reads from /proc on Linux. A slot there is a number of threads and a memory budget, not CPUs: no thread is
 pinned, and a slot is busy by what the machine's load leaves of its share. Each job's supervisor runs as a launchd
-agent of its own (cf.<id>, started and awaited by `executor _agent`): launchd gives an agent a coalition, which its
+daemon of its own (cf.<id> in the system domain as this user, started through sudo and awaited by `executor _agent`,
+so no login at the Mac is needed): launchd gives a daemon a coalition, which its
 descendants cannot leave whatever session, process group or parent they end up with, so the processes of the job are
 the processes of that coalition. The supervisor ends them by it and adds up their memory against the slot's (over it,
 the job ends with 137), as the kernel does for a scope's MemoryMax on Linux.
@@ -61,6 +62,7 @@ import collections
 import ctypes
 import fcntl
 import glob
+import grp
 import json
 import os
 import pwd
@@ -967,8 +969,17 @@ def agent_domain(job, rundir):
     return (jload(os.path.join(rundir, "agent.json")) or {}).get("domain") or f"gui/{os.getuid()}"
 
 
+def launchctl(domain, *args):
+    """launchctl for a domain: the system domain only through sudo (mac-agents install allows bootstrap and bootout
+    there, and the chown of the plist to root, without a password); gui/<uid> is what jobs started before 2026-11-18
+    ran in."""
+    return subprocess.run((["sudo", "-n"] if domain == "system" else []) + ["launchctl", *args],
+                          capture_output=True, text=True)
+
+
 def agent_remove(job, rundir):
-    subprocess.run(["launchctl", "bootout", f"{agent_domain(job, rundir)}/{job['agent']}"], capture_output=True)
+    domain = agent_domain(job, rundir)
+    launchctl(domain, "bootout", f"{domain}/{job['agent']}")
 
 
 def agent_kill(job, rundir):
@@ -996,24 +1007,30 @@ def agent_main(rundir):
     job = jload(os.path.join(rundir, "job.json"))
     label, me = job["agent"], os.path.join(rundir, "executor")
     plist, out = os.path.join(rundir, label + ".plist"), os.path.join(rundir, "launch.log")
+    pw = pwd.getpwuid(os.getuid())
+    if os.path.exists(plist):                # an earlier launcher's, owned by root now
+        os.unlink(plist)
     with open(plist, "wb") as f:
-        # Interactive: launchd applies no background throttling to the job. Its processes other than those of the
-        # supervisor's process group are ended by the supervisor (launchd ends that group when the agent exits).
-        # The supervisor's environment is launchd's, not this process's: the tests' tuning is handed on.
+        # A daemon of the system domain run as this user: it needs no login at the Mac (gui/<uid> exists only with
+        # one, and user/<uid> takes no new job without one). Interactive: launchd applies no background throttling
+        # to the job. Its processes other than those of the supervisor's process group are ended by the supervisor
+        # (launchd ends that group when the daemon exits). The supervisor's environment is launchd's, not this
+        # process's: HOME and PATH for its git and ssh, and the tests' tuning, are handed on.
         plistlib.dump({"Label": label, "ProgramArguments": [sys.executable, me, "_sup", rundir], "RunAtLoad": True,
+                       "UserName": pw.pw_name, "GroupName": grp.getgrgid(os.getgid()).gr_name,
                        "ProcessType": "Interactive", "WorkingDirectory": job["dir"], "StandardOutPath": out,
                        "StandardErrorPath": out,
-                       "EnvironmentVariables": {k: os.environ[k] for k in ("CF_POOL_TUNE",) if k in os.environ}}, f)
-    error = ""
-    for domain in (f"gui/{os.getuid()}", f"user/{os.getuid()}"):      # the login's session, else the user's background one
-        jdump(os.path.join(rundir, "agent.json"), {"domain": domain, "outside": coalition(os.getpid())})
-        subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True)   # an earlier launcher's
-        r = subprocess.run(["launchctl", "bootstrap", domain, plist], capture_output=True, text=True)
-        if r.returncode == 0:
-            break
-        error = (r.stderr or r.stdout).strip()[-300:]
-    else:
-        write_exit(rundir, CODE_ERROR, "error", f"launchd 没接下监管进程：{error}")
+                       "EnvironmentVariables": {"HOME": pw.pw_dir, "USER": pw.pw_name, "LOGNAME": pw.pw_name,
+                                                **{k: os.environ[k] for k in ("PATH", "CF_POOL_TUNE")
+                                                   if k in os.environ}}}, f)
+    jdump(os.path.join(rundir, "agent.json"), {"domain": "system", "outside": coalition(os.getpid())})
+    launchctl("system", "bootout", f"system/{label}")      # an earlier launcher's
+    # launchd loads into the system domain only a plist owned by root
+    r = subprocess.run(["sudo", "-n", "chown", "root:wheel", plist], capture_output=True, text=True)
+    if not r.returncode:
+        r = launchctl("system", "bootstrap", "system", plist)
+    if r.returncode:
+        write_exit(rundir, CODE_ERROR, "error", f"launchd 没接下监管进程：{(r.stderr or r.stdout).strip()[-300:]}")
         return 1
     exit_json, t0 = os.path.join(rundir, "exit.json"), time.time()
     while not os.path.exists(exit_json):
