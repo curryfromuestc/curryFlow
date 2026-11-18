@@ -5,13 +5,14 @@ nginx 把 /api/chat/ 去掉前缀转到 127.0.0.1:PORT，前面挡着 curryPlan 
 POST 另外要求 X-Requested-With: curryplan-chat（跨站表单带不上这个头）。
 
 GET  /convs[?q=词]            -> [{id, title, updated, n}]，新的在前；q 在标题和正文里搜
-POST /convs {title?}           -> 新会话
+POST /convs {title?, mode?}    -> 新会话；mode=agent 是 Agent 会话（Mac 上的 pi 带工具干活），默认 chat
 GET  /convs/ID                 -> 整个会话 {id, title, system, created, updated, messages}
-POST /convs/ID {title?, system?} -> 改标题或设定（system prompt）
+POST /convs/ID {title?, system?, cwd?} -> 改标题、设定（system prompt）、Agent 的工作目录（Mac 上的路径，空=默认）
 POST /convs/ID/delete          -> 删除会话（图片按内容去重、可能被别的会话引用，留在 img/ 不删）
 POST /convs/ID/send {text, images: [dataURL], regenerate?, max_tokens?}
      -> 先存用户消息（regenerate 时去掉末尾的回答、复用最后一条用户消息），再把模型的 SSE 原样流给页面，
-        结束或页面断开时把回答（含思考过程、用时、速度）存进会话
+        结束或页面断开时把回答（含思考过程、用时、速度）存进会话；
+        Agent 会话走 node 的 /agent/run，回答存成 parts：[{t: think|text|tool|note|error, ...}]，不支持 regenerate
 GET  /img/NAME                 -> 会话里的图片
 GET  /model                    -> 模型状态 {state: running|loading|stopped|external|offline, ...}
 POST /model/start, /model/stop -> 启动、停止 Mac 上的模型
@@ -116,6 +117,39 @@ def model_messages(c):
     return out
 
 
+def agent_apply(parts, ev, st):
+    """node 的小事件累加进 parts；页面里有一份同样的 JS（apply）。st 记 turn 边界。"""
+    k = ev.get("k")
+    last = parts[-1] if parts else None
+    if k in ("think", "text"):
+        t = "think" if k == "think" else "text"
+        if last and last["t"] == t and not st.get("cut"):
+            last["text"] += ev.get("d", "")
+        else:
+            parts.append({"t": t, "text": ev.get("d", "")})
+        st["cut"] = False
+    elif k == "turn":
+        st["cut"] = True
+    elif k == "tool":
+        parts.append({"t": "tool", "id": ev.get("id"), "name": ev.get("name"), "args": ev.get("args"), "out": "", "done": False})
+        st["cut"] = True
+    elif k in ("tool_out", "tool_end"):
+        for p in reversed(parts):
+            if p["t"] == "tool" and p.get("id") == ev.get("id"):
+                p["out"] = ev.get("out", "")
+                if k == "tool_end":
+                    p["done"], p["err"] = True, bool(ev.get("err"))
+                break
+        st["cut"] = True
+    elif k in ("note", "error"):
+        parts.append({"t": k, "text": ev.get("d", "")})
+        st["cut"] = True
+    elif k == "start":
+        st["cwd"] = ev.get("cwd")
+    elif k == "done":
+        st["tokens"] = ev.get("tokens")
+
+
 def node_call(method, path, body=None, timeout=10):
     env = read_env()
     u = urllib.parse.urlsplit(env["NODE"])
@@ -195,6 +229,8 @@ class Handler(BaseHTTPRequestHandler):
                 b = self.body()
                 c = {"id": secrets.token_hex(6), "title": (b.get("title") or "新对话")[:80], "system": "",
                      "created": now(), "messages": []}
+                if b.get("mode") == "agent":
+                    c.update(mode="agent", cwd="")
                 with lock:
                     conv_save(c)
                 return self.send_json(200, c)
@@ -209,6 +245,16 @@ class Handler(BaseHTTPRequestHandler):
             cid, act = m.group(1), m.group(3)
             if act == "delete":
                 with lock:
+                    c = conv_load(cid)
+                    if c.get("mode") == "agent":   # 顺手清掉 Mac 上 pi 的会话记录；Mac 连不上也照删
+                        try:
+                            conn, r = node_call("POST", "/agent/reset", {"sid": cid}, timeout=10)
+                            r.read()
+                            conn.close()
+                            if r.status == 409:
+                                raise ValueError("这个 Agent 正在跑，先停掉再删")
+                        except OSError:
+                            pass
                     os.remove(conv_path(cid))
                 return self.send_json(200, {"ok": True})
             if act == "send":
@@ -220,6 +266,8 @@ class Handler(BaseHTTPRequestHandler):
                     c["title"] = str(b["title"]).strip()[:80] or c["title"]
                 if "system" in b:
                     c["system"] = str(b["system"])[:8000]
+                if "cwd" in b and c.get("mode") == "agent":
+                    c["cwd"] = str(b["cwd"]).strip()[:500]
                 conv_save(c)
             return self.send_json(200, c)
         except FileNotFoundError:
@@ -240,12 +288,16 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             if q and q not in c["title"].lower() and not any(q in (m.get("text") or "").lower() for m in c["messages"]):
                 continue
-            out.append({"id": c["id"], "title": c["title"], "updated": c.get("updated", 0), "n": len(c["messages"])})
+            out.append({"id": c["id"], "title": c["title"], "updated": c.get("updated", 0), "n": len(c["messages"]),
+                        "mode": c.get("mode", "chat")})
         return sorted(out, key=lambda x: -x["updated"])
 
     def send(self, cid, b):
         with lock:
             c = conv_load(cid)
+            agent = c.get("mode") == "agent"
+            if b.get("regenerate") and agent:
+                raise ValueError("Agent 会话不支持重新生成")
             if b.get("regenerate"):
                 while c["messages"] and c["messages"][-1]["role"] == "assistant":
                     c["messages"].pop()
@@ -263,6 +315,8 @@ class Handler(BaseHTTPRequestHandler):
                     c["title"] = (text.splitlines()[0][:30] if text else "图片对话") or "新对话"
                 c["messages"].append({"role": "user", "text": text, "images": names, "at": now()})
             conv_save(c)
+            if agent:
+                return self.agent_send(cid, c, text, names)
             payload = {"messages": model_messages(c), "max_tokens": int(b.get("max_tokens") or 8192)}
         t0 = time.time()
         reply = {"role": "assistant", "text": "", "reasoning": "", "at": now()}
@@ -326,6 +380,84 @@ class Handler(BaseHTTPRequestHandler):
                     conv_save(c)
                 except FileNotFoundError:
                     pass   # 生成过程中会话被删了
+
+    def agent_send(self, cid, c, text, names):
+        """调用时持有 lock；这里先放掉，流式期间不占锁。"""
+        imgs = []
+        for n in names:
+            with open(os.path.join(IMG, n), "rb") as f:
+                imgs.append({"data": base64.b64encode(f.read()).decode(), "mimeType": MIME[n.rsplit(".", 1)[1]]})
+        payload = {"sid": cid, "text": text or "（见图）", "images": imgs, "cwd": c.get("cwd", ""), "system": c.get("system", "")}
+        lock.release()
+        try:
+            return self._agent_stream(cid, payload)
+        finally:
+            lock.acquire()
+
+    def _agent_stream(self, cid, payload):
+        t0 = time.time()
+        reply = {"role": "assistant", "agent": True, "parts": [], "text": "", "at": now()}
+        st = {}
+        try:
+            conn, up = node_call("POST", "/agent/run", payload, timeout=900)
+        except OSError as e:
+            return self.send_json(502, {"error": "连不上模型节点：%s" % type(e).__name__})
+        if up.status != 200:
+            try:
+                err = json.loads(up.read() or b"{}").get("error") or up.status
+            except ValueError:
+                err = up.status
+            conn.close()
+            return self.send_json(up.status, {"error": str(err)})
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        buf = b""
+        client_gone = False
+        try:
+            while True:
+                chunk = up.read1(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    if line.startswith(b"data:"):
+                        try:
+                            agent_apply(reply["parts"], json.loads(line[5:]), st)
+                        except ValueError:
+                            pass
+                try:
+                    self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    client_gone = True   # 页面点了停止：关掉到 node 的连接，node 随之给 pi 发 abort
+                    break
+            if not client_gone:
+                self.wfile.write(b"0\r\n\r\n")
+        except (BrokenPipeError, ConnectionResetError):
+            client_gone = True
+        except OSError:
+            reply["parts"].append({"t": "error", "text": "和 Mac 的连接断了"})
+        finally:
+            conn.close()
+            reply["text"] = "\n\n".join(p["text"] for p in reply["parts"] if p["t"] == "text").strip()
+            reply["secs"] = round(time.time() - t0, 1)
+            for k in ("tokens", "cwd"):
+                if st.get(k):
+                    reply[k] = st[k]
+            if client_gone:
+                reply["stopped"] = True
+            with lock:
+                try:
+                    c = conv_load(cid)
+                    c["messages"].append(reply)
+                    conv_save(c)
+                except FileNotFoundError:
+                    pass
 
 
 def main():

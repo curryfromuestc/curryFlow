@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <title>本地模型</title>
 <meta name="cp-title" content="本地模型">
-<meta name="cp-say" content="Mac mini 上的本地多模态模型：按需启动、停止，聊天记录存在 curryPlan 上">
+<meta name="cp-say" content="Mac mini 上的本地多模态模型：按需启动、停止，聊天记录存在 curryPlan 上；Agent 会话能在 Mac 上读写文件、跑命令">
 <meta name="cp-kind" content="工具">
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="apple-touch-icon" href="/icon-180.png">
@@ -18,8 +18,9 @@ body { overflow: hidden; }
 /* 会话列表 */
 .side { display: flex; flex-direction: column; min-height: 0; background: var(--surface); border-right: 1px solid var(--line); }
 .side .hd { display: flex; align-items: center; gap: 8px; padding: 12px 12px 8px; }
-.side .hd a { text-decoration: none; font-size: 13px; color: var(--ink-3); }
-.side .hd b { font-size: 15px; margin-right: auto; }
+.side .hd a { text-decoration: none; font-size: 13px; color: var(--ink-3); white-space: nowrap; }
+.side .hd b { font-size: 15px; margin-right: auto; white-space: nowrap; }
+.side .hd .b { padding: 5px 9px; }
 .side input { margin: 0 12px 8px; padding: 7px 10px; border: 1px solid var(--line); border-radius: var(--r); background: var(--bg); color: var(--ink); font: inherit; }
 .convs { flex: 1; overflow-y: auto; padding: 0 6px 12px; }
 .conv { display: flex; align-items: center; gap: 6px; padding: 7px 8px; border-radius: var(--r); cursor: pointer; color: var(--ink-2); }
@@ -66,6 +67,20 @@ button.lnk:hover { color: var(--accent); }
 .md th, .md td { border: 1px solid var(--line); padding: 3px 8px; }
 .meta { display: flex; gap: 10px; align-items: center; margin-top: 6px; font: 11.5px var(--mono); color: var(--ink-3); }
 .err { color: var(--warn); }
+/* Agent */
+.tag { font: 10.5px var(--mono); color: var(--accent); border: 1px solid var(--accent); border-radius: 4px; padding: 0 4px; flex-shrink: 0; }
+.m.a .tool { margin: 6px 0; border: 1px solid var(--line); border-radius: var(--r); background: var(--bg); font-size: 13px; color: var(--ink-2); }
+.m.a .tool summary { padding: 5px 9px; display: flex; gap: 8px; align-items: baseline; min-width: 0; }
+.m.a .tool summary code { font: 12px var(--mono); color: var(--accent); flex-shrink: 0; }
+.m.a .tool summary .arg { font: 12px var(--mono); color: var(--ink-2); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.m.a .tool summary .s { font-size: 11.5px; flex-shrink: 0; }
+.m.a .tool pre { margin: 0; padding: 8px 10px; border-top: 1px solid var(--line); font: 12px/1.5 var(--mono); white-space: pre-wrap; word-break: break-all; max-height: 420px; overflow-y: auto; color: var(--ink); }
+.m.a .tool pre.args { color: var(--ink-2); background: var(--sunk); }
+.m.a .tool pre.args i { font-style: normal; color: var(--ink-3); }
+.m.a .tool.bad summary .s { color: var(--warn); }
+.m.a .note { font-size: 12.5px; color: var(--ink-3); margin: 4px 0; }
+.dlg input.cwd { padding: 7px 10px; border: 1px solid var(--line); border-radius: var(--r); background: var(--bg); color: var(--ink); font: 13px var(--mono); }
+.dlg label { font-size: 13px; color: var(--ink-3); }
 /* 输入区 */
 .foot { border-top: 1px solid var(--line); background: var(--surface); padding: 10px 16px calc(10px + env(safe-area-inset-bottom, 0px)); }
 .box { max-width: 52rem; margin: 0 auto; display: flex; flex-direction: column; gap: 8px; }
@@ -98,14 +113,14 @@ textarea { width: 100%; min-height: 48px; max-height: 40vh; resize: none; paddin
 <body>
 <div class="app" id="app">
   <aside class="side">
-    <div class="hd"><a href="/">← 全部</a><b>会话</b><button type="button" class="b pri" id="bNew">新对话</button></div>
+    <div class="hd"><a href="/">← 全部</a><b>会话</b><button type="button" class="b" id="bNewA" title="模型在 Mac 上读写文件、跑命令">新 Agent</button><button type="button" class="b pri" id="bNew">新对话</button></div>
     <input id="q" type="search" placeholder="搜索标题和内容" autocomplete="off">
     <div class="convs" id="convs"><p class="empty">加载中…</p></div>
   </aside>
   <section class="main">
     <div class="bar">
       <button type="button" class="b menu" id="bMenu">会话</button>
-      <span class="ttl" id="ttl">新对话</span>
+      <span class="tag" id="tag" hidden>Agent</span><span class="ttl" id="ttl">新对话</span>
       <button type="button" class="lnk" id="bRen" hidden>改名</button>
       <button type="button" class="lnk" id="bSys" hidden>设定</button>
       <button type="button" class="lnk" id="bDel" hidden>删除</button>
@@ -132,6 +147,10 @@ textarea { width: 100%; min-height: 48px; max-height: 40vh; resize: none; paddin
 <div class="ov" id="ovSys" hidden><div class="dlg">
   <h3>本会话的设定（system prompt）</h3>
   <textarea id="sysTxt" placeholder="例如：你是一个简洁的中文助手。留空则不用设定。"></textarea>
+  <div id="cwdRow" hidden style="display:flex;flex-direction:column;gap:4px">
+    <label for="cwdTxt">Agent 的工作目录（Mac 上的路径，留空用 ~/agent-work/会话号；改了会重启这个会话的 pi）</label>
+    <input id="cwdTxt" class="cwd" placeholder="~/agent-work/…" autocomplete="off" spellcheck="false">
+  </div>
   <div class="row"><span class="sp"></span><button type="button" class="b" id="sysCancel">取消</button><button type="button" class="b pri" id="sysSave">保存</button></div>
 </div></div>
 <script>
@@ -141,7 +160,8 @@ textarea { width: 100%; min-height: 48px; max-height: 40vh; resize: none; paddin
   const API = "/api/chat/";
   const H = { "Content-Type": "application/json", "X-Requested-With": "curryplan-chat" };
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-  let convs = [], cur = null, model = { state: "offline" }, pending = [], ctl = null;
+  let convs = [], cur = null, model = { state: "offline" }, pending = [], ctl = null, newMode = "chat";
+  const isAgent = () => (cur ? cur.mode === "agent" : newMode === "agent");
 
   // ---------- Markdown（先整体转义，只认常见块：代码块、标题、列表、引用、表格、行内代码、粗体、链接） ----------
   function inline(s) {
@@ -199,13 +219,14 @@ textarea { width: 100%; min-height: 48px; max-height: 40vh; resize: none; paddin
   async function loadConvs() {
     const q = $("q").value.trim();
     try { convs = await api("convs" + (q ? "?q=" + encodeURIComponent(q) : "")); } catch (e) { $("convs").innerHTML = '<p class="empty">读不到会话：' + esc(e.message) + "</p>"; return; }
-    $("convs").innerHTML = convs.length ? convs.map((c) => `<div class="conv${cur && c.id === cur.id ? " on" : ""}" data-id="${c.id}"><span class="t">${esc(c.title)}</span><span class="d">${ago(c.updated)}</span></div>`).join("")
+    $("convs").innerHTML = convs.length ? convs.map((c) => `<div class="conv${cur && c.id === cur.id ? " on" : ""}" data-id="${c.id}">${c.mode === "agent" ? '<span class="tag">A</span>' : ""}<span class="t">${esc(c.title)}</span><span class="d">${ago(c.updated)}</span></div>`).join("")
       : '<p class="empty">' + (q ? "没有匹配的会话" : "还没有会话") + "</p>";
   }
   $("convs").addEventListener("click", (e) => { const d = e.target.closest(".conv"); if (d) { openConv(d.dataset.id); $("app").classList.remove("open"); } });
   let qt; $("q").addEventListener("input", () => { clearTimeout(qt); qt = setTimeout(loadConvs, 250); });
   $("bMenu").onclick = () => $("app").classList.toggle("open");
-  $("bNew").onclick = () => { if (ctl) return; cur = null; history.replaceState(null, "", location.pathname); render(); loadConvs(); $("app").classList.remove("open"); $("txt").focus(); };
+  $("bNewA").onclick = () => { if (ctl) return; newMode = "agent"; cur = null; history.replaceState(null, "", location.pathname); render(); loadConvs(); $("app").classList.remove("open"); $("txt").focus(); };
+  $("bNew").onclick = () => { if (ctl) return; newMode = "chat"; cur = null; history.replaceState(null, "", location.pathname); render(); loadConvs(); $("app").classList.remove("open"); $("txt").focus(); };
 
   async function openConv(id) {
     if (ctl) return;
@@ -214,18 +235,66 @@ textarea { width: 100%; min-height: 48px; max-height: 40vh; resize: none; paddin
     render(); loadConvs();
   }
 
+  // ---------- Agent：node 的小事件累加成 parts（server.py 的 agent_apply 是同一套） ----------
+  function apply(parts, ev, st) {
+    const k = ev.k, last = parts[parts.length - 1];
+    if (k === "think" || k === "text") {
+      if (last && last.t === k && !st.cut) last.text += ev.d || ""; else parts.push({ t: k, text: ev.d || "" });
+      st.cut = false;
+    } else if (k === "turn") st.cut = true;
+    else if (k === "tool") { parts.push({ t: "tool", id: ev.id, name: ev.name, args: ev.args, out: "", done: false }); st.cut = true; }
+    else if (k === "tool_out" || k === "tool_end") {
+      for (let i = parts.length - 1; i >= 0; i--) if (parts[i].t === "tool" && parts[i].id === ev.id) {
+        parts[i].out = ev.out || ""; if (k === "tool_end") { parts[i].done = true; parts[i].err = !!ev.err; } break;
+      }
+      st.cut = true;
+    } else if (k === "note" || k === "error") { parts.push({ t: k, text: ev.d || "" }); st.cut = true; }
+    else if (k === "start") st.cwd = ev.cwd;
+    else if (k === "done") st.tokens = ev.tokens;
+  }
+  function argLine(name, a) {
+    if (!a || typeof a !== "object") return "";
+    if (a.command) return a.command;
+    if (a.path) return a.path + (a.offset ? " @" + a.offset : "");
+    if (a.pattern) return a.pattern + (a.path ? "  " + a.path : "");
+    return JSON.stringify(a);
+  }
+  function partsHTML(parts, live) {
+    return parts.map((p, i) => {
+      if (p.t === "think") return `<details${live && i === parts.length - 1 ? " open" : ""}><summary>思考</summary><div class="think">${esc(p.text)}</div></details>`;
+      if (p.t === "text") return `<div class="md">${md(p.text)}</div>`;
+      if (p.t === "note") return `<div class="note">${esc(p.text)}</div>`;
+      if (p.t === "error") return `<p class="err">出错：${esc(p.text)}</p>`;
+      if (p.t === "tool") {
+        const s = !p.done ? (live ? "运行中…" : "未完成") : p.err ? "失败" : "完成";
+        // 摘要行已经有 command / path；其余参数（write 的 content、edit 的 oldText/newText 等）按原文逐个列出
+        const rest = p.args && typeof p.args === "object" ? Object.entries(p.args).filter(([k]) => k !== "command" && k !== "path") : [];
+        const full = rest.length ? `<pre class="args">${rest.map(([k, v]) => `<i>${esc(k)}:</i>${typeof v === "string" && v.includes("\n") ? "\n" : " "}${esc(typeof v === "string" ? v : JSON.stringify(v))}`).join("\n")}</pre>` : "";
+        return `<details class="tool${p.err ? " bad" : ""}"${live && !p.done ? " open" : ""}><summary><code>${esc(p.name)}</code><span class="arg">${esc(argLine(p.name, p.args))}</span><span class="s">${s}</span></summary>${full}${p.out ? `<pre>${esc(p.out)}</pre>` : ""}</details>`;
+      }
+      return "";
+    }).join("");
+  }
+
   // ---------- 渲染会话 ----------
   function render() {
-    $("ttl").textContent = cur ? cur.title : "新对话";
+    $("ttl").textContent = cur ? cur.title : isAgent() ? "新 Agent" : "新对话";
+    $("tag").hidden = !isAgent();
     ["bRen", "bSys", "bDel"].forEach((b) => ($(b).hidden = !cur));
     const ms = cur ? cur.messages : [];
-    if (!ms.length) { $("msgs").innerHTML = '<p class="hello">' + (model.state === "running" ? "模型已就绪，说点什么吧" : "先点右上角「启动模型」，加载约 5 秒") + "</p>"; return; }
+    if (!ms.length) {
+      const ready = model.state === "running";
+      $("msgs").innerHTML = '<p class="hello">' + (!ready ? "先点右上角「启动模型」，加载约 5 秒" : isAgent()
+        ? "Agent 会话：模型可以在 Mac 上读写文件、执行命令（以 curry 用户身份，不经沙箱）。<br>工作目录：" + esc(cur && cur.cwd || "~/agent-work/<会话号>") + "，可在「设定」里改。"
+        : "模型已就绪，说点什么吧") + "</p>";
+      return;
+    }
     const lastA = ms.map((m) => m.role).lastIndexOf("assistant");
     $("msgs").innerHTML = ms.map((m, i) => m.role === "user"
       ? `<div class="m u">${m.images && m.images.length ? '<div class="imgs">' + m.images.map((n) => `<img src="${API}img/${esc(n)}" alt="">`).join("") + "</div>" : ""}${esc(m.text)}</div>`
-      : `<div class="m a">${m.reasoning ? `<details><summary>思考过程</summary><div class="think">${esc(m.reasoning)}</div></details>` : ""}<div class="md">${md(m.text || "")}</div>` +
-        `<div class="meta">${m.secs != null ? m.secs + " 秒" : ""}${m.tps ? " · " + m.tps + " tok/s" : ""}${m.stopped ? ' · <span class="err">已停止</span>' : ""}` +
-        `<button type="button" class="lnk" data-copy="${i}">复制</button>${i === lastA && i === ms.length - 1 ? '<button type="button" class="lnk" data-regen="1">重新生成</button>' : ""}</div></div>`).join("");
+      : `<div class="m a">${m.parts ? partsHTML(m.parts, false) : (m.reasoning ? `<details><summary>思考过程</summary><div class="think">${esc(m.reasoning)}</div></details>` : "") + `<div class="md">${md(m.text || "")}</div>`}` +
+        `<div class="meta">${m.secs != null ? m.secs + " 秒" : ""}${m.tps ? " · " + m.tps + " tok/s" : ""}${m.tokens ? " · 上下文 " + (m.tokens / 1000).toFixed(1) + "k" : ""}${m.stopped ? ' · <span class="err">已停止</span>' : ""}` +
+        `<button type="button" class="lnk" data-copy="${i}">复制</button>${i === lastA && i === ms.length - 1 && !m.agent ? '<button type="button" class="lnk" data-regen="1">重新生成</button>' : ""}</div></div>`).join("");
     $("log").scrollTop = 1e9;
   }
   $("msgs").addEventListener("click", (e) => {
@@ -239,9 +308,16 @@ textarea { width: 100%; min-height: 48px; max-height: 40vh; resize: none; paddin
   // ---------- 改名、设定、删除 ----------
   $("bRen").onclick = async () => { const t = prompt("会话标题", cur.title); if (t && t.trim()) { cur = await api("convs/" + cur.id, { title: t.trim() }); render(); loadConvs(); } };
   $("bDel").onclick = async () => { if (!confirm("删除会话「" + cur.title + "」？")) return; await api("convs/" + cur.id + "/delete", {}); $("bNew").onclick(); };
-  $("bSys").onclick = () => { $("sysTxt").value = cur.system || ""; $("ovSys").hidden = false; $("sysTxt").focus(); };
+  $("bSys").onclick = () => {
+    $("sysTxt").value = cur.system || ""; $("cwdRow").hidden = cur.mode !== "agent"; $("cwdRow").style.display = cur.mode === "agent" ? "flex" : "none";
+    $("cwdTxt").value = cur.cwd || ""; $("ovSys").hidden = false; $("sysTxt").focus();
+  };
   $("sysCancel").onclick = () => ($("ovSys").hidden = true);
-  $("sysSave").onclick = async () => { cur = await api("convs/" + cur.id, { system: $("sysTxt").value }); $("ovSys").hidden = true; };
+  $("sysSave").onclick = async () => {
+    const b = { system: $("sysTxt").value }; if (cur.mode === "agent") b.cwd = $("cwdTxt").value;
+    try { cur = await api("convs/" + cur.id, b); } catch (e) { alert(e.message); return; }
+    $("ovSys").hidden = true; render();
+  };
 
   // ---------- 模型状态 ----------
   const LABEL = { running: "运行中", loading: "加载中…", stopped: "已停止", external: "端口被占用", offline: "Mac 连不上" };
@@ -253,7 +329,7 @@ textarea { width: 100%; min-height: 48px; max-height: 40vh; resize: none; paddin
     $("bStart").disabled = model.state !== "stopped";
     $("bStop").disabled = !(model.state === "running" || model.state === "loading");
     $("bSend").disabled = model.state !== "running" || !!ctl;
-    $("hint").textContent = model.model ? model.model : "";
+    $("hint").textContent = model.agent_busy && !ctl ? "有一个 Agent 会话正在 Mac 上跑" : model.model ? model.model : "";
     if (cur && !cur.messages.length || !cur) render();
   }
   async function act(a) { $("bStart").disabled = $("bStop").disabled = true; try { await api("model/" + a, {}); } catch (e) { alert(e.message); } refresh(); }
@@ -302,7 +378,7 @@ textarea { width: 100%; min-height: 48px; max-height: 40vh; resize: none; paddin
       await refresh();
       if (model.state !== "running") { $("hint").textContent = "模型没在运行：先点右上角「启动模型」"; return; }
     }
-    if (!cur) { try { cur = await api("convs", {}); history.replaceState(null, "", "?c=" + cur.id); } catch (e) { alert(e.message); return; } }
+    if (!cur) { try { cur = await api("convs", { mode: newMode }); history.replaceState(null, "", "?c=" + cur.id); } catch (e) { alert(e.message); return; } }
     const imgs = pending.slice();
     if (regen) { while (cur.messages.length && cur.messages[cur.messages.length - 1].role === "assistant") cur.messages.pop(); }
     else { cur.messages.push({ role: "user", text, images: [], _local: imgs }); pending = []; drawThumbs(); $("txt").value = ""; grow(); }
@@ -310,6 +386,7 @@ textarea { width: 100%; min-height: 48px; max-height: 40vh; resize: none; paddin
     // 本地刚发的图先用 dataURL 显示
     if (!regen && imgs.length) { const u = [...document.querySelectorAll(".m.u")].pop(); u.insertAdjacentHTML("afterbegin", '<div class="imgs">' + imgs.map((x) => `<img src="${x}" alt="">`).join("") + "</div>"); }
     const box = document.createElement("div"); box.className = "m a";
+    if (cur.mode === "agent") return sendAgent(box, text, imgs);
     box.innerHTML = '<details open><summary>思考中…</summary><div class="think"></div></details><div class="md"></div><div class="meta"></div>';
     $("msgs").appendChild(box); $("log").scrollTop = 1e9;
     const think = box.querySelector(".think"), ans = box.querySelector(".md"), sum = box.querySelector("summary"), det = box.querySelector("details");
@@ -339,6 +416,48 @@ textarea { width: 100%; min-height: 48px; max-height: 40vh; resize: none; paddin
     }
     ctl = null; $("bAbort").hidden = true;
     // 以服务器存下的为准（回答、用时、图片地址）
+    await new Promise((ok) => setTimeout(ok, 300));
+    try { cur = await api("convs/" + cur.id); } catch (_) {}
+    render(); loadConvs(); refresh();
+  }
+
+  async function sendAgent(box, text, imgs) {
+    box.innerHTML = '<div class="pp"><div class="note">等模型…（新会话第一轮要把整段上下文算一遍）</div></div><div class="meta"></div>';
+    $("msgs").appendChild(box); $("log").scrollTop = 1e9;
+    const pp = box.querySelector(".pp"), meta = box.querySelector(".meta"), parts = [], st = {}, t0 = Date.now();
+    let raf = 0;
+    const paint = () => {
+      raf = 0;
+      // 保留用户手动展开、收起的状态：按序号记下 open
+      const open = [...pp.querySelectorAll("details")].map((d) => d.open);
+      pp.innerHTML = partsHTML(parts, true) || '<div class="note">等模型…</div>';
+      pp.querySelectorAll("details").forEach((d, i) => { if (i < open.length - 1) d.open = open[i]; });
+      meta.textContent = ((Date.now() - t0) / 1000).toFixed(0) + " 秒";
+      const lg = $("log"); if (lg.scrollHeight - lg.scrollTop - lg.clientHeight < 200) lg.scrollTop = 1e9;
+    };
+    const tick = setInterval(() => { if (!raf) raf = requestAnimationFrame(paint); }, 1000);
+    ctl = new AbortController(); $("bAbort").hidden = false; $("bSend").disabled = true;
+    try {
+      const r = await fetch(API + "convs/" + cur.id + "/send", { method: "POST", headers: H, signal: ctl.signal, body: JSON.stringify({ text, images: imgs }) });
+      if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || "HTTP " + r.status); }
+      const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "";
+      for (;;) {
+        const { value, done } = await rd.read(); if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i; while ((i = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+          if (!line.startsWith("data:")) continue;
+          let ev; try { ev = JSON.parse(line.slice(5)); } catch (_) { continue; }
+          apply(parts, ev, st);
+          if (!raf) raf = requestAnimationFrame(paint);
+        }
+      }
+    } catch (e) {
+      if (e.name !== "AbortError") parts.push({ t: "error", text: e.message });
+      paint();
+    }
+    clearInterval(tick);
+    ctl = null; $("bAbort").hidden = true;
     await new Promise((ok) => setTimeout(ok, 300));
     try { cur = await api("convs/" + cur.id); } catch (_) {}
     render(); loadConvs(); refresh();
