@@ -131,7 +131,8 @@ machines 仓库（GitHub `curryflow-machines`，每台机器 clone 到 `~/curryf
   plist 改成 root 属主的 `chown`）。FileVault 的 Mac 重启后要先在本机解锁一次。
 - beat 每 10 分钟 `git pull` 这个 clone，并把本机登记了 `home` 的项目从 GitHub 取 main、快进本地 main（有本地改动挡着、main
   上有自己的提交就不动）；结果在心跳的 `pull`、`homes` 里，机器页上落后或失败标红。
-- 心跳是 ssh 写到 curryPlan 机 `~/curryflow/hb/<机器>.json` 的 JSON；curryPlan 机 cron 每分钟在 machines 仓库的 clone
+- 心跳是 ssh 写到 curryPlan 机 `~/curryflow/hb/<机器>.json` 的 JSON（curryPlan 机自己也登记为一台不设槽位的机器 `curryplan`，
+  `"page": true`，beat 直接写本地）；curryPlan 机 cron 每分钟在 machines 仓库的 clone
   里跑 `python3 status --history hist.json` 写出 `/var/www/plan/curryplan/machines/status.json`；页面是
   `templates/curryplan/machines/index.html`（告警表、各机器的槽位和作业）。重发页面只 scp `index.html` 和 `meta.json`。
 - 改槽位、加项目：改 `machines.json` 推 GitHub，各机器十分钟内自己拉到。加机器：`beat --probe` → 在 `machines.json` 加一项 →
