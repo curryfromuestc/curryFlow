@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """One heartbeat of this machine, written to the curryPlan machine (machines.json "page": <user@host>, as
-~/curryflow/hb/<machine>.json there, over ssh), or --probe to inspect a host.
+~/curryflow/hb/<machine>.json there, over ssh; on the curryPlan machine itself, its entry has "page": true, directly),
+or --probe to inspect a host.
 
 usage: beat --machine NAME [--print]
        beat --probe
@@ -573,11 +574,18 @@ def main():
         return
     proxy = conf.get("proxy")
     target = f"curryflow/hb/{a.machine}.json"
-    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", pool["page"],
-                        f"mkdir -p curryflow/hb && cat > {target}.tmp && mv {target}.tmp {target}"],
-                       input=text, capture_output=True, text=True, timeout=30)
-    if r.returncode:
-        print(f"beat: heartbeat not written to {pool['page']}: {r.stderr.strip()[-300:]}", file=sys.stderr)
+    if conf.get("page"):      # this machine is the curryPlan machine itself
+        path = os.path.expanduser(f"~/{target}")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "w") as f:
+            f.write(text)
+        os.replace(path + ".tmp", path)
+    else:
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", pool["page"],
+                            f"mkdir -p curryflow/hb && cat > {target}.tmp && mv {target}.tmp {target}"],
+                           input=text, capture_output=True, text=True, timeout=30)
+        if r.returncode:
+            print(f"beat: heartbeat not written to {pool['page']}: {r.stderr.strip()[-300:]}", file=sys.stderr)
     pull(proxy)
     sync_homes(projects, a.machine, proxy)
 
