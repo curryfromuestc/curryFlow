@@ -106,7 +106,7 @@ curryPlan 能往手机推通知（标准 Web Push）：机器告警、作业完�
                     └─ /api/chat/         ──▶ 127.0.0.1:8767  site/chat/server.py（yanggl，curry-chat.service）
                                                会话 ~/curry-chat/conv/*.json、图片 ~/curry-chat/img/
                                                └─ 127.0.0.1:18090 ══ ssh -R ══▶ Mac 127.0.0.1:8090  site/chat/node.py
-                                                                                  ├─ 按需起 mlx_vlm.server :8081（APC 前缀缓存）
+                                                                                  ├─ 按需起模型服务 :8081（node.json 的 server_argv：llama-server + MTP）
                                                                                   └─ Agent 会话：每会话一个 `pi --mode rpc` ──▶ :8081
 ```
 
@@ -118,8 +118,11 @@ Agent 会话（侧栏「新 Agent」）：模型经 pi 在 Mac 上以 curry 用�
 |---|---|---|
 | 页面 | `templates/curryplan/chat/index.html` | 会话列表、搜索、改名、删除、设定（system prompt）、发图、思考过程、复制、重新生成、停止生成 |
 | 后端 | `site/chat/server.py` → `~yanggl/curry-chat/server.py` | 只听 127.0.0.1；POST 要 `X-Requested-With: curryplan-chat`；`chat.env` 写 `NODE`、`NODE_KEY` |
-| 模型节点 | `site/chat/node.py` → Mac `~/llm-web/node.py` | 每个请求要 `X-LLM-Key`（`node.key`）；模型在 `node.json` 里配（`server_env` 放 `APC_*`，`agent_env` 放 pi 的代理）；LaunchAgent `com.curry.llm-web` |
+| 模型节点 | `site/chat/node.py` → Mac `~/llm-web/node.py` | 每个请求要 `X-LLM-Key`（`node.key`）；模型在 `node.json` 里配（`server_argv` 是完整启动命令，`agent_env` 放 pi 的代理；改了要重启 node）；LaunchAgent `com.curry.llm-web` |
 | 隧道 | Mac LaunchAgent `com.curry.llm-web-tunnel` | curryPlan 机上的 `llmtunnel` 用户只许 `permitlisten="127.0.0.1:18090"`，不能登录 |
 
+- 现在的模型：huihui-ai Qwen3.8-27B abliterated 的 Q8_0 GGUF 加视觉投影，llama.cpp（Metal）`-c 131072 -np 1
+  --spec-type draft-mtp`，生成约 22~25 token/s。`-np` 不写时默认 4 个槽位各占 128K，Metal 内存不够。Mac 的 GPU 可用内存
+  由 LaunchDaemon `com.curry.gpu-wired-limit` 开机设为 42 GB（`iogpu.wired_limit_mb=43008`）。
 - 发布页面：`bin/planpub curryplan chat <目录> "本地模型" "<一句话>" 工具`。
 - 端到端（真 Chrome、模型真跑，13 步）：`CP_URL=… CP_COOKIE=<cpk> uvx --with playwright python site/test/chat/e2e.py 图.png 截图目录`。

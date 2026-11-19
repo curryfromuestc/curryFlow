@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""聊天页的模型节点：跑在有模型的 Mac 上，按需启动、停止 mlx_vlm.server，转发对话请求。
+"""聊天页的模型节点：跑在有模型的 Mac 上，按需启动、停止模型服务（mlx_vlm.server 或 llama-server），转发对话请求。
 
 只听 127.0.0.1:8090，经 ssh -R 映射到 curryPlan 机的 127.0.0.1:18090，由那里的 site/chat/server.py 调用。
 每个请求都要带 X-LLM-Key（与 node.key 文件内容相同；curryPlan 机上写在 ~/curry-chat/chat.env 的 NODE_KEY）。
 
 GET  /api/status            -> {state: running|loading|stopped|external, model, since, mem_gb}
-POST /api/start, /api/stop  -> 启动、停止模型（mlx_vlm.server 在 127.0.0.1:MODEL_PORT）
+POST /api/start, /api/stop  -> 启动、停止模型（OpenAI 兼容的模型服务，在 127.0.0.1:MODEL_PORT）
 POST /v1/chat/completions {messages, max_tokens?, temperature?} -> 模型的 SSE 原样流回；调用方断开时关掉上游，生成随之停下
 POST /agent/run {sid, text, images?: [{data, mimeType}], cwd?, system?}
      -> 在本机跑 pi（--mode rpc，一个会话一个进程，闲置 AGENT_IDLE 秒后关掉，下次用 --continue 接上），
@@ -19,6 +19,7 @@ pi 的模型配置在 ~/.pi/agent/models.json（指向 127.0.0.1:MODEL_PORT）�
 
 部署：~/llm-web/node.py，配置在同目录 node.json：
   {"model_path", "model_name", "server_bin", "server_env"?: {模型进程的环境变量，如 APC_*}, "server_args"?: [...],
+   "server_argv"?: [完整的启动命令，"{port}" 换成 MODEL_PORT；给了就不用 server_bin 和 server_args，如 llama-server],
    "pi_bin"?, "agent_work"?, "agent_env"?: {pi 进程的环境变量，如代理}}；LaunchAgent com.curry.llm-web。
 """
 import hmac
@@ -112,9 +113,11 @@ def start_model():
             raise RuntimeError("端口 %d 被别的程序占着" % MODEL_PORT)
         env = {k: v for k, v in os.environ.items() if "proxy" not in k.lower()}
         env.update({k: str(v) for k, v in CFG.get("server_env", {}).items()})
-        PROC["p"] = subprocess.Popen(
-            [SERVER_BIN, "--host", "127.0.0.1", "--port", str(MODEL_PORT), "--model", MODEL_PATH, "--enable-thinking"]
-            + [str(a) for a in CFG.get("server_args", [])],
+        argv = ([os.path.expanduser(str(a)).replace("{port}", str(MODEL_PORT)) for a in CFG["server_argv"]]
+                if CFG.get("server_argv") else
+                [SERVER_BIN, "--host", "127.0.0.1", "--port", str(MODEL_PORT), "--model", MODEL_PATH, "--enable-thinking"]
+                + [str(a) for a in CFG.get("server_args", [])])
+        PROC["p"] = subprocess.Popen(argv,
             stdout=open(MODEL_LOG, "ab"), stderr=subprocess.STDOUT, cwd=HERE, env=env, start_new_session=True)
         PROC["started"] = int(time.time())
 
